@@ -4,7 +4,7 @@ use rand::Rng;
 use rcdvlog_core::Catalog;
 use rcdvlog_sync::{
     DEFAULT_MAX_OPERATIONS, ProtocolRange, ReconcileRequest, ReconcileResponse,
-    apply_reconcile_operations, exact_sequence_recovery_page, sequence_recovery_requires_attention,
+    exact_sequence_recovery_page, sequence_recovery_requires_attention,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -193,10 +193,6 @@ impl SyncManager {
         settings: Arc<RwLock<crate::DesktopSettings>>,
         status: Arc<RwLock<HashMap<String, SyncStatus>>>,
     ) -> Self {
-        let catalog_path = catalog
-            .read()
-            .ok()
-            .map(|catalog| catalog.database_path().to_path_buf());
         let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = SyncLoopHandle {
             app_handle,
@@ -206,26 +202,15 @@ impl SyncManager {
             backoffs: HashMap::new(),
             active_projects: HashSet::new(),
             wake_tx: wake_tx.clone(),
+            guard: rcdvlog_sync::SyncGuardTracker::new(),
         };
         // `spawn` is called from Tauri's setup hook, which runs on the main
         // thread outside any Tokio runtime context — `tokio::spawn` would panic
         // there. `tauri::async_runtime::spawn` targets Tauri's global runtime.
+        // The sync guard follows whichever catalog is current (see the loop's
+        // per-cycle `guard.ensure`); it is not bound once at startup.
         tauri::async_runtime::spawn(async move {
-            let Some(catalog_path) = catalog_path else {
-                return;
-            };
-            loop {
-                match rcdvlog_sync::SyncProcessGuard::try_acquire(&catalog_path) {
-                    Ok(Some(guard)) => {
-                        let _guard = guard;
-                        handle.run(wake_rx).await;
-                        return;
-                    }
-                    Ok(None) | Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await
-                    }
-                }
-            }
+            handle.run(wake_rx).await;
         });
         Self { wake_tx }
     }
@@ -269,6 +254,8 @@ struct SyncLoopHandle {
     backoffs: HashMap<String, Backoff>,
     active_projects: HashSet<String>,
     wake_tx: tokio::sync::mpsc::UnboundedSender<WakeEvent>,
+    /// Holds the sync guard for exactly the catalog being synced.
+    guard: rcdvlog_sync::SyncGuardTracker,
 }
 
 impl SyncLoopHandle {
@@ -303,14 +290,15 @@ impl SyncLoopHandle {
                 Err(_) => {
                     // The cross-process CLI wake path is intentionally polled at the
                     // existing bounded interval, so it never creates a second loop.
-                    let requests = self
-                        .catalog
-                        .read()
-                        .ok()
-                        .and_then(|catalog| {
-                            rcdvlog_sync::drain_sync_manager_requests(catalog.database_path()).ok()
-                        })
-                        .unwrap_or_default();
+                    let requests = match self.current_catalog_path() {
+                        Some(path)
+                            if self.guard.ensure(&path).ok()
+                                == Some(rcdvlog_sync::GuardState::Held) =>
+                        {
+                            rcdvlog_sync::drain_sync_manager_requests(&path).unwrap_or_default()
+                        }
+                        _ => Vec::new(),
+                    };
                     if let Some(project_id) = requests.first() {
                         targeted_project = Some(project_id.clone());
                         for project_id in requests.iter().skip(1) {
@@ -323,7 +311,18 @@ impl SyncLoopHandle {
                 }
             }
 
+            // Follow the current catalog: release a swapped-away catalog's guard
+            // and take the new one before syncing it.
+            let Some(current_path) = self.current_catalog_path() else {
+                continue;
+            };
+            let guard_state = self.guard.ensure(&current_path);
             let paired_projects = self.list_paired_projects();
+            if guard_state.ok() != Some(rcdvlog_sync::GuardState::Held) {
+                self.mark_guard_unavailable(&paired_projects);
+                ws_task = None;
+                continue;
+            }
             if paired_projects.is_empty() {
                 // Still ensure WS is cleaned up if no paired projects
                 ws_task = None;
@@ -347,6 +346,23 @@ impl SyncLoopHandle {
         }
         // Shutdown: drop ws_task, which aborts the spawned task
         drop(ws_task);
+    }
+
+    fn current_catalog_path(&self) -> Option<std::path::PathBuf> {
+        self.catalog
+            .read()
+            .ok()
+            .map(|catalog| catalog.database_path().to_path_buf())
+    }
+
+    /// Visible status for a catalog whose sync guard another actor holds.
+    fn mark_guard_unavailable(&self, project_ids: &[String]) {
+        for project_id in project_ids {
+            let mut status = SyncStatus::with_state(project_id.clone(), SyncState::Attention);
+            status.last_error =
+                Some("Sync is paused: another process holds this project's sync lock".to_string());
+            self.set_status(status);
+        }
     }
 
     fn should_attempt(&self, project_id: &str) -> bool {
@@ -394,6 +410,9 @@ impl SyncLoopHandle {
     }
 
     async fn reconcile_project(&mut self, project_id: &str) {
+        let Some(pinned_path) = self.current_catalog_path() else {
+            return;
+        };
         self.active_projects.insert(project_id.to_string());
 
         self.set_status(SyncStatus::with_state(
@@ -427,6 +446,16 @@ impl SyncLoopHandle {
             };
             (s, c)
         };
+
+        // Pinned: `catalog` is the one handle used for every read and write in
+        // this cycle, and the guard must cover exactly its path.
+        if catalog.database_path() != pinned_path
+            || self.guard.ensure(&pinned_path).ok() != Some(rcdvlog_sync::GuardState::Held)
+        {
+            self.mark_guard_unavailable(&[project_id.to_string()]);
+            self.active_projects.remove(project_id);
+            return;
+        }
 
         let server_node_id = match settings.paired_server_node_id.as_deref().filter(|id| {
             catalog
@@ -514,7 +543,6 @@ impl SyncLoopHandle {
 
         // Drop locks before HTTP call
         drop(settings);
-        drop(catalog);
 
         // ── Endpoint selection ──────────────────────────────────────
         let endpoints = self.get_endpoints();
@@ -602,29 +630,41 @@ impl SyncLoopHandle {
         // ── Apply response ──────────────────────────────────────────
         match (response, used_endpoint.as_ref()) {
             (Some(resp), Some(endpoint)) => {
-                // Re-acquire catalog lock to apply server operations
-                let catalog = match self.catalog.read() {
-                    Ok(c) => c.clone(),
-                    Err(_) => {
+                // Apply to the pinned catalog only, and only while it is still
+                // the open one. Acknowledgements are catalog-global and every
+                // catalog shares this node id, so a swapped-in catalog must
+                // never receive them.
+                let applied = match self.current_catalog_path() {
+                    Some(path) => rcdvlog_sync::apply_pinned_reconcile_response(
+                        &catalog,
+                        &path,
+                        &server_node_id,
+                        &resp,
+                    ),
+                    None => Ok(rcdvlog_sync::PinnedApplyOutcome::CatalogChanged),
+                };
+                match applied {
+                    Ok(rcdvlog_sync::PinnedApplyOutcome::Applied) => {}
+                    Ok(rcdvlog_sync::PinnedApplyOutcome::CatalogChanged) => {
+                        eprintln!(
+                            "sync: catalog changed during reconcile of {project_id}; \
+                             discarding results"
+                        );
+                        let mut status =
+                            SyncStatus::with_state(project_id.to_string(), SyncState::Attention);
+                        status.last_error = Some(
+                            "The open catalog changed during sync; results were discarded"
+                                .to_string(),
+                        );
+                        self.set_status(status);
                         self.active_projects.remove(project_id);
                         return;
                     }
-                };
-
-                if !resp.operations.is_empty()
-                    && let Err(e) = apply_reconcile_operations(&catalog, &resp.operations)
-                {
-                    self.record_failure(project_id, Some(&format!("apply failed: {e}")));
-                    self.active_projects.remove(project_id);
-                    return;
-                }
-                if let Err(e) = catalog.record_peer_operation_acknowledgements(
-                    &server_node_id,
-                    &resp.committed_cursors,
-                ) {
-                    self.record_failure(project_id, Some(&format!("acknowledgement failed: {e}")));
-                    self.active_projects.remove(project_id);
-                    return;
+                    Err(e) => {
+                        self.record_failure(project_id, Some(&format!("apply failed: {e}")));
+                        self.active_projects.remove(project_id);
+                        return;
+                    }
                 }
 
                 self.record_success(project_id);

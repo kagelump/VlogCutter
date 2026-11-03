@@ -18,8 +18,8 @@
 //! `edit-plan feedback record` command, with persistent reconciliation receipts;
 //! nothing here writes canonical feedback, a plan or a project catalog.
 use crate::{
-    ReviewTargetActor, ReviewTargetHandoff, ReviewTranscriptionRun, ReviewUtterance,
-    open_read_only_connection, open_writable_connection,
+    ReviewTargetActor, ReviewTranscriptionRun, ReviewUtterance, open_read_only_connection,
+    open_writable_connection,
 };
 use anyhow::Context;
 use chrono::{SecondsFormat, Utc};
@@ -271,6 +271,9 @@ pub struct ReviewWorkspace {
     pub revision_id: String,
     pub viewed_artifact_id: String,
     pub target_digest: String,
+    /// `historicalRenderedArtifactReviewV1` when the movie's current
+    /// renderability was never established; see the target's limitations.
+    pub target_contract: crate::ReviewTargetContract,
     pub sync: SyncDescription,
     pub cuts: Vec<WorkspaceCut>,
     pub utterances: Vec<WorkspaceUtterance>,
@@ -308,7 +311,7 @@ pub struct ReviewDiscussions {
 /// Inputs shared by the workspace and the report.
 struct Context_ {
     run: ReviewTranscriptionRun,
-    handoff: ReviewTargetHandoff,
+    handoff: crate::ReviewTargetEvidence,
     sync: crate::review_sync::SessionSync,
 }
 
@@ -375,7 +378,7 @@ impl ReviewDiscussions {
         let run =
             crate::ReviewTranscripts::new(self.database_path.clone()).get(project_id, run_id)?;
         let handoff = crate::ReviewTargets::new(self.database_path.clone())
-            .handoff(project_id, &run.review_target_id)
+            .evidence(project_id, &run.review_target_id)
             .map_err(|_| ReviewDiscussionError::NotFound)?;
         let sync =
             crate::review_sync::SessionSync::from_session(connection, &run.session_id, &handoff)?;
@@ -434,7 +437,7 @@ impl ReviewDiscussions {
             .map(|u| (u.start_frame, u.end_frame.max(u.start_frame)))
             .collect();
         let synced = context.sync.map_intervals(&intervals, &context.handoff);
-        let movie = &context.handoff.target.movie;
+        let movie = &context.handoff.target().movie;
         let tps = movie.time_base_denominator as f64 / movie.time_base_numerator as f64;
         let mut out = Vec::new();
         for (machine, sync) in context.run.utterances.iter().zip(synced) {
@@ -458,7 +461,7 @@ impl ReviewDiscussions {
                 machine.display_text.clone()
             };
             let human = latest("movieTime");
-            let duration = context.handoff.target.movie.duration_seconds;
+            let duration = context.handoff.target().movie.duration_seconds;
             let (movie_time, mut candidates) = match human {
                 // A human declaration is attributed as such, never as sync.
                 Some(serde_json::Value::Null) => (None, Vec::new()),
@@ -518,7 +521,7 @@ impl ReviewDiscussions {
             let hint = reference_hint(&text);
             if let (Some(hint), Some(first)) = (&hint, candidates.first().cloned()) {
                 // Add the neighbour the speaker seems to mean; still only a candidate.
-                let cuts = &context.handoff.target.cuts;
+                let cuts = &context.handoff.target().cuts;
                 if let Some(index) = cuts.iter().position(|c| c.operation_id == first) {
                     let neighbour = if hint == "previous" {
                         index.checked_sub(1)
@@ -564,7 +567,7 @@ impl ReviewDiscussions {
         let mut context = self.context(&connection, project_id, run_id)?;
         let utterances = self.utterances(&connection, &mut context)?;
         let discussions = load_discussions(&connection, run_id, &utterances)?;
-        let movie = &context.handoff.target.movie;
+        let movie = &context.handoff.target().movie;
         let seconds = |pts: i64| {
             (pts - movie.origin_pts) as f64 * movie.time_base_numerator as f64
                 / movie.time_base_denominator as f64
@@ -574,13 +577,14 @@ impl ReviewDiscussions {
             session_id: context.run.session_id.clone(),
             project_id: project_id.into(),
             review_target_id: context.run.review_target_id.clone(),
-            revision_id: context.handoff.target.revision_id.clone(),
-            viewed_artifact_id: context.handoff.target.viewed_artifact_id.clone(),
-            target_digest: context.handoff.target_digest.clone(),
+            revision_id: context.handoff.target().revision_id.clone(),
+            viewed_artifact_id: context.handoff.target().viewed_artifact_id.clone(),
+            target_digest: context.handoff.target_digest().to_string(),
+            target_contract: context.handoff.contract(),
             sync: context.sync.description().clone(),
             cuts: context
                 .handoff
-                .target
+                .target()
                 .cuts
                 .iter()
                 .map(|c| WorkspaceCut {
@@ -620,7 +624,7 @@ impl ReviewDiscussions {
             {
                 return Err(ReviewDiscussionError::NotFound);
             }
-            let duration = context.handoff.target.movie.duration_seconds;
+            let duration = context.handoff.target().movie.duration_seconds;
             let valid = match field {
                 "text" => value
                     .as_str()
@@ -1134,8 +1138,21 @@ impl ReviewDiscussions {
                 "items": discussion.items,
             }));
         }
+        let mut rules = vec![
+            "Only items with humanAccepted=true reflect an explicit human decision; provisional items are agent suggestions.",
+            "Retracted items are kept for history and are never exported as feedback.",
+            "movieTimeSeconds is a declared playback locator, not verified sync or a source trim.",
+            "Notes target revision revisionId only; map them explicitly on the owning catalog if the plan has changed.",
+            "Do not activate plans, patch timelines or make paid calls from this report without explicit authorization.",
+        ];
+        if workspace.target_contract
+            == crate::ReviewTargetContract::HistoricalRenderedArtifactReviewV1
+        {
+            rules.push("targetContract is historicalRenderedArtifactReviewV1: this discussion concerns an already rendered movie whose current sources, constraints and plan renderability were not established; it grants no render, edit, activation, upload, source-trim or feedback-apply authority.");
+        }
         Ok(serde_json::json!({
             "schema": REVIEW_REPORT_SCHEMA,
+            "targetContract": workspace.target_contract,
             "projectId": workspace.project_id,
             "revisionId": workspace.revision_id,
             "viewedArtifactId": workspace.viewed_artifact_id,
@@ -1145,13 +1162,7 @@ impl ReviewDiscussions {
             "transcriptionRunId": workspace.run_id,
             "sync": workspace.sync,
             "coverage": workspace.coverage,
-            "rules": [
-                "Only items with humanAccepted=true reflect an explicit human decision; provisional items are agent suggestions.",
-                "Retracted items are kept for history and are never exported as feedback.",
-                "movieTimeSeconds is a declared playback locator, not verified sync or a source trim.",
-                "Notes target revision revisionId only; map them explicitly on the owning catalog if the plan has changed.",
-                "Do not activate plans, patch timelines or make paid calls from this report without explicit authorization."
-            ],
+            "rules": rules,
             "discussions": discussions,
             "feedback": feedback,
             "unresolved": unresolved,

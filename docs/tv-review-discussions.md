@@ -113,7 +113,11 @@ collects its speakers, languages and the union of its candidates.
 `review-report.v1`. It contains:
 
 - **Identity:** project, revision, viewed artifact, target digest, session
-  and run.
+  and run, plus `targetContract`. For `historicalRenderedArtifactReviewV1`
+  (#232) the rules add that the movie's current sources, constraints and
+  renderability were not established and that the report grants no render,
+  edit, activation, upload, source-trim or feedback-apply authority. See
+  [the server historical-review policy](tv-review-handoff.md#server-historical-review-policy).
 - **Sync status:** the shared synchronizer's status, policy, anchor and
   boundary counts and diagnostics; each quoted utterance carries its `sync`.
 - **Coverage statement:** `audiovisualReviewAttested: false`. A recording is

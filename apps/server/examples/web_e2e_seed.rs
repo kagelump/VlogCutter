@@ -51,6 +51,37 @@ fn main() -> Result<()> {
         handoff.validate()?;
         std::fs::write(output, serde_json::to_vec_pretty(&handoff)?)?;
     }
+    // A synthetic #232 historical rendered-artifact review of a different,
+    // earlier render: same shape, weaker receipt, imported only through its
+    // own acknowledged route.
+    if let Some(output) = std::env::var_os("RCDVLOG_E2E_HISTORICAL_REVIEW_FILE") {
+        let mut target = serde_json::from_str::<ReviewTargetHandoff>(include_str!(
+            "../../../core/rcdvlog-core/tests/fixtures/review-target/v1.json"
+        ))?
+        .target;
+        target.project_id = project.id.clone();
+        target.youtube_video_id = None;
+        target.revision_id = "editrev_historical".into();
+        target.viewed_artifact_id = "preview_historical".into();
+        let review = rcdvlog_server_core::HistoricalRenderedArtifactReview {
+            schema_version: 1,
+            purpose: rcdvlog_server_core::HistoricalReviewPurpose::HistoricalRenderedArtifactReview,
+            target_digest: ReviewTargetHandoff::snapshot_digest(&target)?,
+            target,
+            verified_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            output_matches: true,
+            mapping_matches_revision: true,
+            stored_fully_decoded: true,
+            current_source_verification:
+                rcdvlog_server_core::HistoricalReviewUnresolved::NotEstablishedByThisReview,
+            current_constraints_verification:
+                rcdvlog_server_core::HistoricalReviewUnresolved::NotEstablishedByThisReview,
+            current_plan_renderability:
+                rcdvlog_server_core::HistoricalReviewUnresolved::NotEstablishedByThisReview,
+        };
+        review.validate()?;
+        std::fs::write(output, serde_json::to_vec_pretty(&review)?)?;
+    }
     if let Some(output) = std::env::var_os("RCDVLOG_E2E_REVIEW_RUN_FILE") {
         let path = seed_transcribed_review(&control, &project.id)?;
         std::fs::write(output, path)?;

@@ -304,3 +304,8 @@ button.danger { background: #f08a7e; border-color: #f08a7e; }
 .secondary-link { background: transparent; color: var(--cyan); }
 .tv-speaker-select select { font-size: 12px; padding: 2px; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.tv-historical { display: grid; gap: 8px; margin: 0; padding: 12px; border: 1px solid var(--amber); border-radius: 6px; }
+.tv-historical legend { padding: 0 4px; font-weight: 600; }
+.tv-acknowledge { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; }
+.tv-acknowledge input { margin-top: 3px; }
+.tv-historical-note { margin: 0; padding: 10px 12px; border-left: 3px solid var(--amber); background: var(--panel); }

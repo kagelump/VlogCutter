@@ -16,8 +16,10 @@ use crate::{AuditActorType, open_read_only_connection, open_writable_connection}
 use anyhow::Context;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rcdvlog_core::{
+    HistoricalRenderedArtifactReview, HistoricalReviewPurpose, HistoricalReviewUnresolved,
     REVIEW_TARGET_SCHEMA_VERSION, ReviewTargetCut, ReviewTargetError, ReviewTargetHandoff,
     ReviewTargetMovie, ReviewTargetSnapshot, ReviewTargetVerification,
+    tv_review_sync::{SyncQuery, SyncReport, SyncRequest},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -43,6 +45,170 @@ pub const REVIEW_TARGET_LIMITATIONS: &[&str] = &[
     "Declared audio describes intent; it does not prove audible presence or measured alignment.",
     "A recording made against this target does not by itself establish human audiovisual coverage.",
 ];
+
+/// What a historical rendered-artifact review (#232) leaves open. Prepended to
+/// the limitations of every historical target so no surface can omit them.
+pub const HISTORICAL_REVIEW_TARGET_LIMITATIONS: &[&str] = &[
+    "Historical rendered-artifact review: the owning host re-hashed this completed movie and bound it to its earlier full-decode receipt and immutable revision mapping.",
+    "Current source verification was not established by this review.",
+    "Current human/chronology/story constraints were not established by this review.",
+    "Current plan renderability was not established by this review; this target grants no render, edit, activation, upload, source-trim or feedback-apply authority.",
+];
+
+/// The exact acknowledgement the historical import route requires. A caller
+/// must state that it accepts integrity-only evidence; there is no default.
+pub const HISTORICAL_REVIEW_ACKNOWLEDGEMENT: &str =
+    "integrityOnlyCurrentRenderabilityNotEstablished";
+
+/// Which export contract a stored target came from. Both share the v1 snapshot
+/// and digest; they differ in what the owning host verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewTargetContract {
+    /// `ReviewTargetHandoff` v1: fresh output, inputs, constraints and renderability.
+    ReviewTargetV1,
+    /// `HistoricalRenderedArtifactReview` v1: integrity of a completed movie only.
+    HistoricalRenderedArtifactReviewV1,
+}
+
+impl ReviewTargetContract {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReviewTargetV1 => "reviewTargetV1",
+            Self::HistoricalRenderedArtifactReviewV1 => "historicalRenderedArtifactReviewV1",
+        }
+    }
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "reviewTargetV1" => Ok(Self::ReviewTargetV1),
+            "historicalRenderedArtifactReviewV1" => Ok(Self::HistoricalRenderedArtifactReviewV1),
+            other => anyhow::bail!("unknown stored review target contract {other}"),
+        }
+    }
+}
+
+/// The integrity statements of a historical review, kept per observation in
+/// place of a strict verification receipt. Never convertible into one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoricalIntegrityReceipt {
+    pub verified_at: String,
+    pub output_matches: bool,
+    pub mapping_matches_revision: bool,
+    pub stored_fully_decoded: bool,
+    pub current_source_verification: HistoricalReviewUnresolved,
+    pub current_constraints_verification: HistoricalReviewUnresolved,
+    pub current_plan_renderability: HistoricalReviewUnresolved,
+}
+
+impl HistoricalIntegrityReceipt {
+    fn of(review: &HistoricalRenderedArtifactReview) -> Self {
+        Self {
+            verified_at: review.verified_at.clone(),
+            output_matches: review.output_matches,
+            mapping_matches_revision: review.mapping_matches_revision,
+            stored_fully_decoded: review.stored_fully_decoded,
+            current_source_verification: review.current_source_verification.clone(),
+            current_constraints_verification: review.current_constraints_verification.clone(),
+            current_plan_renderability: review.current_plan_renderability.clone(),
+        }
+    }
+}
+
+/// One observation's receipt. Serialized untagged so a strict target's
+/// observations keep their established shape; the target's `contract` says
+/// which variant every one of its observations holds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ReviewTargetReceipt {
+    Current(ReviewTargetVerification),
+    Historical(HistoricalIntegrityReceipt),
+}
+
+impl ReviewTargetReceipt {
+    pub fn verified_at(&self) -> &str {
+        match self {
+            Self::Current(v) => &v.verified_at,
+            Self::Historical(h) => &h.verified_at,
+        }
+    }
+}
+
+/// A stored target as the contract it was imported under. Strict callers use
+/// [`ReviewTargets::handoff`], which refuses historical evidence; contract-aware
+/// callers (synchronization, candidates, the editorial workspace) use this.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReviewTargetEvidence {
+    Current(ReviewTargetHandoff),
+    Historical(HistoricalRenderedArtifactReview),
+}
+
+impl ReviewTargetEvidence {
+    pub fn contract(&self) -> ReviewTargetContract {
+        match self {
+            Self::Current(_) => ReviewTargetContract::ReviewTargetV1,
+            Self::Historical(_) => ReviewTargetContract::HistoricalRenderedArtifactReviewV1,
+        }
+    }
+    pub fn target(&self) -> &ReviewTargetSnapshot {
+        match self {
+            Self::Current(h) => &h.target,
+            Self::Historical(h) => &h.target,
+        }
+    }
+    pub fn target_digest(&self) -> &str {
+        match self {
+            Self::Current(h) => &h.target_digest,
+            Self::Historical(h) => &h.target_digest,
+        }
+    }
+    fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Current(h) => h.validate(),
+            Self::Historical(h) => h.validate(),
+        }
+    }
+    /// Map through the shared synchronizer at the matching core boundary.
+    pub fn map_to_cuts(
+        &self,
+        request: &SyncRequest,
+        queries: &[SyncQuery],
+        cancel: &dyn Fn() -> bool,
+    ) -> anyhow::Result<SyncReport> {
+        match self {
+            Self::Current(h) => request.map_to_cuts(queries, h, cancel),
+            Self::Historical(h) => request.map_to_historical_cuts(queries, h, cancel),
+        }
+    }
+    /// Picture locators for a movie-time range; validates the evidence first.
+    pub fn picture_candidates(
+        &self,
+        start_seconds: f64,
+        end_seconds: f64,
+    ) -> anyhow::Result<Vec<String>> {
+        match self {
+            Self::Current(h) => h.picture_candidates(start_seconds, end_seconds),
+            Self::Historical(h) => h.picture_candidates(start_seconds, end_seconds),
+        }
+    }
+}
+
+/// The historical import request: the `data` member of
+/// `edit-plan.historical-review-target-export` plus an explicit acknowledgement.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoricalReviewTargetImportRequest {
+    pub review: serde_json::Value,
+    /// Must equal [`HISTORICAL_REVIEW_ACKNOWLEDGEMENT`].
+    #[serde(default)]
+    pub acknowledgement: Option<String>,
+    #[serde(default)]
+    pub declared_issuer: Option<String>,
+    #[serde(default)]
+    pub availability: Option<ArtifactAvailabilityAssertion>,
+    #[serde(default)]
+    pub max_verification_age_seconds: Option<u32>,
+}
 
 #[derive(Debug, Error)]
 pub enum ReviewTargetServiceError {
@@ -181,6 +347,7 @@ pub enum PreflightOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewTargetPreview {
+    pub contract: ReviewTargetContract,
     pub project_id: String,
     pub revision_id: String,
     pub viewed_artifact_id: String,
@@ -261,7 +428,9 @@ pub struct ReviewTargetProvenance {
 #[serde(rename_all = "camelCase")]
 pub struct ReviewTargetObservation {
     pub observation_id: String,
-    pub verification: ReviewTargetVerification,
+    /// A strict verification receipt, or a historical integrity receipt when
+    /// the target's `contract` is `historicalRenderedArtifactReviewV1`.
+    pub verification: ReviewTargetReceipt,
     pub availability_state: ArtifactAvailabilityState,
     pub availability_observed_at: String,
     pub availability_source: String,
@@ -295,6 +464,7 @@ pub struct ReviewTargetReadiness {
 #[serde(rename_all = "camelCase")]
 pub struct ReviewTargetSummary {
     pub review_target_id: String,
+    pub contract: ReviewTargetContract,
     pub project_id: String,
     pub revision_id: String,
     pub viewed_artifact_id: String,
@@ -320,7 +490,7 @@ pub struct ReviewTargetDetail {
     pub cuts: Vec<ReviewTargetCutView>,
     pub provenance: ReviewTargetProvenance,
     pub observations: Vec<ReviewTargetObservation>,
-    pub limitations: &'static [&'static str],
+    pub limitations: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -362,7 +532,7 @@ pub struct ReviewTargets {
 
 /// Parsed and checked import, before it touches storage.
 struct Evaluated {
-    handoff: ReviewTargetHandoff,
+    evidence: ReviewTargetEvidence,
     max_age: u32,
     binding_digest: String,
     availability: ArtifactAvailabilityAssertion,
@@ -446,7 +616,7 @@ fn readiness(
 ) -> ReviewTargetReadiness {
     let verified_at = observations
         .iter()
-        .map(|o| o.verification.verified_at.as_str())
+        .map(|o| o.verification.verified_at())
         .max_by_key(|v| DateTime::parse_from_rfc3339(v).ok())
         .unwrap_or_default();
     // Ties go to the later record (observations are in insertion order within a receipt).
@@ -485,6 +655,218 @@ fn readiness(
     }
 }
 
+/// Import policy shared by both contracts.
+struct ImportPolicy<'a> {
+    declared_issuer: Option<&'a str>,
+    availability: Option<&'a ArtifactAvailabilityAssertion>,
+    max_verification_age_seconds: Option<u32>,
+}
+
+impl ReviewTargetImportRequest {
+    fn policy(&self) -> ImportPolicy<'_> {
+        ImportPolicy {
+            declared_issuer: self.declared_issuer.as_deref(),
+            availability: self.availability.as_ref(),
+            max_verification_age_seconds: self.max_verification_age_seconds,
+        }
+    }
+}
+
+impl HistoricalReviewTargetImportRequest {
+    fn policy(&self) -> ImportPolicy<'_> {
+        ImportPolicy {
+            declared_issuer: self.declared_issuer.as_deref(),
+            availability: self.availability.as_ref(),
+            max_verification_age_seconds: self.max_verification_age_seconds,
+        }
+    }
+}
+
+impl ReviewTargetEvidence {
+    fn receipt(&self) -> ReviewTargetReceipt {
+        match self {
+            Self::Current(h) => ReviewTargetReceipt::Current(h.verification.clone()),
+            Self::Historical(h) => {
+                ReviewTargetReceipt::Historical(HistoricalIntegrityReceipt::of(h))
+            }
+        }
+    }
+}
+
+const HISTORICAL_PURPOSE: &str = "historicalRenderedArtifactReview";
+
+fn is_historical(value: &serde_json::Value) -> bool {
+    value.get("purpose").and_then(serde_json::Value::as_str) == Some(HISTORICAL_PURPOSE)
+}
+
+fn schema_version_check(report: &mut ReviewTargetPreflight, value: &serde_json::Value) -> bool {
+    // Version first, so an unknown future version is reported as such
+    // rather than as an unknown-field parse failure.
+    let version = value
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64);
+    if version != Some(u64::from(REVIEW_TARGET_SCHEMA_VERSION)) {
+        report.checks.push(check(
+            "schemaVersion",
+            ReviewTargetCheckStatus::Fail,
+            Some("review_target_unsupported_version"),
+            format!(
+                "this server imports review target schema version {REVIEW_TARGET_SCHEMA_VERSION} only"
+            ),
+        ));
+        return false;
+    }
+    report.checks.push(check(
+        "schemaVersion",
+        ReviewTargetCheckStatus::Pass,
+        None,
+        "schema version 1",
+    ));
+    true
+}
+
+fn parse_failure(report: &mut ReviewTargetPreflight, error: anyhow::Error) {
+    let code = match error.downcast_ref::<ReviewTargetError>() {
+        Some(typed) => typed.code(),
+        None => "review_target_invalid",
+    };
+    let name = match code {
+        "review_target_digest_mismatch" => "targetDigest",
+        "review_target_artifact_not_verified" => "verificationReceipt",
+        _ => "structure",
+    };
+    report.checks.push(check(
+        name,
+        ReviewTargetCheckStatus::Fail,
+        Some(code),
+        error.to_string(),
+    ));
+}
+
+fn parse_current(
+    report: &mut ReviewTargetPreflight,
+    value: &serde_json::Value,
+) -> Result<Option<ReviewTargetEvidence>, ReviewTargetServiceError> {
+    if is_historical(value) {
+        report.checks.push(check(
+            "contract",
+            ReviewTargetCheckStatus::Fail,
+            Some("review_target_historical_contract"),
+            "this is a historical rendered-artifact review, not a currently renderable target; import it through the historical route, which states what it does not establish",
+        ));
+        return Ok(None);
+    }
+    if !schema_version_check(report, value) {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(value).context("serialize handoff")?;
+    let handoff = match ReviewTargetHandoff::from_json(&bytes) {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            parse_failure(report, error);
+            return Ok(None);
+        }
+    };
+    report.checks.push(check(
+        "structure",
+        ReviewTargetCheckStatus::Pass,
+        None,
+        "shape, limits, unique operations and contiguous frame-complete mapping validated by the shared Rust validator",
+    ));
+    report.checks.push(check(
+        "targetDigest",
+        ReviewTargetCheckStatus::Pass,
+        None,
+        "recomputed by the shared Rust digest; establishes consistency only",
+    ));
+    report.checks.push(check(
+        "verificationReceipt",
+        ReviewTargetCheckStatus::Pass,
+        None,
+        "owning host reported output, inputs, constraints, renderability and full decode",
+    ));
+    Ok(Some(ReviewTargetEvidence::Current(handoff)))
+}
+
+fn parse_historical(
+    report: &mut ReviewTargetPreflight,
+    request: &HistoricalReviewTargetImportRequest,
+) -> Result<Option<ReviewTargetEvidence>, ReviewTargetServiceError> {
+    if request.acknowledgement.as_deref() != Some(HISTORICAL_REVIEW_ACKNOWLEDGEMENT) {
+        report.checks.push(check(
+            "historicalPolicy",
+            ReviewTargetCheckStatus::Fail,
+            Some("review_target_historical_acknowledgement_required"),
+            format!(
+                "a historical review establishes movie integrity only; the importer must acknowledge \"{HISTORICAL_REVIEW_ACKNOWLEDGEMENT}\""
+            ),
+        ));
+        return Ok(None);
+    }
+    report.checks.push(check(
+        "historicalPolicy",
+        ReviewTargetCheckStatus::Pass,
+        None,
+        "importer acknowledged that current sources, constraints and renderability are not established",
+    ));
+    let value = &request.review;
+    if !is_historical(value) {
+        report.checks.push(check(
+            "contract",
+            ReviewTargetCheckStatus::Fail,
+            Some("review_target_not_historical"),
+            "this is not a historical rendered-artifact review; import a current review target through the standard route",
+        ));
+        return Ok(None);
+    }
+    if !schema_version_check(report, value) {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(value).context("serialize historical review")?;
+    let review = match HistoricalRenderedArtifactReview::from_json(&bytes) {
+        Ok(review) => review,
+        Err(error) => {
+            parse_failure(report, error);
+            return Ok(None);
+        }
+    };
+    debug_assert_eq!(
+        review.purpose,
+        HistoricalReviewPurpose::HistoricalRenderedArtifactReview
+    );
+    report.checks.push(check(
+        "structure",
+        ReviewTargetCheckStatus::Pass,
+        None,
+        "shape, limits, unique operations and contiguous frame-complete mapping validated by the shared Rust validator",
+    ));
+    report.checks.push(check(
+        "targetDigest",
+        ReviewTargetCheckStatus::Pass,
+        None,
+        "recomputed by the shared Rust digest; establishes consistency only",
+    ));
+    report.checks.push(check(
+        "integrityReceipt",
+        ReviewTargetCheckStatus::Pass,
+        None,
+        "owning host re-hashed the completed movie, bound its earlier full-decode receipt and matched every cut to the immutable revision",
+    ));
+    for (name, what) in [
+        ("currentSources", "current source verification"),
+        ("currentConstraints", "current constraints"),
+        ("currentRenderability", "current plan renderability"),
+    ] {
+        report.checks.push(check(
+            name,
+            ReviewTargetCheckStatus::Warn,
+            None,
+            format!("{what} is not established by this historical review"),
+        ));
+    }
+    Ok(Some(ReviewTargetEvidence::Historical(review)))
+}
+
 impl ReviewTargets {
     pub(crate) fn new(database_path: PathBuf) -> Self {
         Self { database_path }
@@ -514,16 +896,44 @@ impl ReviewTargets {
     ) -> Result<ReviewTargetPreflight, ReviewTargetServiceError> {
         let connection = open_read_only_connection(&self.database_path)?;
         Self::project_registered(&connection, project_id)?;
-        Ok(Self::evaluate(&connection, project_id, request, now)?.0)
+        Ok(
+            Self::evaluate(&connection, project_id, &request.policy(), now, |report| {
+                parse_current(report, &request.handoff)
+            })?
+            .0,
+        )
     }
 
+    /// Preflight a historical rendered-artifact review (#232). Same storage
+    /// policy as a strict target, plus a required explicit acknowledgement.
+    pub fn preflight_historical(
+        &self,
+        project_id: &str,
+        request: &HistoricalReviewTargetImportRequest,
+        now: DateTime<Utc>,
+    ) -> Result<ReviewTargetPreflight, ReviewTargetServiceError> {
+        let connection = open_read_only_connection(&self.database_path)?;
+        Self::project_registered(&connection, project_id)?;
+        Ok(
+            Self::evaluate(&connection, project_id, &request.policy(), now, |report| {
+                parse_historical(report, request)
+            })?
+            .0,
+        )
+    }
+
+    /// Shared policy over a parsed target of either contract. `parse` records
+    /// its own contract checks and returns `None` when the target is unusable.
     fn evaluate(
         connection: &Connection,
         project_id: &str,
-        request: &ReviewTargetImportRequest,
+        policy: &ImportPolicy<'_>,
         now: DateTime<Utc>,
+        parse: impl FnOnce(
+            &mut ReviewTargetPreflight,
+        ) -> Result<Option<ReviewTargetEvidence>, ReviewTargetServiceError>,
     ) -> Result<(ReviewTargetPreflight, Option<Evaluated>), ReviewTargetServiceError> {
-        let max_age = request
+        let max_age = policy
             .max_verification_age_seconds
             .unwrap_or(REVIEW_TARGET_SERVER_MAX_VERIFICATION_AGE_SECONDS)
             .min(REVIEW_TARGET_SERVER_MAX_VERIFICATION_AGE_SECONDS);
@@ -545,7 +955,7 @@ impl ReviewTargets {
             ));
             return Ok((report, None));
         }
-        let declared_issuer = match validate_declared_issuer(request.declared_issuer.as_deref()) {
+        let declared_issuer = match validate_declared_issuer(policy.declared_issuer) {
             Ok(value) => value,
             Err(message) => {
                 report.checks.push(check(
@@ -557,82 +967,24 @@ impl ReviewTargets {
                 return Ok((report, None));
             }
         };
-
-        // Version first, so an unknown future version is reported as such
-        // rather than as an unknown-field parse failure.
-        let version = request
-            .handoff
-            .get("schemaVersion")
-            .and_then(serde_json::Value::as_u64);
-        if version != Some(u64::from(REVIEW_TARGET_SCHEMA_VERSION)) {
-            report.checks.push(check(
-                "schemaVersion",
-                ReviewTargetCheckStatus::Fail,
-                Some("review_target_unsupported_version"),
-                format!(
-                    "this server imports review target schema version {REVIEW_TARGET_SCHEMA_VERSION} only"
-                ),
-            ));
+        let Some(evidence) = parse(&mut report)? else {
             return Ok((report, None));
-        }
-        report.checks.push(check(
-            "schemaVersion",
-            ReviewTargetCheckStatus::Pass,
-            None,
-            "schema version 1",
-        ));
-
-        let bytes = serde_json::to_vec(&request.handoff).context("serialize handoff")?;
-        let handoff = match ReviewTargetHandoff::from_json(&bytes) {
-            Ok(handoff) => handoff,
-            Err(error) => {
-                let code = match error.downcast_ref::<ReviewTargetError>() {
-                    Some(typed) => typed.code(),
-                    None => "review_target_invalid",
-                };
-                let name = match code {
-                    "review_target_digest_mismatch" => "targetDigest",
-                    "review_target_artifact_not_verified" => "verificationReceipt",
-                    _ => "structure",
-                };
-                report.checks.push(check(
-                    name,
-                    ReviewTargetCheckStatus::Fail,
-                    Some(code),
-                    error.to_string(),
-                ));
-                return Ok((report, None));
-            }
         };
-        report.checks.push(check(
-            "structure",
-            ReviewTargetCheckStatus::Pass,
-            None,
-            "shape, limits, unique operations and contiguous frame-complete mapping validated by the shared Rust validator",
-        ));
-        report.checks.push(check(
-            "targetDigest",
-            ReviewTargetCheckStatus::Pass,
-            None,
-            "recomputed by the shared Rust digest; establishes consistency only",
-        ));
-        report.checks.push(check(
-            "verificationReceipt",
-            ReviewTargetCheckStatus::Pass,
-            None,
-            "owning host reported output, inputs, constraints, renderability and full decode",
-        ));
-        let target = &handoff.target;
+        let contract = evidence.contract();
+        let receipt = evidence.receipt();
+        let target = evidence.target().clone();
+        let target_digest = evidence.target_digest().to_string();
         report.preview = Some(ReviewTargetPreview {
+            contract,
             project_id: target.project_id.clone(),
             revision_id: target.revision_id.clone(),
             viewed_artifact_id: target.viewed_artifact_id.clone(),
-            target_digest: handoff.target_digest.clone(),
+            target_digest: target_digest.clone(),
             movie_blake3: target.movie.blake3.clone(),
             duration_seconds: target.movie.duration_seconds,
             cut_count: target.cuts.len(),
             youtube_video_id: target.youtube_video_id.clone(),
-            verified_at: handoff.verification.verified_at.clone(),
+            verified_at: receipt.verified_at().to_string(),
         });
 
         if target.project_id != project_id {
@@ -651,28 +1003,26 @@ impl ReviewTargets {
             ));
         }
 
-        match handoff.require_fresh(now, max_age) {
-            Ok(()) => report.checks.push(check(
+        // The same lifetime policy for both contracts: an old receipt says
+        // nothing about whether the movie is still on its owning host.
+        let (fresh, _) = freshness(receipt.verified_at(), now, max_age);
+        if fresh == VerificationFreshness::Fresh {
+            report.checks.push(check(
                 "freshness",
                 ReviewTargetCheckStatus::Pass,
                 None,
                 format!("verified within the last {max_age} seconds"),
-            )),
-            Err(error) => {
-                let code = error
-                    .downcast_ref::<ReviewTargetError>()
-                    .map(ReviewTargetError::code)
-                    .unwrap_or("review_target_verification_expired");
-                report.checks.push(check(
-                    "freshness",
-                    ReviewTargetCheckStatus::Fail,
-                    Some(code),
-                    "verification is expired or in the future; re-export on the owning host",
-                ));
-            }
+            ));
+        } else {
+            report.checks.push(check(
+                "freshness",
+                ReviewTargetCheckStatus::Fail,
+                Some("review_target_verification_expired"),
+                "verification is expired or in the future; re-export on the owning host",
+            ));
         }
 
-        let (availability, availability_source) = match &request.availability {
+        let (availability, availability_source) = match policy.availability {
             Some(assertion) => {
                 if DateTime::parse_from_rfc3339(&assertion.observed_at).is_err() {
                     report.checks.push(check(
@@ -688,7 +1038,7 @@ impl ReviewTargets {
             None => (
                 ArtifactAvailabilityAssertion {
                     state: ArtifactAvailabilityState::Present,
-                    observed_at: handoff.verification.verified_at.clone(),
+                    observed_at: receipt.verified_at().to_string(),
                 },
                 "exportVerification",
             ),
@@ -739,17 +1089,35 @@ impl ReviewTargets {
             },
         ));
 
-        let binding = binding_digest(target)?;
-        // Same digest: duplicate or refresh.
-        let existing: Option<String> = connection
+        let binding = binding_digest(&target)?;
+        // Same digest: duplicate or refresh — but only under the same contract.
+        let existing: Option<(String, String)> = connection
             .query_row(
-                "SELECT review_target_id FROM review_targets WHERE project_id=?1 AND target_digest=?2",
-                params![project_id, handoff.target_digest],
-                |row| row.get(0),
+                "SELECT review_target_id, contract FROM review_targets WHERE project_id=?1 AND target_digest=?2",
+                params![project_id, target_digest],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        let existing = match existing {
+            Some((id, stored)) if stored != contract.as_str() => {
+                // Both contracts digest the same snapshot. Adding a historical
+                // receipt to a strict target (or the reverse) would change
+                // what sessions already bound to it were promised.
+                report.checks.push(check(
+                    "contract",
+                    ReviewTargetCheckStatus::Fail,
+                    Some("review_target_contract_conflict"),
+                    format!(
+                        "this snapshot is already stored as {id} under the {stored} contract; nothing will be changed"
+                    ),
+                ));
+                report.conflicting_review_target_ids.push(id);
+                None
+            }
+            Some((id, _)) => Some(id),
+            None => None,
+        };
         // Same artifact with different binding: conflict.
-        let mut conflicts = Vec::new();
         {
             let mut statement = connection.prepare(
                 "SELECT review_target_id FROM review_targets
@@ -760,29 +1128,32 @@ impl ReviewTargets {
                 params![project_id, target.viewed_artifact_id, binding],
                 |row| row.get::<_, String>(0),
             )?;
+            let mut identity_conflicts = Vec::new();
             for row in rows {
-                conflicts.push(row?);
+                identity_conflicts.push(row?);
+            }
+            if identity_conflicts.is_empty() {
+                report.checks.push(check(
+                    "identity",
+                    ReviewTargetCheckStatus::Pass,
+                    None,
+                    match &existing {
+                        Some(id) => format!("identical target already stored as {id}"),
+                        None => "no stored target reuses this viewed artifact differently".into(),
+                    },
+                ));
+            } else {
+                report.checks.push(check(
+                    "identity",
+                    ReviewTargetCheckStatus::Fail,
+                    Some("review_target_conflict"),
+                    "this viewed artifact was already imported with different movie bytes, plan, revision or cut mapping; nothing will be overwritten",
+                ));
+                report
+                    .conflicting_review_target_ids
+                    .extend(identity_conflicts);
             }
         }
-        if conflicts.is_empty() {
-            report.checks.push(check(
-                "identity",
-                ReviewTargetCheckStatus::Pass,
-                None,
-                match &existing {
-                    Some(id) => format!("identical target already stored as {id}"),
-                    None => "no stored target reuses this viewed artifact differently".into(),
-                },
-            ));
-        } else {
-            report.checks.push(check(
-                "identity",
-                ReviewTargetCheckStatus::Fail,
-                Some("review_target_conflict"),
-                "this viewed artifact was already imported with different movie bytes, plan, revision or cut mapping; nothing will be overwritten",
-            ));
-        }
-        report.conflicting_review_target_ids = conflicts;
 
         let failed = report.first_failure().is_some();
         report.importable = !failed;
@@ -800,7 +1171,7 @@ impl ReviewTargets {
                        AND max_verification_age_seconds=?5",
                     params![
                         id,
-                        handoff.verification.verified_at,
+                        receipt.verified_at(),
                         availability.state.as_str(),
                         availability.observed_at,
                         max_age
@@ -827,7 +1198,7 @@ impl ReviewTargets {
             .all(|c| c.code == Some("review_target_artifact_unavailable"));
         let evaluated =
             (!failed || (only_availability_failed && existing.is_some())).then_some(Evaluated {
-                handoff,
+                evidence,
                 max_age,
                 binding_digest: binding,
                 availability,
@@ -845,16 +1216,46 @@ impl ReviewTargets {
         actor: &ReviewTargetActor,
         now: DateTime<Utc>,
     ) -> Result<ReviewTargetImportResult, ReviewTargetServiceError> {
+        self.import_with(project_id, &request.policy(), actor, now, |report| {
+            parse_current(report, &request.handoff)
+        })
+    }
+
+    /// Import a historical rendered-artifact review under its own explicit
+    /// policy. It is stored with contract `historicalRenderedArtifactReviewV1`
+    /// and can never be read back as a strict `ReviewTargetHandoff`.
+    pub fn import_historical(
+        &self,
+        project_id: &str,
+        request: &HistoricalReviewTargetImportRequest,
+        actor: &ReviewTargetActor,
+        now: DateTime<Utc>,
+    ) -> Result<ReviewTargetImportResult, ReviewTargetServiceError> {
+        self.import_with(project_id, &request.policy(), actor, now, |report| {
+            parse_historical(report, request)
+        })
+    }
+
+    fn import_with(
+        &self,
+        project_id: &str,
+        policy: &ImportPolicy<'_>,
+        actor: &ReviewTargetActor,
+        now: DateTime<Utc>,
+        parse: impl FnOnce(
+            &mut ReviewTargetPreflight,
+        ) -> Result<Option<ReviewTargetEvidence>, ReviewTargetServiceError>,
+    ) -> Result<ReviewTargetImportResult, ReviewTargetServiceError> {
         let mut connection = open_writable_connection(&self.database_path)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::project_registered(&tx, project_id)?;
-        let (report, evaluated) = Self::evaluate(&tx, project_id, request, now)?;
+        let (report, evaluated) = Self::evaluate(&tx, project_id, policy, now, parse)?;
         if let Some(code) = report.first_failure() {
             if let (Some(adverse), Some(id)) = (&evaluated, &report.existing_review_target_id) {
                 insert_observation(
                     &tx,
                     id,
-                    &adverse.handoff.verification,
+                    &adverse.evidence.receipt(),
                     &adverse.availability,
                     adverse.availability_source,
                     adverse.max_age,
@@ -869,14 +1270,15 @@ impl ReviewTargets {
             });
         }
         let evaluated = evaluated.context("evaluated import")?;
-        let declared_issuer = validate_declared_issuer(request.declared_issuer.as_deref())
+        let declared_issuer = validate_declared_issuer(policy.declared_issuer)
             .map_err(ReviewTargetServiceError::InvalidInput)?;
+        let receipt = evaluated.evidence.receipt();
         let (review_target_id, outcome) = match report.existing_review_target_id.clone() {
             Some(id) => {
                 let inserted = insert_observation(
                     &tx,
                     &id,
-                    &evaluated.handoff.verification,
+                    &receipt,
                     &evaluated.availability,
                     evaluated.availability_source,
                     evaluated.max_age,
@@ -895,11 +1297,11 @@ impl ReviewTargets {
             None => {
                 let id = insert_target(
                     &tx,
-                    &evaluated.handoff,
+                    &evaluated.evidence,
                     &evaluated.binding_digest,
                     evaluated
-                        .handoff
-                        .target
+                        .evidence
+                        .target()
                         .youtube_video_id
                         .as_ref()
                         .map(|_| "export"),
@@ -911,7 +1313,7 @@ impl ReviewTargets {
                 insert_observation(
                     &tx,
                     &id,
-                    &evaluated.handoff.verification,
+                    &receipt,
                     &evaluated.availability,
                     evaluated.availability_source,
                     evaluated.max_age,
@@ -953,7 +1355,7 @@ impl ReviewTargets {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::project_registered(&tx, project_id)?;
         let stored = load_stored(&tx, project_id, review_target_id)?;
-        let parent_observations = load_observations(&tx, review_target_id)?;
+        let parent_observations = load_observations(&tx, stored.contract, review_target_id)?;
         let parent_policy = parent_observations
             .iter()
             .map(|o| o.max_verification_age_seconds)
@@ -965,26 +1367,28 @@ impl ReviewTargets {
             .context("review target has no verification observation")?;
         let mut target = stored.snapshot.clone();
         target.youtube_video_id = youtube_video_id.map(str::to_string);
-        let handoff = ReviewTargetHandoff {
-            schema_version: REVIEW_TARGET_SCHEMA_VERSION,
-            target_digest: ReviewTargetHandoff::snapshot_digest(&target)?,
-            target,
-            verification: latest.verification.clone(),
-        };
-        handoff.validate()?;
-        let existing: Option<String> = tx
+        // The rebound snapshot keeps its parent's contract and receipt: a
+        // historical target stays historical.
+        let evidence = evidence_from(stored.contract, target, &latest.verification)?;
+        evidence.validate()?;
+        let existing: Option<(String, String)> = tx
             .query_row(
-                "SELECT review_target_id FROM review_targets WHERE project_id=?1 AND target_digest=?2",
-                params![project_id, handoff.target_digest],
-                |row| row.get(0),
+                "SELECT review_target_id, contract FROM review_targets WHERE project_id=?1 AND target_digest=?2",
+                params![project_id, evidence.target_digest()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         let (id, outcome) = match existing {
-            Some(id) => (id, ImportOutcome::Reused),
+            Some((_, contract)) if contract != stored.contract.as_str() => {
+                return Err(ReviewTargetServiceError::InvalidInput(format!(
+                    "that YouTube declaration is already stored under the {contract} contract"
+                )));
+            }
+            Some((id, _)) => (id, ImportOutcome::Reused),
             None => {
                 let id = insert_target(
                     &tx,
-                    &handoff,
+                    &evidence,
                     &stored.binding_digest,
                     youtube_video_id.map(|_| "serverRebind"),
                     Some(review_target_id),
@@ -1076,16 +1480,33 @@ impl ReviewTargets {
         load_detail(connection, project_id, review_target_id, now)
     }
 
-    /// The stored snapshot as a handoff carrying its latest receipt. Used by
-    /// later session/sync owners; it is never re-digested or rewritten.
+    /// The stored snapshot as a strict handoff carrying its latest receipt.
+    /// Refuses a historical target: there is no strict receipt to give, and
+    /// inventing one would claim current renderability.
     pub fn handoff(
         &self,
         project_id: &str,
         review_target_id: &str,
     ) -> Result<ReviewTargetHandoff, ReviewTargetServiceError> {
+        match self.evidence(project_id, review_target_id)? {
+            ReviewTargetEvidence::Current(handoff) => Ok(handoff),
+            ReviewTargetEvidence::Historical(_) => Err(ReviewTargetServiceError::InvalidInput(
+                "historical review targets have no current-renderability handoff".into(),
+            )),
+        }
+    }
+
+    /// The stored target under the contract it was imported with, carrying
+    /// its latest receipt. Used by session/sync owners; it is never
+    /// re-digested or rewritten.
+    pub fn evidence(
+        &self,
+        project_id: &str,
+        review_target_id: &str,
+    ) -> Result<ReviewTargetEvidence, ReviewTargetServiceError> {
         let connection = open_read_only_connection(&self.database_path)?;
         Self::project_registered(&connection, project_id)?;
-        stored_handoff(&connection, project_id, review_target_id)
+        stored_evidence(&connection, project_id, review_target_id)
     }
 
     /// Candidate cuts for a movie-time point or range, via the shared Rust lookup.
@@ -1096,8 +1517,8 @@ impl ReviewTargets {
         start_seconds: f64,
         end_seconds: f64,
     ) -> Result<ReviewTargetCandidates, ReviewTargetServiceError> {
-        let handoff = self.handoff(project_id, review_target_id)?;
-        let operation_ids = handoff
+        let evidence = self.evidence(project_id, review_target_id)?;
+        let operation_ids = evidence
             .picture_candidates(start_seconds, end_seconds)
             .map_err(|error| ReviewTargetServiceError::InvalidInput(error.to_string()))?;
         Ok(ReviewTargetCandidates {
@@ -1110,6 +1531,7 @@ impl ReviewTargets {
 }
 
 struct StoredTarget {
+    contract: ReviewTargetContract,
     snapshot: ReviewTargetSnapshot,
     schema_version: u32,
     target_digest: String,
@@ -1124,7 +1546,7 @@ struct StoredTarget {
 #[allow(clippy::too_many_arguments)]
 fn insert_target(
     tx: &Transaction<'_>,
-    handoff: &ReviewTargetHandoff,
+    evidence: &ReviewTargetEvidence,
     binding_digest: &str,
     youtube_declared_by: Option<&str>,
     derived_from: Option<&str>,
@@ -1133,19 +1555,20 @@ fn insert_target(
     now: DateTime<Utc>,
 ) -> Result<String, ReviewTargetServiceError> {
     let id = format!("rtarget_{}", Uuid::new_v4().simple());
-    let t = &handoff.target;
+    let t = evidence.target();
     tx.execute(
         "INSERT INTO review_targets(
             review_target_id, project_id, schema_version, target_digest, binding_digest,
             revision_id, viewed_artifact_id, movie_blake3, movie_byte_length, duration_seconds,
             cut_count, youtube_video_id, youtube_declared_by, derived_from_review_target_id,
-            snapshot_json, declared_issuer, imported_at, importer_actor_type, importer_actor_id)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            snapshot_json, declared_issuer, imported_at, importer_actor_type, importer_actor_id,
+            contract)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
             id,
             t.project_id,
-            handoff.schema_version,
-            handoff.target_digest,
+            REVIEW_TARGET_SCHEMA_VERSION,
+            evidence.target_digest(),
             binding_digest,
             t.revision_id,
             t.viewed_artifact_id,
@@ -1161,6 +1584,7 @@ fn insert_target(
             timestamp(now),
             actor.actor_type,
             actor.actor_id,
+            evidence.contract().as_str(),
         ],
     )?;
     Ok(id)
@@ -1171,7 +1595,7 @@ fn insert_target(
 fn insert_observation(
     tx: &Transaction<'_>,
     review_target_id: &str,
-    verification: &ReviewTargetVerification,
+    verification: &ReviewTargetReceipt,
     availability: &ArtifactAvailabilityAssertion,
     availability_source: &str,
     max_age: u32,
@@ -1189,7 +1613,7 @@ fn insert_observation(
         params![
             format!("rtobs_{}", Uuid::new_v4().simple()),
             review_target_id,
-            verification.verified_at,
+            verification.verified_at(),
             serde_json::to_string(verification).context("serialize verification")?,
             availability.state.as_str(),
             availability.observed_at,
@@ -1212,7 +1636,7 @@ fn load_stored(
         .query_row(
             "SELECT schema_version, target_digest, binding_digest, snapshot_json,
                     youtube_declared_by, derived_from_review_target_id, declared_issuer,
-                    imported_at, importer_actor_type, importer_actor_id
+                    imported_at, importer_actor_type, importer_actor_id, contract
              FROM review_targets WHERE project_id=?1 AND review_target_id=?2",
             params![project_id, review_target_id],
             |row| {
@@ -1227,12 +1651,14 @@ fn load_stored(
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             },
         )
         .optional()?
         .ok_or(ReviewTargetServiceError::NotFound)?;
     Ok(StoredTarget {
+        contract: ReviewTargetContract::parse(&row.10)?,
         schema_version: row.0,
         target_digest: row.1,
         binding_digest: row.2,
@@ -1250,6 +1676,7 @@ fn load_stored(
 
 fn load_observations(
     connection: &Connection,
+    contract: ReviewTargetContract,
     review_target_id: &str,
 ) -> Result<Vec<ReviewTargetObservation>, ReviewTargetServiceError> {
     let mut statement = connection.prepare(
@@ -1278,7 +1705,17 @@ fn load_observations(
             Ok(ReviewTargetObservation {
                 max_verification_age_seconds: row.8,
                 observation_id: row.0,
-                verification: serde_json::from_str(&row.1).context("decode stored verification")?,
+                verification: match contract {
+                    ReviewTargetContract::ReviewTargetV1 => ReviewTargetReceipt::Current(
+                        serde_json::from_str(&row.1).context("decode stored verification")?,
+                    ),
+                    ReviewTargetContract::HistoricalRenderedArtifactReviewV1 => {
+                        ReviewTargetReceipt::Historical(
+                            serde_json::from_str(&row.1)
+                                .context("decode stored historical receipt")?,
+                        )
+                    }
+                },
                 availability_state: ArtifactAvailabilityState::parse(&row.2),
                 availability_observed_at: row.3,
                 availability_source: row.4,
@@ -1292,21 +1729,61 @@ fn load_observations(
         .collect()
 }
 
-fn stored_handoff(
+/// Rebuild the evidence for a snapshot from one of its receipts. The digest
+/// is recomputed from the snapshot, so a stored row can only round-trip.
+fn evidence_from(
+    contract: ReviewTargetContract,
+    target: ReviewTargetSnapshot,
+    receipt: &ReviewTargetReceipt,
+) -> Result<ReviewTargetEvidence, ReviewTargetServiceError> {
+    let target_digest = ReviewTargetHandoff::snapshot_digest(&target)?;
+    Ok(match (contract, receipt) {
+        (ReviewTargetContract::ReviewTargetV1, ReviewTargetReceipt::Current(v)) => {
+            ReviewTargetEvidence::Current(ReviewTargetHandoff {
+                schema_version: REVIEW_TARGET_SCHEMA_VERSION,
+                target_digest,
+                target,
+                verification: v.clone(),
+            })
+        }
+        (
+            ReviewTargetContract::HistoricalRenderedArtifactReviewV1,
+            ReviewTargetReceipt::Historical(h),
+        ) => ReviewTargetEvidence::Historical(HistoricalRenderedArtifactReview {
+            schema_version: REVIEW_TARGET_SCHEMA_VERSION,
+            purpose: HistoricalReviewPurpose::HistoricalRenderedArtifactReview,
+            target_digest,
+            target,
+            verified_at: h.verified_at.clone(),
+            output_matches: h.output_matches,
+            mapping_matches_revision: h.mapping_matches_revision,
+            stored_fully_decoded: h.stored_fully_decoded,
+            current_source_verification: h.current_source_verification.clone(),
+            current_constraints_verification: h.current_constraints_verification.clone(),
+            current_plan_renderability: h.current_plan_renderability.clone(),
+        }),
+        _ => {
+            return Err(
+                anyhow::anyhow!("stored receipt does not match the target contract").into(),
+            );
+        }
+    })
+}
+
+fn stored_evidence(
     connection: &Connection,
     project_id: &str,
     review_target_id: &str,
-) -> Result<ReviewTargetHandoff, ReviewTargetServiceError> {
+) -> Result<ReviewTargetEvidence, ReviewTargetServiceError> {
     let stored = load_stored(connection, project_id, review_target_id)?;
-    let latest = load_observations(connection, review_target_id)?
+    let latest = load_observations(connection, stored.contract, review_target_id)?
         .pop()
         .context("review target has no verification observation")?;
-    Ok(ReviewTargetHandoff {
-        schema_version: stored.schema_version,
-        target_digest: stored.target_digest,
-        target: stored.snapshot,
-        verification: latest.verification,
-    })
+    let evidence = evidence_from(stored.contract, stored.snapshot, &latest.verification)?;
+    if evidence.target_digest() != stored.target_digest || stored.schema_version != 1 {
+        return Err(anyhow::anyhow!("stored review target digest does not round-trip").into());
+    }
+    Ok(evidence)
 }
 
 fn load_detail(
@@ -1316,7 +1793,7 @@ fn load_detail(
     now: DateTime<Utc>,
 ) -> Result<ReviewTargetDetail, ReviewTargetServiceError> {
     let stored = load_stored(connection, project_id, review_target_id)?;
-    let observations = load_observations(connection, review_target_id)?;
+    let observations = load_observations(connection, stored.contract, review_target_id)?;
     let latest = observations
         .last()
         .context("review target has no verification observation")?;
@@ -1334,6 +1811,7 @@ fn load_detail(
     let picture_end_seconds = cuts.last().map(|c| c.movie_out_seconds).unwrap_or(0.0);
     let summary = ReviewTargetSummary {
         review_target_id: review_target_id.to_string(),
+        contract: stored.contract,
         project_id: snapshot.project_id.clone(),
         revision_id: snapshot.revision_id.clone(),
         viewed_artifact_id: snapshot.viewed_artifact_id.clone(),
@@ -1350,7 +1828,7 @@ fn load_detail(
             },
         },
         imported_at: stored.imported_at.clone(),
-        latest_verified_at: latest.verification.verified_at.clone(),
+        latest_verified_at: latest.verification.verified_at().to_string(),
         readiness: readiness(&observations, now),
     };
     Ok(ReviewTargetDetail {
@@ -1376,7 +1854,16 @@ fn load_detail(
             derived_from_review_target_id: stored.derived_from,
         },
         observations,
-        limitations: REVIEW_TARGET_LIMITATIONS,
+        limitations: match stored.contract {
+            ReviewTargetContract::ReviewTargetV1 => REVIEW_TARGET_LIMITATIONS.to_vec(),
+            ReviewTargetContract::HistoricalRenderedArtifactReviewV1 => {
+                HISTORICAL_REVIEW_TARGET_LIMITATIONS
+                    .iter()
+                    .chain(REVIEW_TARGET_LIMITATIONS)
+                    .copied()
+                    .collect()
+            }
+        },
     })
 }
 
@@ -1422,6 +1909,18 @@ pub(crate) fn migrate(tx: &Transaction<'_>) -> anyhow::Result<()> {
             actor_id TEXT NOT NULL,
             UNIQUE(review_target_id, verified_at, availability_state, availability_observed_at, max_verification_age_seconds)
         );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Control migration 17: record which export contract each target came from.
+/// Existing rows were all imported through the strict v1 route.
+pub(crate) fn migrate_contract(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute_batch(
+        r#"
+        ALTER TABLE review_targets ADD COLUMN contract TEXT NOT NULL DEFAULT 'reviewTargetV1'
+            CHECK(contract IN ('reviewTargetV1','historicalRenderedArtifactReviewV1'));
         "#,
     )?;
     Ok(())
