@@ -8,6 +8,7 @@ use rcdvlog_core::{
         SoundtrackCapture, SoundtrackIndex, SoundtrackPolicy, SoundtrackReferenceSpec,
         read_pcm8k_wav,
     },
+    tv_soundtrack_consensus,
     tv_soundtrack_session::{
         SessionAudioFile, SessionBatch, SoundtrackSessionPlan, SoundtrackSessionSpec,
     },
@@ -87,6 +88,13 @@ pub enum TvReviewCommand {
         #[arg(long)]
         historical_target: Option<PathBuf>,
     },
+    /// Derive offset segments and boundaries from complete session evidence.
+    SoundtrackSessionConsensus {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        cache: PathBuf,
+    },
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -125,6 +133,9 @@ pub fn command_name(command: &TvReviewCommand) -> &'static str {
             "tv-review.soundtrack-session-evidence"
         }
         TvReviewCommand::SoundtrackSessionSync { .. } => "tv-review.soundtrack-session-sync",
+        TvReviewCommand::SoundtrackSessionConsensus { .. } => {
+            "tv-review.soundtrack-session-consensus"
+        }
     }
 }
 pub fn execute(command: &TvReviewCommand) -> Result<Value> {
@@ -191,6 +202,14 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
                     max_tasks: *max_tasks,
                 },
                 &cancel,
+            )?)?)
+        }
+        TvReviewCommand::SoundtrackSessionConsensus { plan, cache } => {
+            let plan = SoundtrackSessionPlan::from_json(&read_bytes(plan, SYNC_MAX_BYTES)?)?;
+            Ok(serde_json::to_value(tv_soundtrack_consensus::consensus(
+                &plan,
+                cache,
+                &|| false,
             )?)?)
         }
         TvReviewCommand::SoundtrackSessionEvidence {
