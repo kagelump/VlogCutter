@@ -27,6 +27,10 @@ env:
   RUST_TOOLCHAIN: "1.97.1"
   NODE_VERSION: "24.11.0"
   PNPM_VERSION: "10.17.0"
+  # cargo-nextest runs the Rust tests; see .config/nextest.toml and
+  # .github/workflows/README.md. scripts/ci-nextest.test.mjs keeps this and the
+  # shard matrix below consistent.
+  NEXTEST_VERSION: "0.9.151"
 
 # Required check: ci-required. Never add workflow-level path filters.
 jobs:
@@ -49,13 +53,30 @@ jobs:
         run: node scripts/ci-platform.mjs
 
   linux-rust:
-    name: linux-rust (${{ matrix.gate }})
+    name: linux-rust (${{ matrix.label }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        gate: [lint, tests]
+        # `tests` is split into nextest `--partition count:SHARD/4` shards. The
+        # job id stays `linux-rust`, so `ci-required` aggregates every shard:
+        # any failed, cancelled or missing shard fails the whole job result.
+        include:
+          - gate: lint
+            label: lint
+          - gate: tests
+            shard: 1
+            label: tests 1/4
+          - gate: tests
+            shard: 2
+            label: tests 2/4
+          - gate: tests
+            shard: 3
+            label: tests 3/4
+          - gate: tests
+            shard: 4
+            label: tests 4/4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Free disk space
@@ -90,8 +111,11 @@ jobs:
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-on-failure: true
-          # Matrix jobs produce different artifacts; avoid a first-writer cache race.
+          # Lint and tests produce different artifacts; avoid a first-writer
+          # cache race. All test shards build the same artifacts, so they share
+          # one key and only shard 1 saves it.
           key: ${{ matrix.gate }}
+          save-if: ${{ matrix.gate == 'lint' || matrix.shard == 1 }}
 
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile
@@ -101,15 +125,33 @@ jobs:
       - name: cargo clippy --workspace --all-targets -- -D warnings
         if: ${{ !cancelled() && matrix.gate == 'lint' }}
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo test --workspace
+      - name: Install cargo-nextest ${{ env.NEXTEST_VERSION }} (bounded)
+        if: ${{ !cancelled() && matrix.gate == 'tests' }}
+        timeout-minutes: 5
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - name: cargo nextest run --workspace (shard ${{ matrix.shard }}/4)
         if: ${{ !cancelled() && matrix.gate == 'tests' }}
         run: |
           nproc
           lscpu
-          /usr/bin/time -v cargo test --workspace -- --test-threads=4
+          /usr/bin/time -v cargo nextest run --workspace --profile ci --test-threads 4 --partition count:${{ matrix.shard }}/4
+      # nextest does not run doctests; run them once, on the first shard.
+      - name: cargo test --workspace --doc
+        if: ${{ !cancelled() && matrix.gate == 'tests' && matrix.shard == 1 }}
+        run: cargo test --workspace --doc
       - name: pnpm check:openapi
-        if: ${{ !cancelled() && matrix.gate == 'tests' }}
+        if: ${{ !cancelled() && matrix.gate == 'tests' && matrix.shard == 1 }}
         run: pnpm check:openapi
+      - name: Upload nextest JUnit (per-test timings)
+        if: ${{ !cancelled() && matrix.gate == 'tests' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-junit-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
 
   frontend:
     runs-on: ubuntu-24.04

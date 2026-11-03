@@ -20,7 +20,8 @@ The production server serves `apps/web/dist` when `RCDVLOG_WEB_DIR` points at th
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace
+cargo test --workspace --doc
 pnpm check:frontend
 pnpm test:web
 pnpm test:web:e2e
