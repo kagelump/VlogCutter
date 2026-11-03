@@ -57,7 +57,7 @@ if (seed.status !== 0) {
   throw new Error(`seed real web project fixture: ${seed.error ?? seed.stderr}`);
 }
 
-const bootstrapFiles = [1, 2, 3, 4, 5, 6, 7, 8].map((index) => bootstrapCodePath(listenAddress, index));
+const bootstrapFiles = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((index) => bootstrapCodePath(listenAddress, index));
 for (const bootstrapFile of bootstrapFiles) {
   rmSync(bootstrapFile, { force: true });
   const bootstrapLaunch = rustLaunch(process.env, "server", ["admin", "bootstrap", "create", "--output-file", bootstrapFile]);
