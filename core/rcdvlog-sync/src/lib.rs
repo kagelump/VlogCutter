@@ -38,6 +38,84 @@ impl SyncProcessGuard {
     }
 }
 
+/// Result of asking a [`SyncGuardTracker`] to cover a catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardState {
+    /// This tracker holds the sync guard for the requested catalog.
+    Held,
+    /// Another actor holds the requested catalog's guard; do not sync it.
+    HeldElsewhere,
+}
+
+/// Holds the sync guard for exactly one catalog at a time and follows the
+/// catalog the caller currently intends to sync. Moving to another catalog
+/// releases the previous guard first, so a swapped-away catalog is never
+/// squatted on and a catalog is never synced without its own guard.
+#[derive(Default)]
+pub struct SyncGuardTracker {
+    held: Option<(PathBuf, SyncProcessGuard)>,
+}
+
+impl SyncGuardTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Path whose guard is currently held, if any.
+    pub fn guarded_path(&self) -> Option<&Path> {
+        self.held.as_ref().map(|(path, _)| path.as_path())
+    }
+
+    /// Ensure the guard held is the one for `catalog_path`.
+    pub fn ensure(&mut self, catalog_path: &Path) -> Result<GuardState> {
+        if self.guarded_path() == Some(catalog_path) {
+            return Ok(GuardState::Held);
+        }
+        // Release the old catalog's guard before touching the new one.
+        self.held = None;
+        match SyncProcessGuard::try_acquire(catalog_path)? {
+            Some(guard) => {
+                self.held = Some((catalog_path.to_path_buf(), guard));
+                Ok(GuardState::Held)
+            }
+            None => Ok(GuardState::HeldElsewhere),
+        }
+    }
+
+    /// Release any held guard.
+    pub fn release(&mut self) {
+        self.held = None;
+    }
+}
+
+/// Outcome of applying a reconcile response to the catalog the cycle started with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedApplyOutcome {
+    Applied,
+    /// The open catalog is no longer the one the cycle was built from; nothing was written.
+    CatalogChanged,
+}
+
+/// Apply a reconcile response to `pinned`, the catalog the request was built
+/// from, only if `current_path` (the catalog open now) is still that catalog.
+/// Acknowledgements are catalog-global and every desktop catalog shares one
+/// node id, so a response must never be applied to a different catalog.
+pub fn apply_pinned_reconcile_response(
+    pinned: &Catalog,
+    current_path: &Path,
+    server_node_id: &str,
+    response: &ReconcileResponse,
+) -> Result<PinnedApplyOutcome> {
+    if pinned.database_path() != current_path {
+        return Ok(PinnedApplyOutcome::CatalogChanged);
+    }
+    if !response.operations.is_empty() {
+        apply_reconcile_operations(pinned, &response.operations)?;
+    }
+    pinned.record_peer_operation_acknowledgements(server_node_id, &response.committed_cursors)?;
+    Ok(PinnedApplyOutcome::Applied)
+}
+
 pub fn signal_running_sync_manager(catalog_path: &Path, project_id: &str) -> Result<()> {
     anyhow::ensure!(
         !project_id.is_empty()
@@ -1319,5 +1397,112 @@ mod tests {
                 expected = Some(projection);
             }
         }
+    }
+
+    fn ack_response(cursors: &[(&str, u64)]) -> ReconcileResponse {
+        ReconcileResponse {
+            protocol_major: 1,
+            protocol_minor: 0,
+            project_id: "project_fixture".to_string(),
+            committed_cursors: cursors.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            operations: Vec::new(),
+            observation_cursors: BTreeMap::new(),
+            representation_cursors: BTreeMap::new(),
+            conflicts: Vec::new(),
+            has_more_operations: false,
+            sequence_recovery: Vec::new(),
+            node_targeted_jobs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn catalog_swapped_mid_reconcile_is_not_acknowledged_into_the_new_catalog() {
+        let root = TempDir::new().unwrap();
+        // Both catalogs share the desktop node id, as every desktop catalog does.
+        let a = new_catalog(&root, "a.sqlite3", "node_mac");
+        let b = new_catalog(&root, "b.sqlite3", "node_mac");
+        let open = std::cell::RefCell::new(a.database_path().to_path_buf());
+
+        // Fake transport: the round trip is where the user opens catalog B.
+        let transport = || {
+            *open.borrow_mut() = b.database_path().to_path_buf();
+            ack_response(&[("node_mac", 7)])
+        };
+        let response = transport();
+        let current = open.borrow().clone();
+        let outcome =
+            apply_pinned_reconcile_response(&a, &current, "node_server", &response).unwrap();
+
+        assert_eq!(outcome, PinnedApplyOutcome::CatalogChanged);
+        assert!(
+            b.peer_operation_acknowledgements("node_server")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            a.peer_operation_acknowledgements("node_server")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unswapped_reconcile_records_acknowledgements_on_the_pinned_catalog() {
+        let root = TempDir::new().unwrap();
+        let a = new_catalog(&root, "a.sqlite3", "node_mac");
+        let b = new_catalog(&root, "b.sqlite3", "node_mac");
+        let outcome = apply_pinned_reconcile_response(
+            &a,
+            a.database_path(),
+            "node_server",
+            &ack_response(&[("node_mac", 3)]),
+        )
+        .unwrap();
+        assert_eq!(outcome, PinnedApplyOutcome::Applied);
+        assert_eq!(
+            a.peer_operation_acknowledgements("node_server").unwrap()["node_mac"],
+            3
+        );
+        assert!(
+            b.peer_operation_acknowledgements("node_server")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn guard_follows_the_catalog_and_never_syncs_unguarded() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("a")).unwrap();
+        fs::create_dir_all(root.path().join("b")).unwrap();
+        let a = new_catalog(&root, "a/catalog.sqlite3", "node_mac");
+        let b = new_catalog(&root, "b/catalog.sqlite3", "node_mac");
+        let (a_path, b_path) = (
+            a.database_path().to_path_buf(),
+            b.database_path().to_path_buf(),
+        );
+        let mut tracker = SyncGuardTracker::new();
+
+        assert_eq!(tracker.ensure(&a_path).unwrap(), GuardState::Held);
+        assert!(SyncProcessGuard::try_acquire(&a_path).unwrap().is_none());
+
+        // Swap to B: A's guard is released so another actor can take it.
+        assert_eq!(tracker.ensure(&b_path).unwrap(), GuardState::Held);
+        assert_eq!(tracker.guarded_path(), Some(b_path.as_path()));
+        let other_a = SyncProcessGuard::try_acquire(&a_path).unwrap();
+        assert!(
+            other_a.is_some(),
+            "A must be free once the manager moved to B"
+        );
+        assert!(SyncProcessGuard::try_acquire(&b_path).unwrap().is_none());
+
+        // Swap back to A while another actor holds it: not synced, nothing held.
+        assert_eq!(tracker.ensure(&a_path).unwrap(), GuardState::HeldElsewhere);
+        assert_eq!(tracker.guarded_path(), None);
+        assert!(SyncProcessGuard::try_acquire(&b_path).unwrap().is_some());
+
+        // Once the other actor leaves, A is guarded again.
+        drop(other_a);
+        assert_eq!(tracker.ensure(&a_path).unwrap(), GuardState::Held);
     }
 }
