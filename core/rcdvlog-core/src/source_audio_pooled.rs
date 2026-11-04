@@ -84,11 +84,31 @@ pub struct PooledRecognitionRequest {
     /// Diagnostic rows returned per window after pooling; defaults to 8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_limit: Option<u8>,
+    /// Opt-in per-mode supporting evidence: the occupied one-second cells with
+    /// their absolute query-anchor feature frames. When unset (the default),
+    /// serialized diagnostics stay byte-identical to the demonstrated output;
+    /// when `Some(true)` each returned mode row carries `supportingCells`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_mode_support: Option<bool>,
+}
+
+/// One occupied one-second cell of an offset-mode hypothesis with the absolute
+/// query-anchor feature-frame positions that support the mode in that cell.
+/// Returned only when [`PooledRecognitionRequest::include_mode_support`] is
+/// `Some(true)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PooledModeSupportCell {
+    /// One-second query time bin (recording seconds within the decoded query).
+    pub time_bin: u32,
+    /// Absolute feature-frame positions within the decoded recording
+    /// (a local chunk frame number is never used as an identity).
+    pub query_anchor_frames: Vec<u32>,
 }
 
 /// A pooled offset-mode hypothesis row (diagnostic top-N output). Scores and
 /// decisions never depend on how many rows are returned.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PooledOffsetModeRow {
     pub offset_bin: i32,
@@ -102,11 +122,16 @@ pub struct PooledOffsetModeRow {
     pub frequency_diversity_median_per_time_bin: f64,
     pub saturated_anchors: u64,
     pub shared_query_anchors_with_best: usize,
+    /// Occupied one-second cells with their absolute query-anchor feature
+    /// frames; `None` (and omitted from serialization) unless the request set
+    /// `includeModeSupport`, keeping serialized diagnostics byte-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supporting_cells: Option<Vec<PooledModeSupportCell>>,
 }
 
 /// The strongest non-adjacent competing offset bin (|delta bin| >= 2) taken
 /// from the full ranking, not from the returned top-N rows.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PooledDistinctCompetitor {
     pub offset_bin: i32,
@@ -120,8 +145,10 @@ pub struct PooledDistinctCompetitor {
 /// v3 acceptance verdict for one window. `accepted` is `None` exactly when the
 /// verdict abstains (uncalibrated floors or a non-frozen extractor recipe),
 /// mirroring the frozen scorer's tri-state `policyV3AnchorAwareAccepted`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// Round-trips through the frozen reason vocabulary (`serde(try_from)`), so a
+/// deserialized verdict always carries the canonical statics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "PooledWindowAcceptanceWire")]
 pub struct PooledWindowAcceptance {
     /// Per-duration floors from the vendored policy are calibrated
     /// (10-second windows only; 20/30-second floors are diagnostic-only).
@@ -137,7 +164,61 @@ pub struct PooledWindowAcceptance {
     pub gate_failure_reasons: Vec<&'static str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PooledWindowAcceptanceWire {
+    floors_calibrated: bool,
+    recipe_calibrated: bool,
+    accepted: Option<bool>,
+    #[serde(default)]
+    failure_reasons: Vec<String>,
+    #[serde(default)]
+    gate_failure_reasons: Vec<String>,
+}
+
+impl TryFrom<PooledWindowAcceptanceWire> for PooledWindowAcceptance {
+    type Error = String;
+    fn try_from(wire: PooledWindowAcceptanceWire) -> Result<Self, Self::Error> {
+        Ok(PooledWindowAcceptance {
+            floors_calibrated: wire.floors_calibrated,
+            recipe_calibrated: wire.recipe_calibrated,
+            accepted: wire.accepted,
+            failure_reasons: wire
+                .failure_reasons
+                .iter()
+                .map(|reason| frozen_reason(reason))
+                .collect::<Result<_, _>>()?,
+            gate_failure_reasons: wire
+                .gate_failure_reasons
+                .iter()
+                .map(|reason| frozen_reason(reason))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+/// The frozen rejection/abstention vocabulary is closed: a round-tripped
+/// reason maps back onto its canonical static.
+fn frozen_reason(reason: &str) -> Result<&'static str, String> {
+    for candidate in [
+        REASON_INCOMPLETE_EVIDENCE,
+        REASON_NO_OFFSET_MODE,
+        REASON_MINIMUM_ANCHORS,
+        REASON_MINIMUM_OCCUPIED_TIME_BINS,
+        REASON_MINIMUM_DISTINCT_COMPETITOR_RATIO,
+        REASON_MINIMUM_UNIQUE_ANCHOR_MARGIN,
+        REASON_NOT_CALIBRATED,
+    ] {
+        if reason == candidate {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "invalid input: unknown pooled acceptance reason {reason:?}"
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PooledWindowResult {
     pub start_seconds: u32,
@@ -160,9 +241,10 @@ pub struct PooledWindowResult {
 /// Pooled recognition result. Carries the demonstrated payload key names and
 /// shape unchanged; `recipeIdentity` and `acceptancePolicyId` record the
 /// versioned recipe/policy identity and per-window `acceptance` rows carry the
-/// v3 verdict.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// v3 verdict. Round-trips through its wire shape (`serde(try_from)`), so a
+/// deserialized result always carries the canonical identity statics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "PooledRecognitionResultWire")]
 pub struct PooledRecognitionResult {
     pub schema_version: u32,
     pub status: &'static str,
@@ -179,6 +261,77 @@ pub struct PooledRecognitionResult {
     pub acceptance_policy_id: &'static str,
     pub mode_limit: usize,
     pub windows: Vec<PooledWindowResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PooledRecognitionResultWire {
+    schema_version: u32,
+    status: String,
+    complete: bool,
+    search_complete: bool,
+    internal_offset_cell_count: usize,
+    offset_cell_scan_complete: bool,
+    diagnostic_truncation_applied_after_pooling: bool,
+    query_anchor_identity_available: bool,
+    anchor_identity_serialized: bool,
+    anchor_identity_scope: String,
+    aggregation_scope: String,
+    recipe_identity: String,
+    acceptance_policy_id: String,
+    mode_limit: usize,
+    #[serde(default)]
+    windows: Vec<PooledWindowResult>,
+}
+
+impl TryFrom<PooledRecognitionResultWire> for PooledRecognitionResult {
+    type Error = String;
+    fn try_from(wire: PooledRecognitionResultWire) -> Result<Self, Self::Error> {
+        let status = match wire.status.as_str() {
+            "complete" => "complete",
+            "incomplete" => "incomplete",
+            other => {
+                return Err(format!("invalid input: unknown pooled status {other:?}"));
+            }
+        };
+        let identity_static = |value: &str, expected: &'static str, what: &str| {
+            if value == expected {
+                Ok(expected)
+            } else {
+                Err(format!("invalid input: unexpected pooled {what} {value:?}"))
+            }
+        };
+        Ok(PooledRecognitionResult {
+            schema_version: wire.schema_version,
+            status,
+            complete: wire.complete,
+            search_complete: wire.search_complete,
+            internal_offset_cell_count: wire.internal_offset_cell_count,
+            offset_cell_scan_complete: wire.offset_cell_scan_complete,
+            diagnostic_truncation_applied_after_pooling: wire
+                .diagnostic_truncation_applied_after_pooling,
+            query_anchor_identity_available: wire.query_anchor_identity_available,
+            anchor_identity_serialized: wire.anchor_identity_serialized,
+            anchor_identity_scope: identity_static(
+                &wire.anchor_identity_scope,
+                ANCHOR_IDENTITY_SCOPE,
+                "anchor identity scope",
+            )?,
+            aggregation_scope: identity_static(
+                &wire.aggregation_scope,
+                AGGREGATION_SCOPE,
+                "aggregation scope",
+            )?,
+            recipe_identity: identity_static(&wire.recipe_identity, RECIPE_ID, "recipe identity")?,
+            acceptance_policy_id: identity_static(
+                &wire.acceptance_policy_id,
+                PooledRecognitionPolicy::frozen().policy_id.as_str(),
+                "acceptance policy id",
+            )?,
+            mode_limit: wire.mode_limit,
+            windows: wire.windows,
+        })
+    }
 }
 
 /// Complete recognition outcome: the full search evidence plus the pooled
@@ -402,6 +555,7 @@ pub fn pool_exact_offset_windows(
                     })
                 })
         });
+        let include_support = request.include_mode_support.unwrap_or(false);
         let modes: Vec<PooledOffsetModeRow> = ranked
             .iter()
             .take(mode_limit)
@@ -423,6 +577,16 @@ pub fn pool_exact_offset_windows(
                     frequency_diversity_median_per_time_bin: mode.median_frequency_diversity(),
                     saturated_anchors: mode.saturated_anchors,
                     shared_query_anchors_with_best: shared_with_best,
+                    supporting_cells: if include_support {
+                        Some(mode_support_cells(
+                            &search.offsets,
+                            window.start_seconds,
+                            end_seconds,
+                            *offset_bin,
+                        ))
+                    } else {
+                        None
+                    },
                 }
             })
             .collect();
@@ -474,6 +638,37 @@ pub fn pool_exact_offset_windows(
         mode_limit,
         windows: output_windows,
     })
+}
+
+/// Per-cell supporting evidence of one offset mode within a window: occupied
+/// one-second bins with the deduplicated absolute query-anchor feature frames
+/// that voted for the mode in that cell. Only computed when the request opts in
+/// to `includeModeSupport`.
+fn mode_support_cells(
+    offsets: &[OffsetEvidence],
+    window_start_seconds: u32,
+    end_seconds: u32,
+    offset_bin: i32,
+) -> Vec<PooledModeSupportCell> {
+    let mut cells: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for evidence in offsets {
+        if evidence.time_bin >= window_start_seconds
+            && evidence.time_bin < end_seconds
+            && evidence.offset_bin == offset_bin
+        {
+            cells
+                .entry(evidence.time_bin)
+                .or_default()
+                .extend(evidence.query_anchor_frames.iter().copied());
+        }
+    }
+    cells
+        .into_iter()
+        .map(|(time_bin, frames)| PooledModeSupportCell {
+            time_bin,
+            query_anchor_frames: frames.into_iter().collect(),
+        })
+        .collect()
 }
 
 #[derive(Default)]

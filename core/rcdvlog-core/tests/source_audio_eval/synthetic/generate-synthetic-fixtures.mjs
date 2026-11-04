@@ -38,14 +38,33 @@ const MOVIE_SAMPLES = RATE * MOVIE_SECONDS;
 const RECORDING_SAMPLES = RATE * (ROOM_SECONDS + MOVIE_SECONDS);
 const EVENT_SAMPLES = Math.floor(RATE * EVENT_SECONDS);
 
+// Seek fixture layout (recording-seek.wav): the movie is heard at two distinct
+// known delays, with room tone before, between (the seek) and after the runs.
+const SEEK_ROOM_SECONDS = 2; // room tone before the first playback run
+const SEEK_TRANSITION_SECONDS = 1; // room tone while the player seeks
+const SEEK_TAIL_SECONDS = 1; // room tone after the second playback run
+const SEEK_FIRST_LEAD = RATE * SEEK_ROOM_SECONDS;
+const SEEK_SECOND_LEAD =
+  RATE * (SEEK_ROOM_SECONDS + MOVIE_SECONDS + SEEK_TRANSITION_SECONDS);
+const SEEK_RECORDING_SAMPLES =
+  RATE *
+  (SEEK_ROOM_SECONDS + MOVIE_SECONDS + SEEK_TRANSITION_SECONDS + MOVIE_SECONDS + SEEK_TAIL_SECONDS);
+
 const SEED_MOVIE_CHORDS = 0x5eed10c1;
 const SEED_MOVIE_NOISE = 0x1a2b3c4d;
 const SEED_ROOM = 0x7f8e9d0c;
 const SEED_RECORDING_MIX = 0x2468ace0;
+const SEED_SEEK_ROOM = 0x13579bdf;
+const SEED_SEEK_MIX = 0x0badf00d;
 
 const OFFSET_CONVENTION =
   "movieElapsedSeconds = recordingSecondsWithinEpoch + offsetSeconds";
 const EXPECTED_OFFSET_SECONDS = -3.0;
+// Seek fixture offsets (same convention):
+//   first run:  the movie starts (0.0) at recording time 2.0 s  -> -2.0
+//   second run: the movie restarts (0.0) at recording time 15.0 s -> -15.0
+const SEEK_FIRST_OFFSET_SECONDS = -2.0;
+const SEEK_SECOND_OFFSET_SECONDS = -15.0;
 
 function usage() {
   console.error("Usage: generate-synthetic-fixtures.mjs --out <dir>");
@@ -126,6 +145,25 @@ function generateRecording(movie) {
   return samples;
 }
 
+// The seek fixture: the movie is heard at two distinct known delays — the
+// whole movie from its start at recording time 2.0 s, then (after a 1.0 s
+// seek) the whole movie from its start again at recording time 15.0 s.
+function generateSeekRecording(movie) {
+  const room = makePrng(SEED_SEEK_ROOM);
+  const mix = makePrng(SEED_SEEK_MIX);
+  const samples = new Int16Array(SEEK_RECORDING_SAMPLES);
+  for (let i = 0; i < SEEK_RECORDING_SAMPLES; i += 1) {
+    let v = (room() * 2 - 1) * 0.03 + (mix() * 2 - 1) * 0.01;
+    if (i >= SEEK_FIRST_LEAD && i < SEEK_FIRST_LEAD + MOVIE_SAMPLES) {
+      v += (movie[i - SEEK_FIRST_LEAD] / 32768) * 0.8;
+    } else if (i >= SEEK_SECOND_LEAD && i < SEEK_SECOND_LEAD + MOVIE_SAMPLES) {
+      v += (movie[i - SEEK_SECOND_LEAD] / 32768) * 0.8;
+    }
+    samples[i] = quantize(v);
+  }
+  return samples;
+}
+
 function wavBytes(samples, rate) {
   const dataBytes = samples.length * 2;
   const bytes = Buffer.alloc(44 + dataBytes);
@@ -158,10 +196,13 @@ function writeJson(path, value) {
 
 const movie = generateMovie();
 const recording = generateRecording(movie);
+const seekRecording = generateSeekRecording(movie);
 const movieWav = wavBytes(movie, RATE);
 const recordingWav = wavBytes(recording, RATE);
+const seekWav = wavBytes(seekRecording, RATE);
 const movieSha = sha256(movieWav);
 const recordingSha = sha256(recordingWav);
+const seekSha = sha256(seekWav);
 
 const movieClock = {
   movieDigest: movieSha,
@@ -293,11 +334,61 @@ const manifest = {
       },
     },
   ],
+  // Assembler/segment integration evidence (consumed by
+  // core/rcdvlog-core/src/source_audio_segments_tests.rs). Kept out of
+  // `cases` because the seek recording has no single case-level expected
+  // offset: each playback run has its own known delay.
+  integrationCases: [
+    {
+      caseId: "seek-two-known-delays",
+      description:
+        "the movie is heard at two distinct known delays: the whole movie from its start at recording time 2.0 s (offset -2.0), a 1.0 s seek, then the whole movie from its start again at recording time 15.0 s (offset -15.0)",
+      recording: {
+        path: "recording-seek.wav",
+        sha256: seekSha,
+        sampleRate: RATE,
+        firstSample: 0,
+        lastSample: SEEK_RECORDING_SAMPLES,
+        captureClockId: "synthetic-ci-v1-seek",
+      },
+      pooledOffsetWindows: [
+        { startSeconds: 2, durationSeconds: 10 },
+        { startSeconds: 4, durationSeconds: 10 },
+        { startSeconds: 15, durationSeconds: 10 },
+        { startSeconds: 17, durationSeconds: 10 },
+      ],
+      pooledOffsetModeLimit: 8,
+      expected: {
+        offsetConvention: OFFSET_CONVENTION,
+        offsetToleranceSeconds: 0.1,
+        derivation:
+          "first run: movieElapsed = recordingSecondsWithinEpoch + offsetSeconds gives 0.0 = 2.0 + offsetSeconds, offsetSeconds = -2.0; second run: 0.0 = 15.0 + offsetSeconds, offsetSeconds = -15.0",
+        windows: [
+          { startSeconds: 2, durationSeconds: 10, expectedOffsetSeconds: SEEK_FIRST_OFFSET_SECONDS },
+          { startSeconds: 4, durationSeconds: 10, expectedOffsetSeconds: SEEK_FIRST_OFFSET_SECONDS },
+          { startSeconds: 15, durationSeconds: 10, expectedOffsetSeconds: SEEK_SECOND_OFFSET_SECONDS },
+          { startSeconds: 17, durationSeconds: 10, expectedOffsetSeconds: SEEK_SECOND_OFFSET_SECONDS },
+        ],
+        segments: [
+          {
+            offsetSeconds: SEEK_FIRST_OFFSET_SECONDS,
+            supportedSecondsWithinEpoch: [2, 14],
+          },
+          {
+            offsetSeconds: SEEK_SECOND_OFFSET_SECONDS,
+            supportedSecondsWithinEpoch: [15, 27],
+          },
+        ],
+        unknownTransitionSecondsWithinEpoch: [14, 15],
+      },
+    },
+  ],
 };
 
 mkdirSync(values.out, { recursive: true });
 writeFileSync(join(values.out, "movie.wav"), movieWav);
 writeFileSync(join(values.out, "recording-continuous.wav"), recordingWav);
+writeFileSync(join(values.out, "recording-seek.wav"), seekWav);
 writeJson(join(values.out, "synthetic-ci-v1.json"), manifest);
 
 console.log(

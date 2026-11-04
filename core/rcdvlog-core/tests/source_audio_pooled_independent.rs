@@ -213,6 +213,7 @@ fn replay(row: &Value) -> PooledRecognitionResult {
             duration_seconds: row["durationSeconds"].as_u64().unwrap() as u16,
         }]),
         mode_limit: Some(8),
+        include_mode_support: None,
     };
     pool_exact_offset_windows(&search, &request).unwrap()
 }
@@ -459,6 +460,7 @@ fn frozen_outcomes_are_independent_of_the_diagnostic_mode_limit() {
                 search_policy: None,
                 windows: Some(vec![window]),
                 mode_limit: Some(1),
+                include_mode_support: None,
             },
         )
         .unwrap();
@@ -468,6 +470,7 @@ fn frozen_outcomes_are_independent_of_the_diagnostic_mode_limit() {
                 search_policy: None,
                 windows: Some(vec![window]),
                 mode_limit: Some(64),
+                include_mode_support: None,
             },
         )
         .unwrap();

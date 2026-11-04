@@ -130,5 +130,85 @@
         ]
       }
     }
+  ],
+  "integrationCases": [
+    {
+      "caseId": "seek-two-known-delays",
+      "description": "the movie is heard at two distinct known delays: the whole movie from its start at recording time 2.0 s (offset -2.0), a 1.0 s seek, then the whole movie from its start again at recording time 15.0 s (offset -15.0)",
+      "recording": {
+        "path": "recording-seek.wav",
+        "sha256": "75435e3f0d69e0302ad39477e7e6f2d7b25955fd6d3c486da085785ff8e8da22",
+        "sampleRate": 11025,
+        "firstSample": 0,
+        "lastSample": 308700,
+        "captureClockId": "synthetic-ci-v1-seek"
+      },
+      "pooledOffsetWindows": [
+        {
+          "startSeconds": 2,
+          "durationSeconds": 10
+        },
+        {
+          "startSeconds": 4,
+          "durationSeconds": 10
+        },
+        {
+          "startSeconds": 15,
+          "durationSeconds": 10
+        },
+        {
+          "startSeconds": 17,
+          "durationSeconds": 10
+        }
+      ],
+      "pooledOffsetModeLimit": 8,
+      "expected": {
+        "offsetConvention": "movieElapsedSeconds = recordingSecondsWithinEpoch + offsetSeconds",
+        "offsetToleranceSeconds": 0.1,
+        "derivation": "first run: movieElapsed = recordingSecondsWithinEpoch + offsetSeconds gives 0.0 = 2.0 + offsetSeconds, offsetSeconds = -2.0; second run: 0.0 = 15.0 + offsetSeconds, offsetSeconds = -15.0",
+        "windows": [
+          {
+            "startSeconds": 2,
+            "durationSeconds": 10,
+            "expectedOffsetSeconds": -2
+          },
+          {
+            "startSeconds": 4,
+            "durationSeconds": 10,
+            "expectedOffsetSeconds": -2
+          },
+          {
+            "startSeconds": 15,
+            "durationSeconds": 10,
+            "expectedOffsetSeconds": -15
+          },
+          {
+            "startSeconds": 17,
+            "durationSeconds": 10,
+            "expectedOffsetSeconds": -15
+          }
+        ],
+        "segments": [
+          {
+            "offsetSeconds": -2,
+            "supportedSecondsWithinEpoch": [
+              2,
+              14
+            ]
+          },
+          {
+            "offsetSeconds": -15,
+            "supportedSecondsWithinEpoch": [
+              15,
+              27
+            ]
+          }
+        ],
+        "unknownTransitionSecondsWithinEpoch": [
+          14,
+          15
+        ]
+      }
+    }
   ]
 }

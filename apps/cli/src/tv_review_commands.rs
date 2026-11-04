@@ -431,6 +431,7 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
                     search_policy: request.search_policy.take(),
                     windows: request.pooled_offset_windows.take(),
                     mode_limit: request.pooled_offset_mode_limit.take(),
+                    include_mode_support: None,
                 },
                 &cancel,
             )?;

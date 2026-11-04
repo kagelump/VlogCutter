@@ -78,7 +78,12 @@ under `$SOURCE_AUDIO_EVAL_ROOT/mvp/**`, never in this repository.
 * `movie.wav` — 12.0 s synthetic movie soundtrack: seeded chord events of
   square-wave oscillators plus a seeded noise floor, 11025 Hz mono 16-bit PCM;
 * `recording-continuous.wav` — 15.0 s: 3.0 s of seeded room noise, then the
-  movie heard from its start (plus seeded mixing noise), 11025 Hz mono PCM.
+  movie heard from its start (plus seeded mixing noise), 11025 Hz mono PCM;
+* `recording-seek.wav` — 28.0 s: the movie heard at two distinct known delays
+  (from its start at recording time 2.0 s, then — after a 1.0 s seek — from its
+  start again at recording time 15.0 s), 11025 Hz mono PCM. Segment-assembly
+  expectations for it live in the manifest's `integrationCases[]` (kept out of
+  `cases[]` because each playback run has its own expected offset).
 
 Regenerate (two runs must produce byte-identical outputs):
 
@@ -95,7 +100,8 @@ byte-identical across runs and machines. Current digests
 | --- | --- |
 | `movie.wav` | `8870e7be64c3257a3630b1348f5511df33e0a6e374eeb6f55974002d15d0e86a` |
 | `recording-continuous.wav` | `8531cedc7e3524c5d6691f527788479884a790070cbe544fb32cf4f4175214dd` |
-| `synthetic-ci-v1.json` | `324e88d98ce5fcec48150728a0a747fea1ffa644215670d25d6af15aadbb9733` |
+| `recording-seek.wav` | `75435e3f0d69e0302ad39477e7e6f2d7b25955fd6d3c486da085785ff8e8da22` |
+| `synthetic-ci-v1.json` | `df6775861643a4fb3bd9722bcc120ecf8d5e75c04547d8ee75c8b5d71259c7d0` |
 
 ### Offset sign convention (explicit)
 
@@ -170,6 +176,12 @@ complete example) and the runner validates strictly:
   `fftSize` 512/1024, `hashesPerSecond` 20..=100, `fanout` 1..=3).
 * `cases[]`: `caseId`, `recording` (`path`, `sha256`, `sampleRate`,
   `firstSample`, `lastSample`, `captureClockId`), `request` and `expected`.
+* `integrationCases[]` (optional, ignored by the runner): segment-assembly
+  evidence for recordings without one case-level offset — `caseId`,
+  `recording`, `pooledOffsetWindows`, `pooledOffsetModeLimit` and `expected`
+  with per-window `expectedOffsetSeconds`, per-segment
+  `supportedSecondsWithinEpoch` and `unknownTransitionSecondsWithinEpoch`
+  (consumed by `core/rcdvlog-core/src/source_audio_segments_tests.rs`).
 * `request` is a full match request per the preserved CLI request schema
   (`LandmarkMatchInput`): `captureClockId`, `policy`, `searchPolicy`,
   `diagnosticOffsetEvidencePerTile`, `pooledOffsetWindows`

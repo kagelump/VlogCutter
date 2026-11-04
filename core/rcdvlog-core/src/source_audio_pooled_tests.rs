@@ -53,6 +53,7 @@ fn request(windows: Vec<PooledOffsetWindow>, mode_limit: Option<u8>) -> PooledRe
         search_policy: None,
         windows: Some(windows),
         mode_limit,
+        include_mode_support: None,
     }
 }
 
