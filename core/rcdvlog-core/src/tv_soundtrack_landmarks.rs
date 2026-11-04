@@ -86,6 +86,10 @@ pub struct OffsetEvidence {
     pub frequency_diversity: u32,
     pub rarity_weight: f64,
     pub saturated_anchors: u32,
+    /// Query-local frame identities for overlap-aware diagnostics. Kept in memory
+    /// for exact deduplication, but omitted from serialized raw evidence.
+    #[serde(skip)]
+    pub query_anchor_frames: Vec<u32>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -398,15 +402,28 @@ impl Index {
         }
         let mut offsets: Vec<_> = votes
             .into_iter()
-            .map(|((time_bin, offset_bin), v)| OffsetEvidence {
-                time_bin,
-                offset_bin,
-                offset_seconds_from_capture_start: f64::from(offset_bin) * 0.08,
-                independent_anchors: v.anchors.len() as u32,
-                supporting_seconds: v.seconds.len() as u32,
-                frequency_diversity: v.frequencies.len() as u32,
-                rarity_weight: v.weight,
-                saturated_anchors: v.saturated.len() as u32,
+            .map(|((time_bin, offset_bin), v)| {
+                let VoteCell {
+                    anchors,
+                    seconds,
+                    frequencies,
+                    saturated,
+                    weight,
+                } = v;
+                let independent_anchors = anchors.len() as u32;
+                let mut query_anchor_frames: Vec<_> = anchors.into_iter().collect();
+                query_anchor_frames.sort_unstable();
+                OffsetEvidence {
+                    time_bin,
+                    offset_bin,
+                    offset_seconds_from_capture_start: f64::from(offset_bin) * 0.08,
+                    independent_anchors,
+                    supporting_seconds: seconds.len() as u32,
+                    frequency_diversity: frequencies.len() as u32,
+                    rarity_weight: weight,
+                    saturated_anchors: saturated.len() as u32,
+                    query_anchor_frames,
+                }
             })
             .collect();
         offsets.sort_by(|a, b| {

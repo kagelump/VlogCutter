@@ -1069,6 +1069,7 @@ mod tests {
                 frequency_diversity: 8,
                 rarity_weight: f64::from(a),
                 saturated_anchors: 0,
+                query_anchor_frames: (0..a).map(|ordinal| t * 1000 + ordinal).collect(),
             })
             .collect();
         (
@@ -1146,6 +1147,7 @@ mod tests {
                     frequency_diversity: 8,
                     rarity_weight: 4.0,
                     saturated_anchors: 0,
+                    query_anchor_frames: (0..4).map(|ordinal| tile * 1000 + ordinal).collect(),
                 });
             }
             evidence.push(OffsetEvidence {
@@ -1157,6 +1159,7 @@ mod tests {
                 frequency_diversity: 4,
                 rarity_weight: 4.0,
                 saturated_anchors: 0,
+                query_anchor_frames: (0..3).map(|ordinal| tile * 1000 + ordinal).collect(),
             });
         }
         let (mut search, clock, movie) = fixture(Vec::new());

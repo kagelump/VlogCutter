@@ -25,6 +25,7 @@ const MAX_LANDMARK_DIAGNOSTIC_DURATION_SECONDS: f64 = 60.0;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -154,7 +155,72 @@ struct LandmarkMatchInput {
     search_policy: Option<LandmarkSearchPolicy>,
     #[serde(default)]
     diagnostic_offset_evidence_per_tile: Option<u16>,
+    #[serde(default)]
+    pooled_offset_windows: Option<Vec<PooledOffsetWindow>>,
+    #[serde(default)]
+    pooled_offset_mode_limit: Option<u8>,
 }
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PooledOffsetWindow {
+    start_seconds: u32,
+    duration_seconds: u16,
+}
+
+#[derive(Default)]
+struct PooledOffsetMode {
+    summed_cell_anchor_count: u64,
+    rarity_weight: f64,
+    saturated_anchors: u64,
+    query_anchor_frames: BTreeSet<u32>,
+    occupied_time_bins: Vec<u32>,
+    frequency_diversity_by_time_bin: Vec<u32>,
+}
+
+impl PooledOffsetMode {
+    fn add(&mut self, evidence: &LandmarkOffsetEvidence) {
+        self.summed_cell_anchor_count += u64::from(evidence.independent_anchors);
+        self.query_anchor_frames
+            .extend(evidence.query_anchor_frames.iter().copied());
+        self.rarity_weight += evidence.rarity_weight;
+        self.saturated_anchors += u64::from(evidence.saturated_anchors);
+        self.occupied_time_bins.push(evidence.time_bin);
+        self.frequency_diversity_by_time_bin
+            .push(evidence.frequency_diversity);
+    }
+
+    fn independent_anchor_count(&self) -> u64 {
+        self.query_anchor_frames.len() as u64
+    }
+
+    fn shared_query_anchors(&self, other: &Self) -> usize {
+        self.query_anchor_frames
+            .intersection(&other.query_anchor_frames)
+            .count()
+    }
+
+    fn support_span_seconds(&self) -> u32 {
+        match (
+            self.occupied_time_bins.first(),
+            self.occupied_time_bins.last(),
+        ) {
+            (Some(first), Some(last)) => last - first + 1,
+            _ => 0,
+        }
+    }
+
+    fn median_frequency_diversity(&self) -> f64 {
+        let mut values = self.frequency_diversity_by_time_bin.clone();
+        values.sort_unstable();
+        match values.len() {
+            0 => 0.0,
+            length if length % 2 == 1 => f64::from(values[length / 2]),
+            length => f64::from(values[length / 2 - 1] + values[length / 2]) / 2.0,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PreviewInput {
@@ -423,6 +489,17 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
                 request.search_policy.take().unwrap_or_default(),
                 &cancel,
             )?;
+            let pooled_offset_evidence = request
+                .pooled_offset_windows
+                .take()
+                .map(|windows| {
+                    pool_exact_offset_windows(
+                        &search,
+                        &windows,
+                        usize::from(request.pooled_offset_mode_limit.take().unwrap_or(8)),
+                    )
+                })
+                .transpose()?;
             let offset_evidence_limit = usize::from(
                 request
                     .diagnostic_offset_evidence_per_tile
@@ -453,6 +530,7 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
             Ok(
                 serde_json::json!({"schemaVersion":1,"movieDigest":index.movie.movie_digest,
                 "indexDigest":index.index_digest,"recordingDigest":before.hex_digest,
+                "pooledOffsetEvidence":pooled_offset_evidence,
                 "search":{"complete":search.complete,"queryLandmarkCount":search.query_landmark_count,
                     "matchedLandmarkCount":search.matched_landmark_count,
                     "candidatePairCount":search.candidate_pair_count,
@@ -463,6 +541,174 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
             )
         }
     }
+}
+
+/// Pool complete per-second exact-offset cells before the bounded raw diagnostics
+/// are selected. Windows are independent observations: no evidence is combined
+/// across overlapping windows, and neighboring offset bins remain alternatives.
+fn pool_exact_offset_windows(
+    search: &LandmarkSearch,
+    windows: &[PooledOffsetWindow],
+    mode_limit: usize,
+) -> Result<Value> {
+    const MAX_WINDOWS: usize = 256;
+    const MAX_MODE_LIMIT: usize = 64;
+    const MAX_WINDOW_CELL_SCANS: usize = 50_000_000;
+    ensure!(
+        !windows.is_empty() && windows.len() <= MAX_WINDOWS,
+        "invalid input: pooled offset window count must be 1..256"
+    );
+    ensure!(
+        (1..=MAX_MODE_LIMIT).contains(&mode_limit),
+        "invalid input: pooled offset mode limit must be 1..64"
+    );
+    ensure!(
+        search
+            .offsets
+            .len()
+            .checked_mul(windows.len())
+            .is_some_and(|scans| scans <= MAX_WINDOW_CELL_SCANS),
+        "invalid input: pooled offset cell-scan budget exceeded"
+    );
+    let query_seconds = search.query_sample_count as f64 / f64::from(tv_soundtrack_landmarks::RATE);
+    let mut output_windows = Vec::with_capacity(windows.len());
+
+    for window in windows {
+        ensure!(
+            matches!(window.duration_seconds, 10 | 20 | 30),
+            "invalid input: pooled offset durations must be 10, 20 or 30 seconds"
+        );
+        let end_seconds = window
+            .start_seconds
+            .checked_add(u32::from(window.duration_seconds))
+            .ok_or_else(|| anyhow::anyhow!("invalid input: pooled offset window overflow"))?;
+        ensure!(
+            f64::from(end_seconds) <= query_seconds + 1e-6,
+            "invalid input: pooled offset window exceeds decoded query duration"
+        );
+
+        let mut by_offset: BTreeMap<i32, PooledOffsetMode> = BTreeMap::new();
+        let mut pooled_offset_cell_count = 0usize;
+        for evidence in &search.offsets {
+            if evidence.time_bin >= window.start_seconds && evidence.time_bin < end_seconds {
+                by_offset
+                    .entry(evidence.offset_bin)
+                    .or_default()
+                    .add(evidence);
+                pooled_offset_cell_count += 1;
+            }
+        }
+        let mut ranked: Vec<(i32, PooledOffsetMode)> = by_offset.into_iter().collect();
+        ranked.sort_by(|(left_bin, left), (right_bin, right)| {
+            right
+                .independent_anchor_count()
+                .cmp(&left.independent_anchor_count())
+                .then(left_bin.cmp(right_bin))
+        });
+
+        let best_competitor = ranked.first().and_then(|(best_bin, best)| {
+            ranked
+                .iter()
+                .skip(1)
+                .find(|(bin, _)| (i64::from(*bin) - i64::from(*best_bin)).abs() >= 2)
+                .map(|(bin, mode)| {
+                    let shared = best.shared_query_anchors(mode);
+                    serde_json::json!({
+                        "offsetBin": bin,
+                        "offsetSeconds": f64::from(*bin) * 0.08,
+                        "independentAnchors": mode.independent_anchor_count(),
+                        "occupiedTimeBins": mode.occupied_time_bins.len(),
+                        "sharedQueryAnchorsWithBest": shared,
+                        "uniqueQueryAnchorsOutsideBest": mode.independent_anchor_count() as usize - shared,
+                    })
+                })
+        });
+        let best_anchor_margin = ranked.first().and_then(|(_, best)| {
+            ranked
+                .iter()
+                .skip(1)
+                .find(|(bin, _)| (i64::from(*bin) - i64::from(ranked[0].0)).abs() >= 2)
+                .and_then(|(_, competitor)| {
+                    (competitor.independent_anchor_count() > 0).then(|| {
+                        ((best.independent_anchor_count() as f64
+                            / competitor.independent_anchor_count() as f64)
+                            * 10_000.0)
+                            .round()
+                            / 10_000.0
+                    })
+                })
+        });
+        let best_unique_anchor_margin = ranked.first().and_then(|(best_bin, best)| {
+            ranked
+                .iter()
+                .skip(1)
+                .find(|(bin, _)| (i64::from(*bin) - i64::from(*best_bin)).abs() >= 2)
+                .and_then(|(_, competitor)| {
+                    let shared = best.shared_query_anchors(competitor);
+                    let best_unique = best.independent_anchor_count() as usize - shared;
+                    let competitor_unique = competitor.independent_anchor_count() as usize - shared;
+                    (competitor_unique > 0).then(|| {
+                        ((best_unique as f64 / competitor_unique as f64) * 10_000.0).round()
+                            / 10_000.0
+                    })
+                })
+        });
+        let modes: Vec<Value> = ranked
+            .iter()
+            .take(mode_limit)
+            .map(|(offset_bin, mode)| {
+                let shared_with_best = ranked
+                    .first()
+                    .map(|(_, best)| best.shared_query_anchors(mode))
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "offsetBin": offset_bin,
+                    "offsetSeconds": f64::from(*offset_bin) * 0.08,
+                    "independentAnchors": mode.independent_anchor_count(),
+                    "summedCellAnchorCount": mode.summed_cell_anchor_count,
+                    "duplicateAnchorVotesRemoved": mode.summed_cell_anchor_count - mode.independent_anchor_count(),
+                    "occupiedTimeBins": mode.occupied_time_bins.len(),
+                    "supportSpanSeconds": mode.support_span_seconds(),
+                    "rarityWeight": (mode.rarity_weight * 1_000_000.0).round() / 1_000_000.0,
+                    "frequencyDiversityMedianPerTimeBin": mode.median_frequency_diversity(),
+                    "saturatedAnchors": mode.saturated_anchors,
+                    "sharedQueryAnchorsWithBest": shared_with_best,
+                })
+            })
+            .collect();
+        output_windows.push(serde_json::json!({
+            "startSeconds": window.start_seconds,
+            "durationSeconds": window.duration_seconds,
+            "endSeconds": end_seconds,
+            "complete": search.complete,
+            "internalOffsetCellCount": search.offsets.len(),
+            "offsetCellsScanned": search.offsets.len(),
+            "offsetCellsPooledForWindow": pooled_offset_cell_count,
+            "offsetCellsDropped": 0,
+            "rankedOffsetBinCount": ranked.len(),
+            "returnedOffsetBinCount": modes.len(),
+            "bestDistinctCompetitor": best_competitor,
+            "bestAnchorMargin": best_anchor_margin,
+            "bestUniqueAnchorMargin": best_unique_anchor_margin,
+            "modes": modes,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "schemaVersion": 1,
+        "status": if search.complete { "complete" } else { "incomplete" },
+        "complete": search.complete,
+        "searchComplete": search.complete,
+        "internalOffsetCellCount": search.offsets.len(),
+        "offsetCellScanComplete": true,
+        "diagnosticTruncationAppliedAfterPooling": true,
+        "queryAnchorIdentityAvailable": true,
+        "anchorIdentitySerialized": false,
+        "anchorIdentityScope": "query landmark frame index within the current decoded recording; available to the in-memory pool and omitted from serialized raw diagnostic rows",
+        "aggregationScope": "exact offset bin per window; query anchor IDs deduplicate within a mode and quantify cross-mode overlap; no neighboring-bin merge and no cross-window accumulation",
+        "modeLimit": mode_limit,
+        "windows": output_windows,
+    }))
 }
 
 /// Preserve bounded raw offset modes before per-second alignment gates. These
@@ -526,4 +772,147 @@ fn write_immutable_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(test)]
+mod pooled_offset_tests {
+    use super::*;
+
+    fn evidence(time_bin: u32, offset_bin: i32, anchors: u32) -> LandmarkOffsetEvidence {
+        LandmarkOffsetEvidence {
+            time_bin,
+            offset_bin,
+            offset_seconds_from_capture_start: f64::from(offset_bin) * 0.08,
+            independent_anchors: anchors,
+            supporting_seconds: 1,
+            frequency_diversity: 4,
+            rarity_weight: f64::from(anchors),
+            saturated_anchors: 0,
+            query_anchor_frames: (0..anchors)
+                .map(|ordinal| time_bin * 1000 + ordinal)
+                .collect(),
+        }
+    }
+
+    fn search(query_seconds: u64, offsets: Vec<LandmarkOffsetEvidence>) -> LandmarkSearch {
+        LandmarkSearch {
+            schema_version: 1,
+            recipe: LandmarkRecipe::default(),
+            search_policy: LandmarkSearchPolicy::default(),
+            movie_digest: "movie".into(),
+            index_digest: "index".into(),
+            query_pcm_digest: "query".into(),
+            query_sample_count: query_seconds * u64::from(tv_soundtrack_landmarks::RATE),
+            query_landmark_count: 0,
+            matched_landmark_count: 0,
+            candidate_pair_count: 0,
+            complete: true,
+            offsets,
+        }
+    }
+
+    #[test]
+    fn exact_offset_bins_remain_separate_and_adjacent_bins_have_no_distinct_competitor() {
+        let search = search(
+            10,
+            vec![
+                evidence(0, 100, 3),
+                evidence(1, 100, 2),
+                evidence(0, 101, 20),
+            ],
+        );
+        let pooled = pool_exact_offset_windows(
+            &search,
+            &[PooledOffsetWindow {
+                start_seconds: 0,
+                duration_seconds: 10,
+            }],
+            8,
+        )
+        .unwrap();
+        let window = &pooled["windows"][0];
+        assert_eq!(window["modes"][0]["offsetBin"], 101);
+        assert_eq!(window["modes"][0]["independentAnchors"], 20);
+        assert_eq!(window["modes"][1]["offsetBin"], 100);
+        assert_eq!(window["modes"][1]["independentAnchors"], 5);
+        assert_eq!(window["modes"][1]["sharedQueryAnchorsWithBest"], 3);
+        assert!(window["bestDistinctCompetitor"].is_null());
+        assert!(window["bestUniqueAnchorMargin"].is_null());
+        assert_eq!(window["offsetCellsPooledForWindow"], 3);
+    }
+
+    #[test]
+    fn distinct_competitor_margin_uses_unique_anchor_identity() {
+        let mut best0 = evidence(0, 100, 3);
+        best0.query_anchor_frames = vec![1, 2, 3];
+        let mut best1 = evidence(1, 100, 2);
+        best1.query_anchor_frames = vec![4, 5];
+        let mut competitor0 = evidence(0, 110, 3);
+        competitor0.query_anchor_frames = vec![1, 2, 6];
+        let mut competitor1 = evidence(1, 110, 2);
+        competitor1.query_anchor_frames = vec![7];
+        let pooled = pool_exact_offset_windows(
+            &search(10, vec![best0, best1, competitor0, competitor1]),
+            &[PooledOffsetWindow {
+                start_seconds: 0,
+                duration_seconds: 10,
+            }],
+            8,
+        )
+        .unwrap();
+        let window = &pooled["windows"][0];
+        assert_eq!(window["bestAnchorMargin"], 1.25);
+        assert_eq!(
+            window["bestDistinctCompetitor"]["sharedQueryAnchorsWithBest"],
+            2
+        );
+        assert_eq!(window["bestUniqueAnchorMargin"], 1.5);
+    }
+
+    #[test]
+    fn overlapping_windows_are_ranked_separately_without_cross_window_vote_sums() {
+        let search = search(
+            12,
+            vec![evidence(0, 50, 2), evidence(5, 50, 4), evidence(10, 50, 3)],
+        );
+        let pooled = pool_exact_offset_windows(
+            &search,
+            &[
+                PooledOffsetWindow {
+                    start_seconds: 0,
+                    duration_seconds: 10,
+                },
+                PooledOffsetWindow {
+                    start_seconds: 2,
+                    duration_seconds: 10,
+                },
+            ],
+            8,
+        )
+        .unwrap();
+        assert_eq!(pooled["windows"][0]["modes"][0]["independentAnchors"], 6);
+        assert_eq!(pooled["windows"][1]["modes"][0]["independentAnchors"], 7);
+        assert_eq!(pooled["windows"][0]["offsetCellsScanned"], 3);
+        assert_eq!(pooled["windows"][1]["offsetCellsScanned"], 3);
+        assert_eq!(pooled["windows"][0]["offsetCellsDropped"], 0);
+        assert_eq!(pooled["windows"][1]["offsetCellsDropped"], 0);
+    }
+
+    #[test]
+    fn incomplete_search_is_reported_even_when_all_returned_cells_are_scanned() {
+        let mut search = search(10, vec![evidence(0, 50, 2)]);
+        search.complete = false;
+        let pooled = pool_exact_offset_windows(
+            &search,
+            &[PooledOffsetWindow {
+                start_seconds: 0,
+                duration_seconds: 10,
+            }],
+            8,
+        )
+        .unwrap();
+        assert_eq!(pooled["complete"], false);
+        assert_eq!(pooled["offsetCellScanComplete"], true);
+        assert_eq!(pooled["windows"][0]["offsetCellsDropped"], 0);
+    }
 }

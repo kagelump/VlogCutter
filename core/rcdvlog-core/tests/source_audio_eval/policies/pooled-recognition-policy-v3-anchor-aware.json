@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "policyId": "rc6-v2-density100-exact-bin-complete-evidence-anchor-identity-calibrated-v3",
+  "status": "provisional small-set development calibration; not a population false-accept guarantee",
+  "extractorIdentity": "fft512-density100-fanout3; full RC6 movie identity",
+  "scoreDefinition": "Best exact 80 ms offset bin ranked by deduplicated query-anchor identity; occupancy and distinct non-adjacent-bin unique-anchor margin are additional floors. Neighboring bins remain separate alternatives.",
+  "baselinePolicyId": "rc6-v2-pooled-exact-80ms-bin-independent-anchor-count-v1",
+  "baselinePolicySha256": "1be66d6b58c3ca41bdd910f26d3c53c121a02867205be84cb6d67ee7a1be4438",
+  "calibrationMethod": "For 10 s only, preserve every baseline floor, including the raw distinct-competitor ratio. Raise the minimum-anchor floor to max(baseline minimum, maximum observed calibration-negative best-mode count + 1), and add a unique-anchor margin floor of max(baseline distinct-competitor ratio, maximum observed calibration-negative unique-anchor margin + 0.01). No floor is relaxed.",
+  "requiresBaselineDistinctCompetitorRatio": true,
+  "acceptance": {
+    "10": {
+      "minimumAnchors": 33,
+      "minimumOccupiedTimeBins": 5,
+      "minimumDistinctCompetitorRatio": 2.0,
+      "minimumUniqueAnchorMargin": 2.0,
+      "calibratedFromNegativeCaptureCount": 7,
+      "maximumCalibrationNegativeBestModeAnchors": 32,
+      "maximumCalibrationNegativeUniqueAnchorMargin": 1.6667,
+      "calibrated": true
+    },
+    "20": {
+      "minimumAnchors": 90,
+      "minimumOccupiedTimeBins": 6,
+      "minimumDistinctCompetitorRatio": 3.0,
+      "calibrated": false,
+      "inheritedFrom": "rc6-v2-pooled-exact-80ms-bin-independent-anchor-count-v1",
+      "negativeWindowCount": 0
+    },
+    "30": {
+      "minimumAnchors": 150,
+      "minimumOccupiedTimeBins": 10,
+      "minimumDistinctCompetitorRatio": 3.0,
+      "calibrated": false,
+      "inheritedFrom": "rc6-v2-pooled-exact-80ms-bin-independent-anchor-count-v1",
+      "negativeWindowCount": 0
+    }
+  },
+  "completenessRequired": true,
+  "anchorIdentityAvailable": true,
+  "windowAggregation": "Each requested window is scored separately. Exact offset bins and overlapping windows are not merged; anchor IDs deduplicate within a mode and identify support shared with competing modes.",
+  "calibrationCaptureIds": [
+    "130c08f9850afd1f88cd6764",
+    "44e4a49c4b8bed517f38ffa2",
+    "5d9b30a5c412495c189f0df1",
+    "72ac162fd6ddc16a5088976b",
+    "9135ee202cf042bbf822b2fc",
+    "9f90726add9dd81a2b1d7e09",
+    "a1ae3b891900071f3f693649"
+  ]
+}
