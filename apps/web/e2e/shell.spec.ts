@@ -256,6 +256,15 @@ test("Chrome recovers a recording interrupted by a page reload and finalizes it 
   await expect(page.getByText(/^interrupted/)).toBeVisible();
   await expect(page.getByText("Incomplete",{exact:true})).toBeVisible();
   await expect(page.getByText(/reviewer declaration, not measured sync/)).toBeVisible();
+  // What arrived of the incomplete recording is still listenable, from the
+  // real server's verified chunks, without a padded whole-session download.
+  await expect(page.getByRole("link", { name: "Download WAV" })).toHaveCount(0);
+  const listen = page.getByRole("region", { name: "Listen to stored audio" });
+  await expect(listen).toContainText("never filled with silence");
+  await listen.getByRole("button", { name: /^Listen to 0:00–/ }).click();
+  const player = listen.locator("audio");
+  await expect(player).toHaveCount(1);
+  await expect.poll(() => player.evaluate((a: HTMLAudioElement) => a.error ? -1 : a.duration || 0), { timeout: 10_000 }).toBeGreaterThan(0.5);
 });
 
 

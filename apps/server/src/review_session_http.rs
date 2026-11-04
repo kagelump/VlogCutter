@@ -48,6 +48,7 @@ fn error_response(request_id: &RequestId, error: ReviewSessionError) -> Response
         | ReviewSessionError::NotRecording
         | ReviewSessionError::ChunkConflict
         | ReviewSessionError::AudioUnavailable
+        | ReviewSessionError::AudioGap
         | ReviewSessionError::IdempotencyConflict => StatusCode::CONFLICT,
         ReviewSessionError::LimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
         ReviewSessionError::LowDiskSpace => StatusCode::INSUFFICIENT_STORAGE,
@@ -359,6 +360,49 @@ pub(super) async fn audio(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SnippetQuery {
+    start_frame: u64,
+    end_frame: u64,
+}
+
+/// A bounded WAV snippet for listening, from any non-deleted session. Inline,
+/// uncached and never padded: a range touching missing audio is a 409.
+pub(super) async fn snippet(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath((project_id, session_id)): AxumPath<(String, String)>,
+    query: Result<Query<SnippetQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return query_error_response(&request_id, "invalid_query", StatusCode::BAD_REQUEST);
+    };
+    let sessions = sessions(&state);
+    let snippet = match blocking(&request_id, move || {
+        sessions.snippet(&project_id, &session_id, query.start_frame, query.end_frame)
+    })
+    .await
+    {
+        Ok(snippet) => snippet,
+        Err(response) => return response,
+    };
+    let mut body = wav_header(
+        snippet.sample_rate,
+        snippet.channels,
+        snippet.pcm.len() as u64,
+    );
+    body.extend_from_slice(&snippet.pcm);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "audio/wav")
+        .header(header::CONTENT_LENGTH, body.len())
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .header(header::CONTENT_DISPOSITION, "inline")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 pub(super) fn routes(state: &HttpState) -> Router<HttpState> {
     let base = "/api/v1/projects/{project_id}/review-sessions";
     let chunks = Router::new()
@@ -376,6 +420,7 @@ pub(super) fn routes(state: &HttpState) -> Router<HttpState> {
         .route(&format!("{base}/{{session_id}}/events"), post(record_event))
         .route(&format!("{base}/{{session_id}}/finalize"), post(finalize))
         .route(&format!("{base}/{{session_id}}/audio.wav"), get(audio))
+        .route(&format!("{base}/{{session_id}}/snippet.wav"), get(snippet))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .merge(chunks)
         .layer(middleware::from_fn_with_state(state.clone(), require_csrf))
@@ -436,7 +481,14 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
         "/api/v1/projects/{projectId}/review-sessions/{sessionId}/audio.wav": {
             "get": {"operationId":"getReviewSessionAudio","description":"WAV of a completed session only. Incomplete audio is never padded.",
                 "parameters":[project,session],
-                "responses":{"200":{"description":"WAV audio","content":{"audio/wav":{"schema":{"type":"string","format":"binary"}}}},"404":error.clone(),"409":error}}
+                "responses":{"200":{"description":"WAV audio","content":{"audio/wav":{"schema":{"type":"string","format":"binary"}}}},"404":error.clone(),"409":error.clone()}}
+        },
+        "/api/v1/projects/{projectId}/review-sessions/{sessionId}/snippet.wav": {
+            "get": {"operationId":"getReviewSessionSnippet","description":"Bounded WAV (at most 30 seconds) of stored audio from any non-deleted session, including recoverable spans of an incomplete one. A range touching missing audio is 409 review_session_audio_gap; audio is never padded.",
+                "parameters":[project,session,
+                    {"name":"startFrame","in":"query","required":true,"schema":{"type":"integer","minimum":0}},
+                    {"name":"endFrame","in":"query","required":true,"schema":{"type":"integer","minimum":1}}],
+                "responses":{"200":{"description":"WAV audio","content":{"audio/wav":{"schema":{"type":"string","format":"binary"}}}},"400":error.clone(),"404":error.clone(),"409":error}}
         }
     });
     let open = json!({"type":"object","additionalProperties":true});

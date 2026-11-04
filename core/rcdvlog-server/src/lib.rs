@@ -105,11 +105,11 @@ pub use review_discussions::{
 pub use review_sessions::{
     ChunkReceipt, ChunkUpload, CreateReviewSessionRequest, FinalizeReviewSessionRequest,
     FrameRange, REVIEW_SESSION_LIST_MAX_LIMIT, REVIEW_SESSION_MAX_ACTIVE, REVIEW_SESSION_MAX_BYTES,
-    REVIEW_SESSION_MAX_CHUNK_BYTES, RecordingAudioFormat, RecordingCaptureSettings,
-    RecordingConsent, RecordingEndReason, ReviewSessionAudio, ReviewSessionCoverage,
-    ReviewSessionDetail, ReviewSessionError, ReviewSessionEvent, ReviewSessionEventKind,
-    ReviewSessionEventRequest, ReviewSessionPage, ReviewSessionState, ReviewSessionSummary,
-    ReviewSessions, wav_header,
+    REVIEW_SESSION_MAX_CHUNK_BYTES, REVIEW_SNIPPET_MAX_SECONDS, RecordingAudioFormat,
+    RecordingCaptureSettings, RecordingConsent, RecordingEndReason, ReviewSessionAudio,
+    ReviewSessionCoverage, ReviewSessionDetail, ReviewSessionError, ReviewSessionEvent,
+    ReviewSessionEventKind, ReviewSessionEventRequest, ReviewSessionPage, ReviewSessionSnippet,
+    ReviewSessionState, ReviewSessionSummary, ReviewSessions, wav_header,
 };
 pub use review_sync::{
     CALIBRATION_SCHEMA, MANUAL_CUE_CONFIDENCE, MANUAL_CUE_MOVIE_UNCERTAINTY_SECONDS, SessionSync,

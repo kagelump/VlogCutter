@@ -686,3 +686,86 @@ fn unacknowledged_capture_tail_remains_incomplete_while_uploaded_bytes_are_usabl
     );
     assert!(f.sessions.audio(PROJECT, &id).is_err());
 }
+
+#[test]
+fn snippets_play_recoverable_spans_of_any_live_session_and_never_pad_gaps() {
+    let f = fixture();
+    let id = f
+        .sessions
+        .create(
+            PROJECT,
+            &create_request(&f.target_id, "key_snippet"),
+            &actor(),
+            now(),
+        )
+        .unwrap()
+        .summary
+        .session_id;
+    upload(&f, &id, 0, 0, 4800).unwrap();
+    upload(&f, &id, 1, 4800, 4800).unwrap();
+    // Sequence 2 never arrives.
+    upload(&f, &id, 3, 14_400, 4800).unwrap();
+    // While still recording: stored audio is already listenable, across chunks.
+    let across = f.sessions.snippet(PROJECT, &id, 4000, 6000).unwrap();
+    assert_eq!(across.pcm, pcm(4000, 2000));
+    assert_eq!((across.sample_rate, across.channels), (48_000, 1));
+    let done = finalize(&f, &id, 24_000, RecordingEndReason::DeviceLost).unwrap();
+    assert_eq!(done.summary.state, ReviewSessionState::Incomplete);
+    assert_eq!(
+        done.coverage.stored_ranges,
+        vec![
+            FrameRange {
+                start_frame: 0,
+                end_frame: 9600
+            },
+            FrameRange {
+                start_frame: 14_400,
+                end_frame: 19_200
+            },
+        ]
+    );
+    // The whole-session WAV stays refused; a recoverable span is not.
+    assert!(matches!(
+        f.sessions.audio(PROJECT, &id),
+        Err(ReviewSessionError::AudioUnavailable)
+    ));
+    assert_eq!(
+        f.sessions
+            .snippet(PROJECT, &id, 14_400, 19_200)
+            .unwrap()
+            .pcm,
+        pcm(14_400, 4800)
+    );
+    // Touching the gap, or the unreceived tail, is refused rather than padded.
+    for (start, end) in [(9000, 10_000), (9600, 14_400), (19_000, 19_201)] {
+        assert!(
+            matches!(
+                f.sessions.snippet(PROJECT, &id, start, end),
+                Err(ReviewSessionError::AudioGap)
+            ),
+            "{start}..{end}"
+        );
+    }
+    // Bounded: empty, reversed and over-long requests are invalid.
+    for (start, end) in [(10, 10), (20, 10), (0, 48_000 * 30 + 1)] {
+        assert!(matches!(
+            f.sessions.snippet(PROJECT, &id, start, end),
+            Err(ReviewSessionError::InvalidInput(_))
+        ));
+    }
+    // A modified stored chunk is never played.
+    let path = f.sessions.chunk_path(&id, 3);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(matches!(
+        f.sessions.snippet(PROJECT, &id, 14_400, 14_500),
+        Err(ReviewSessionError::AudioUnavailable)
+    ));
+    // Deleted sessions have no audio at all.
+    f.sessions.delete(PROJECT, &id, now()).unwrap();
+    assert!(matches!(
+        f.sessions.snippet(PROJECT, &id, 0, 100),
+        Err(ReviewSessionError::AudioUnavailable)
+    ));
+}

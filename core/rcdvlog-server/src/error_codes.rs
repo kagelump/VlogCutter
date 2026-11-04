@@ -55,6 +55,7 @@ pub const STABLE_ERROR_CODES: &[&str] = &[
     "review_human_required",
     "review_item_retracted",
     "review_reconciliation_conflict",
+    "review_session_audio_gap",
     "review_session_audio_unavailable",
     "review_session_busy",
     "review_session_chunk_conflict",

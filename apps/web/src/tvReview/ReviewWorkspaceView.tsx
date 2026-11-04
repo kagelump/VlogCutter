@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
+import { SnippetPlayer } from "./SnippetPlayer";
+import { utteranceWindow, type FrameSpan } from "./snippet";
 import type {
   BrowserProjectClient,
   Discussion,
@@ -50,12 +52,13 @@ const SYNC_LABEL: Record<string, string> = {
   failed: "Movie time: sync failed",
 };
 
-function UtteranceEditor({ utterance, onCorrect }: { utterance: WorkspaceUtterance; onCorrect: (field: "text" | "speaker" | "movieTime" | "excluded", value: unknown) => Promise<void> }) {
+function UtteranceEditor({ utterance, onCorrect, listenUrl }: { utterance: WorkspaceUtterance; onCorrect: (field: "text" | "speaker" | "movieTime" | "excluded", value: unknown) => Promise<void>; listenUrl?: string | null }) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(utterance.text);
   const [movie, setMovie] = useState(utterance.movieTime ? utterance.movieTime.movieSeconds.toFixed(2) : "");
   return <li className={utterance.excluded ? "tv-utterance suppressed" : "tv-utterance"}>
     <span className="tv-stamp" title="Recording clock">{formatStamp(utterance.machine.startSeconds)}</span>
+    {listenUrl ? <SnippetPlayer url={listenUrl} label={`utterance at ${formatStamp(utterance.machine.startSeconds)}`} /> : null}
     <label className="tv-speaker-select"><span className="visually-hidden">Speaker for {utterance.machine.utteranceId}</span>
       <select aria-label={`Speaker for ${utterance.machine.utteranceId}`} value={utterance.speaker} onChange={(event) => void onCorrect("speaker", event.target.value)}>
         {SPEAKER_OPTIONS.map((s) => <option key={s} value={s}>{s === "unknown" ? "Speaker ?" : s === "A" || s === "B" ? `Speaker ${s}` : s}</option>)}
@@ -161,6 +164,19 @@ export function ReviewWorkspaceView({ client, projectId, targetId, sessionId, ru
   const [statusFilter, setStatusFilter] = useState("all");
   const [syncFilter, setSyncFilter] = useState("all");
   useEffect(() => { client.getReviewWorkspace(projectId, runId).then(setWorkspace).catch((reason) => setError(describe(reason))); }, [client, projectId, runId]);
+  // Stored ranges decide which utterances can be listened to; a failure here
+  // only hides the listen buttons, it never blocks editorial work.
+  const [audio, setAudio] = useState<{ rate: number; ranges: FrameSpan[] } | null>(null);
+  useEffect(() => {
+    client.getReviewSession(projectId, sessionId)
+      .then((s) => setAudio(s.state === "deleted" ? null : { rate: s.sampleRate, ranges: s.coverage.storedRanges }))
+      .catch(() => setAudio(null));
+  }, [client, projectId, sessionId]);
+  const listenUrl = (u: WorkspaceUtterance) => {
+    if (!audio) return null;
+    const window = utteranceWindow(audio.ranges, audio.rate, u.machine.startFrame, u.machine.endFrame);
+    return window ? client.reviewSessionSnippetUrl(projectId, sessionId, window.startFrame, window.endFrame) : null;
+  };
 
   async function act(work: () => Promise<ReviewWorkspace>) {
     setError(null);
@@ -191,7 +207,7 @@ export function ReviewWorkspaceView({ client, projectId, targetId, sessionId, ru
     <div className="tv-review-columns">
       <div>
         <h2 className="tv-section-title">Transcript</h2>
-        <ol className="tv-utterances">{workspace.utterances.map((u) => <UtteranceEditor key={u.machine.utteranceId} utterance={u}
+        <ol className="tv-utterances">{workspace.utterances.map((u) => <UtteranceEditor key={u.machine.utteranceId} utterance={u} listenUrl={listenUrl(u)}
           onCorrect={(field, value) => act(() => client.correctReviewUtterance(projectId, runId, u.machine.utteranceId, field, value))} />)}</ol>
       </div>
       <div>

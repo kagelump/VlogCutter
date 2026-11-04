@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ProjectClientError,
+  REVIEW_SNIPPET_MAX_SECONDS,
   type BrowserProjectClient,
   type RecordingEndReason,
   type ReviewSessionDetail,
@@ -10,6 +11,8 @@ import {
 import { StatePanel, StatusBadge } from "@rcdvlog/review-ui";
 import { normalizeError } from "../errors";
 import { TranscriptPanel } from "./TranscriptPanel";
+import { SnippetPlayer } from "./SnippetPlayer";
+import { snippetWindows } from "./snippet";
 import { defaultOutbox, type ChunkOutbox, type OutboxSession } from "./recording/outbox";
 import {
   VoiceRecording,
@@ -267,6 +270,25 @@ export function RecordView({ client, projectId, targetId, navigate, deps = brows
   </section>;
 }
 
+const MAX_LISTED_WINDOWS = 24;
+
+/** Listenable stored spans, including what arrived of an incomplete session. */
+function RecoverableAudio({ client, projectId, sessionId, session }: { client: BrowserProjectClient; projectId: string; sessionId: string; session: ReviewSessionDetail }) {
+  const rate = session.sampleRate;
+  const windows = snippetWindows(session.coverage.storedRanges, rate);
+  const partial = session.state !== "completed";
+  return <section aria-label="Listen to stored audio">
+    <h2 className="tv-section-title">{partial ? "Listen to what was stored" : "Listen"}</h2>
+    <p className="help">{partial
+      ? "Only audio the server received and verified plays here; gaps are skipped, never filled with silence."
+      : `Snippets of up to ${REVIEW_SNIPPET_MAX_SECONDS} seconds, streamed from private storage on request.`}</p>
+    <ul className="tv-snippets">{windows.slice(0, MAX_LISTED_WINDOWS).map((w) => <li key={w.startFrame}>
+      <SnippetPlayer url={client.reviewSessionSnippetUrl(projectId, sessionId, w.startFrame, w.endFrame)} label={`${formatClock(w.startFrame / rate)}–${formatClock(w.endFrame / rate)}`} />
+    </li>)}</ul>
+    {windows.length > MAX_LISTED_WINDOWS ? <p className="help">{windows.length - MAX_LISTED_WINDOWS} more snippets; use the transcript to jump to a moment{session.state === "completed" ? " or download the WAV" : ""}.</p> : null}
+  </section>;
+}
+
 export function SessionDetailView({ client, projectId, targetId, sessionId, navigate }: { client: BrowserProjectClient; projectId: string; targetId: string; sessionId: string; navigate: (path: string) => void }) {
   const [session, setSession] = useState<ReviewSessionDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -298,6 +320,7 @@ export function SessionDetailView({ client, projectId, targetId, sessionId, navi
           <dt>Gaps</dt><dd>{session.coverage.gaps.length ? session.coverage.gaps.map((gap) => `${formatClock(gap.startFrame / rate)}–${formatClock(gap.endFrame / rate)}`).join(", ") + " (no audio exists for these spans)" : session.state === "recording" ? "not computed until finalized" : "none"}</dd>
           {session.events.some((event)=>event.kind==="pageInterrupted"&&event.detail?.captureTailStatus==="unknown") ? <><dt>Capture end</dt><dd>The final sample count was not acknowledged. Uploaded audio is retained; the tail length is unknown.</dd></> : null}
         </dl>
+        {session.state !== "deleted" && session.coverage.storedRanges.length ? <RecoverableAudio client={client} projectId={projectId} sessionId={sessionId} session={session} /> : null}
         <h2 className="tv-section-title">Manual cues</h2>
         {cues.length ? <ul className="tv-limitations">{cues.map((cue) => <li key={cue.eventId}>{formatClock(cue.audioSeconds)} on the recording clock — declared movie {cue.declaredMovieSeconds ?? "?"} s (reviewer declaration, not measured sync)</li>)}</ul> : <p className="help">No manual cue. Automatic synchronization may still align this recording later.</p>}
         {health.length ? <><h2 className="tv-section-title">Capture events</h2><ul className="tv-limitations">{health.map((event) => <li key={event.eventId}>{formatClock(event.audioSeconds)} · {event.kind}</li>)}</ul></> : null}

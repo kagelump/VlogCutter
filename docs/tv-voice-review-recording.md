@@ -166,6 +166,7 @@ rest of the server.
 | `POST …/finalize` | Takes `finalFrameCount` and an `endReason`. The server re-hashes every stored chunk and computes received ranges, missing sequences and gaps over `[0, finalFrameCount)`. Identical repeats are idempotent. |
 | `GET …/{sessionId}`, `GET …/review-sessions` | Detail and bounded list. A recording past its 12 h lifetime is marked `abandoned` and can still be finalized. |
 | `GET …/audio.wav` | Only for `completed` sessions. Each chunk is re-verified and the result is streamed. Incomplete audio is never padded (409 `review_session_audio_unavailable`). |
+| `GET …/snippet.wav?startFrame&endFrame` | Bounded listening (at most 30 s, `REVIEW_SNIPPET_MAX_SECONDS`) from any non-deleted session, including a still-recording or incomplete one. The range must lie entirely in stored audio; every chunk it touches is re-verified. A range touching missing audio is 409 `review_session_audio_gap`, never padded. Served `inline` and `private, no-store`. |
 | `GET …/chunks/{sequence}` | Exact stored bytes, re-verified, for any non-deleted session. |
 | `DELETE …/{sessionId}` | Removes the audio directory. The metadata, events and chunk ledger remain as a tombstone. |
 
@@ -232,7 +233,10 @@ a real TV:
 5. Close the tab mid-recording, reopen it, and use **Resume upload and finalize**.
 6. Fill the server disk to `RCDVLOG_MIN_FREE_BYTES`. Expect 507 retries with
    the audio kept in the browser.
-7. Download the WAV and confirm it plays. Delete the session, and confirm that
+7. On an interrupted (incomplete) session, play a span under *Listen to what
+   was stored* and confirm it is the reviewer's own speech with no inserted
+   silence. In the editorial workspace, play one utterance's snippet.
+8. Download the WAV and confirm it plays. Delete the session, and confirm that
    the audio directory is gone and the tombstone remains.
 
 Record the browser version, device, sample rate the context actually used,
