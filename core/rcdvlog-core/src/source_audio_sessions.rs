@@ -21,11 +21,12 @@
 //! origins: [`SessionWindowResult::offset_seconds`] is rebased from the
 //! chunk-local pooled offset by the chunk's position within its epoch.
 //!
-//! Execution runs the scheduled windows through
-//! [`source_audio_pooled::recognize`] in query batches that respect the
-//! demonstrated caps ([`MAX_WINDOWS_PER_CALL`] windows and
-//! [`MAX_CELL_SCANS_PER_CALL`] offset-cell scans per pooled call); every
-//! window is searched against the ENTIRE reference. Progress
+//! Execution searches bounded query chunks ([`QUERY_BLOCK_SECONDS`] blocks
+//! from each epoch origin plus trailing context), never a whole long epoch,
+//! and runs each chunk's windows through [`source_audio_pooled::recognize`]
+//! in batches that respect the demonstrated caps ([`MAX_WINDOWS_PER_CALL`]
+//! windows and [`MAX_CELL_SCANS_PER_CALL`] offset-cell scans per pooled
+//! call); every window is searched against the ENTIRE reference. Progress
 //! (completed-window counts) and cancellation state are published; an
 //! interrupted run persists resumable per-window derived results and a later
 //! run continues without redoing completed windows. Incomplete batches and
@@ -69,6 +70,26 @@ pub const MAX_CELL_SCANS_PER_CALL: usize = 50_000_000;
 /// the observed count and stay exact.
 const SAFE_FIRST_BATCH: usize = 25;
 
+/// Bounded query chunks: integral-start windows are grouped into fixed
+/// blocks of this many seconds from their epoch origin, and each block is
+/// searched as its own query chunk (never the whole epoch). The landmark
+/// searcher caps one query at 2,000,000 vote cells, which a ~23-minute query
+/// exceeds, so whole-epoch queries cannot serve long recordings.
+///
+/// 128 s keeps every chunk on the same extraction lattice as the epoch
+/// origin: it is a whole number of seconds, of 128-sample hops at 11025 Hz,
+/// and of the 441-frame period of the 100 hashes/s landmark quota. Inside a
+/// block, landmarks therefore match whole-epoch extraction except on the
+/// single frame at the block start (which has no previous frame for peak
+/// picking). Block boundaries depend only on the schedule, so a resumed run
+/// uses exactly the same chunks. An epoch that fits in one block plus context
+/// keeps one whole-epoch chunk.
+pub const QUERY_BLOCK_SECONDS: u32 = 128;
+/// Trailing context after a block's last window: landmark pairing looks up to
+/// 173 frames (about 2.01 s) ahead, so 3 s keeps every in-window anchor's
+/// targets inside the chunk.
+pub const QUERY_CONTEXT_AFTER_SECONDS: u64 = 3;
+
 /// Reason recorded on an epoch that schedules no windows because it is
 /// shorter than one full window; such epochs stay unknown.
 pub const SHORT_EPOCH_REASON: &str = "epoch_shorter_than_window";
@@ -95,6 +116,9 @@ const REASON_NOT_ATTEMPTED: &str = "not_attempted";
 pub struct SchedulingIdentity {
     pub window_seconds: u16,
     pub step_seconds: u32,
+    /// Query block length ([`QUERY_BLOCK_SECONDS`]); part of the identity
+    /// because chunk boundaries affect extracted evidence.
+    pub query_block_seconds: u32,
     pub epochs: Vec<CaptureEpoch>,
 }
 
@@ -288,6 +312,10 @@ pub fn build_schedule(identity: &SessionIdentity) -> Result<SessionSchedule> {
         scheduling.step_seconds >= 1,
         "invalid input: source-audio session step seconds must be positive"
     );
+    ensure!(
+        scheduling.query_block_seconds == QUERY_BLOCK_SECONDS,
+        "invalid input: source-audio session query block seconds must be {QUERY_BLOCK_SECONDS}"
+    );
     let rate = u64::from(clock.sample_rate);
     let mut seen_epochs = BTreeSet::new();
     let mut previous_end: Option<u64> = None;
@@ -447,6 +475,51 @@ pub fn run_session(
 /// `observed_offset_cells` is the chunk's observed offset-cell count (`None`
 /// before the first call). A returned size of 0 means no batch can respect the
 /// scan budget and the remaining windows must be reported incomplete.
+/// One bounded query chunk: a native half-open sample range on the capture
+/// clock and the scheduled integral-start windows (indices into
+/// [`SessionSchedule::windows`], in schedule order) it serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryChunk {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub windows: Vec<usize>,
+}
+
+/// Plan the bounded query chunks for one epoch's integral-start windows.
+/// Block `k` serves windows starting in `[k, k + 1) x QUERY_BLOCK_SECONDS`
+/// from the epoch origin; its chunk starts at the block start and ends
+/// [`QUERY_CONTEXT_AFTER_SECONDS`] after its last window (clipped to the
+/// epoch). The plan depends only on the schedule, never on which windows are
+/// still pending, so interrupted and resumed runs search identical chunks.
+pub(crate) fn plan_query_chunks(
+    schedule: &SessionSchedule,
+    epoch: &CaptureEpoch,
+    rate: u64,
+) -> Vec<QueryChunk> {
+    let block = u64::from(QUERY_BLOCK_SECONDS) * rate;
+    let mut chunks: BTreeMap<u64, QueryChunk> = BTreeMap::new();
+    for (index, window) in schedule.windows.iter().enumerate() {
+        if window.epoch_id != epoch.epoch_id {
+            continue;
+        }
+        let offset = window.start_sample - epoch.start_sample;
+        if !offset.is_multiple_of(rate) {
+            continue;
+        }
+        let k = offset / block;
+        let chunk = chunks.entry(k).or_insert_with(|| QueryChunk {
+            start_sample: epoch.start_sample + k * block,
+            end_sample: 0,
+            windows: Vec::new(),
+        });
+        chunk.end_sample = chunk
+            .end_sample
+            .max((window.end_sample + QUERY_CONTEXT_AFTER_SECONDS * rate).min(epoch.end_sample));
+        chunk.windows.push(index);
+    }
+    chunks.into_values().collect()
+}
+
 fn planned_batch_size(remaining_windows: usize, observed_offset_cells: Option<usize>) -> usize {
     match observed_offset_cells {
         None => remaining_windows.min(SAFE_FIRST_BATCH),
@@ -729,22 +802,38 @@ impl SessionExecutor<'_> {
             if pending.is_empty() {
                 continue;
             }
-            // The epoch chunk is the query for every integral-start window;
-            // a fractional-start final window runs on its own chunk starting
-            // at the window itself (chunk-local start 0).
-            let (fractional, integral): (Vec<usize>, Vec<usize>) =
-                pending.into_iter().partition(|index| {
+            // Integral-start windows run in bounded query chunks (fixed
+            // blocks from the epoch origin, see [`plan_query_chunks`]); a
+            // fractional-start final window runs on its own chunk starting at
+            // the window itself (chunk-local start 0).
+            let fractional: Vec<usize> = pending
+                .into_iter()
+                .filter(|index| {
                     !(schedule.windows[*index].start_sample - epoch.start_sample)
                         .is_multiple_of(rate)
-                });
-            if !integral.is_empty() {
+                })
+                .collect();
+            for planned in plan_query_chunks(schedule, epoch, rate) {
+                let integral: Vec<usize> = planned
+                    .windows
+                    .iter()
+                    .copied()
+                    .filter(|index| self.results[*index].is_none())
+                    .collect();
+                if integral.is_empty() {
+                    continue;
+                }
                 let epoch_origin = epoch.start_sample;
-                let epoch_end = epoch.end_sample;
-                let e0 = ((epoch_origin - self.pcm_origin_sample) as u128 * u128::from(RATE)
+                let e0 = ((planned.start_sample - self.pcm_origin_sample) as u128
+                    * u128::from(RATE)
                     / u128::from(self.rate)) as usize;
-                let e1 =
-                    extractor_end(epoch_end, self.pcm_origin_sample, self.rate, self.pcm.len())
-                        .expect("epoch coverage validated");
+                let e1 = extractor_end(
+                    planned.end_sample,
+                    self.pcm_origin_sample,
+                    self.rate,
+                    self.pcm.len(),
+                )
+                .expect("query chunk lies inside the validated epoch coverage");
                 let chunk = &self.pcm[e0..e1];
                 let chunk0_samples =
                     self.pcm_origin_sample as f64 + e0 as f64 * self.rate as f64 / RATE as f64;

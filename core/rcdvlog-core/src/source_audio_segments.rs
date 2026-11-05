@@ -43,8 +43,8 @@ use crate::source_audio_pooled::{
     RECIPE_ID,
 };
 use crate::source_audio_sessions::{
-    SCHEDULE_STEP_SECONDS, SCHEDULE_WINDOW_SECONDS, SchedulingIdentity, SessionIdentity,
-    SessionProgress, SessionResult, SessionRunRequest, SessionWindowResult,
+    QUERY_BLOCK_SECONDS, SCHEDULE_STEP_SECONDS, SCHEDULE_WINDOW_SECONDS, SchedulingIdentity,
+    SessionIdentity, SessionProgress, SessionResult, SessionRunRequest, SessionWindowResult,
 };
 use crate::tv_review_sync::{
     CaptureClock, CapturePosition, MovieEstimate, SYNC_VERSION, SyncAnchor, SyncAnchorSource,
@@ -1567,6 +1567,7 @@ pub fn report(
                 scheduling_identity: SchedulingIdentity {
                     window_seconds: SCHEDULE_WINDOW_SECONDS,
                     step_seconds: SCHEDULE_STEP_SECONDS,
+                    query_block_seconds: QUERY_BLOCK_SECONDS,
                     epochs: request.epochs.clone(),
                 },
                 capture_clock: request.capture_clock.clone(),

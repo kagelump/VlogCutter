@@ -90,6 +90,7 @@ fn identity() -> SessionIdentity {
         scheduling_identity: SchedulingIdentity {
             window_seconds: SCHEDULE_WINDOW_SECONDS,
             step_seconds: SCHEDULE_STEP_SECONDS,
+            query_block_seconds: QUERY_BLOCK_SECONDS,
             epochs: vec![CaptureEpoch {
                 epoch_id: "e1".into(),
                 start_sample: 0,
@@ -821,4 +822,174 @@ fn end_to_end_schedule_and_recognize_on_the_generated_synthetic_audio() {
         .expect("movie-covered window has modes");
     assert!((offset - 2.0).abs() <= 0.1, "{offset}");
     assert!(window.is_accepted(), "{:?}", window.acceptance);
+}
+
+#[test]
+fn query_chunks_bound_long_epochs_on_the_extraction_lattice() {
+    const NATIVE: u64 = 48_000;
+    let mut identity = identity();
+    identity.capture_clock.sample_rate = NATIVE as u32;
+    identity.capture_clock.last_sample = 3_600 * NATIVE;
+    // A 2710.8 s epoch (the release replay length) at a nonzero origin.
+    let epoch = CaptureEpoch {
+        epoch_id: "long".into(),
+        start_sample: 1_000,
+        end_sample: 1_000 + 130_118_400,
+    };
+    identity.scheduling_identity.epochs = vec![epoch.clone()];
+    let schedule = build_schedule(&identity).unwrap();
+    let chunks = plan_query_chunks(&schedule, &epoch, NATIVE);
+    let integral: Vec<usize> = schedule
+        .windows
+        .iter()
+        .enumerate()
+        .filter(|(_, window)| (window.start_sample - epoch.start_sample).is_multiple_of(NATIVE))
+        .map(|(index, _)| index)
+        .collect();
+    let mut served: Vec<usize> = chunks
+        .iter()
+        .flat_map(|chunk| chunk.windows.clone())
+        .collect();
+    served.sort_unstable();
+    assert_eq!(
+        served, integral,
+        "every integral window in exactly one chunk"
+    );
+    assert_eq!(chunks.len(), 22, "ceil(2700 s of window starts / 128 s)");
+    let block = u64::from(QUERY_BLOCK_SECONDS) * NATIVE;
+    for (k, chunk) in chunks.iter().enumerate() {
+        // Block starts sit on the epoch's whole-second, hop and hash-quota
+        // lattice: 128 s = 1,411,200 extractor samples = 25 x 56,448
+        // (441 frames x 128-sample hop).
+        assert_eq!(chunk.start_sample, epoch.start_sample + k as u64 * block);
+        let extractor_offset = (chunk.start_sample - epoch.start_sample) * u64::from(RATE) / NATIVE;
+        assert_eq!(extractor_offset % (441 * 128), 0);
+        assert!(chunk.end_sample <= epoch.end_sample);
+        assert!(
+            chunk.end_sample - chunk.start_sample
+                <= (126 + 10 + QUERY_CONTEXT_AFTER_SECONDS) * NATIVE,
+            "chunk {k} stays bounded"
+        );
+        for &index in &chunk.windows {
+            let window = &schedule.windows[index];
+            assert!(window.start_sample >= chunk.start_sample);
+            assert!(window.start_sample < chunk.start_sample + block);
+            assert!(
+                chunk.end_sample
+                    >= (window.end_sample + QUERY_CONTEXT_AFTER_SECONDS * NATIVE)
+                        .min(epoch.end_sample),
+                "chunk {k} keeps trailing pairing context"
+            );
+        }
+    }
+    assert_eq!(chunks.last().unwrap().end_sample, epoch.end_sample);
+
+    // An epoch that fits one block plus context keeps a single whole-epoch
+    // chunk, so short captures search exactly as before.
+    let short = CaptureEpoch {
+        epoch_id: "short".into(),
+        start_sample: 0,
+        end_sample: 3_330_768,
+    };
+    identity.scheduling_identity.epochs = vec![short.clone()];
+    let schedule = build_schedule(&identity).unwrap();
+    let chunks = plan_query_chunks(&schedule, &short, NATIVE);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        (chunks[0].start_sample, chunks[0].end_sample),
+        (short.start_sample, short.end_sample)
+    );
+
+    // The block length is part of the scheduling identity and fixed.
+    identity.scheduling_identity.query_block_seconds = 64;
+    let error = build_schedule(&identity).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("query block seconds"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn playback_in_a_later_query_block_is_recognized_on_real_audio() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/source_audio_eval/synthetic");
+    let movie_pcm = decode_wav(&root.join("movie.wav"), &|| false).unwrap();
+    let index = Index::from_pcm(
+        SyncMovieClock {
+            movie_digest: "8870e7be64c3257a3630b1348f5511df33e0a6e374eeb6f55974002d15d0e86a".into(),
+            time_base_numerator: 1,
+            time_base_denominator: 11025,
+            origin_pts: 0,
+            duration_pts: 132_300,
+        },
+        &movie_pcm,
+        Recipe::default(),
+        &|| false,
+    )
+    .unwrap();
+    // 140 s of seeded low-level noise, the 12 s movie, then 3 s of noise:
+    // the playback sits in the second 128 s query block.
+    let rate = RATE as usize;
+    let mut state = 0x9e37_79b9_u32;
+    let mut noise = |count: usize| -> Vec<i16> {
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                ((state >> 16) as i16) / 64
+            })
+            .collect()
+    };
+    let mut recording = noise(140 * rate);
+    recording.extend(movie_pcm.iter().copied());
+    recording.extend(noise(3 * rate));
+    let end_sample = recording.len() as u64;
+
+    let mut identity = identity_for(&index);
+    identity.scheduling_identity.epochs = vec![CaptureEpoch {
+        epoch_id: "e1".into(),
+        start_sample: 0,
+        end_sample,
+    }];
+    let schedule = build_schedule(&identity).unwrap();
+    let chunks = plan_query_chunks(
+        &schedule,
+        &identity.scheduling_identity.epochs[0],
+        u64::from(RATE),
+    );
+    assert_eq!(chunks.len(), 2, "the recording spans two query blocks");
+    let result = run_session(
+        &index,
+        &request_with(identity, &recording, 0, tempdir().unwrap().path()),
+        &mut |_update| {},
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(result.status, "complete");
+    assert!(
+        result
+            .windows
+            .iter()
+            .all(|window| window.state == SessionWindowState::Completed)
+    );
+    for start in [140.0, 142.0] {
+        let window = result
+            .windows
+            .iter()
+            .find(|window| window.window_start_seconds == start)
+            .unwrap();
+        let offset = window
+            .offset_seconds
+            .expect("movie-covered window has modes");
+        assert!((offset + 140.0).abs() <= 0.1, "{start}: {offset}");
+        assert!(window.is_accepted(), "{start}: {:?}", window.acceptance);
+    }
+    // Noise-only windows in the first block never match.
+    assert!(
+        result
+            .windows
+            .iter()
+            .filter(|window| window.window_start_seconds + 10.0 <= 140.0)
+            .all(|window| !window.is_accepted())
+    );
 }
