@@ -238,7 +238,7 @@ fn full_recording_workflow_indexes_reports_and_maps_movie_time() {
     let report = &data["report"];
     assert_eq!(report["status"], "complete");
     assert_eq!(report["recipeIdentity"], RECIPE);
-    assert_eq!(report["assemblerId"], "source-audio-segments-mvp-v1");
+    assert_eq!(report["assemblerId"], "source-audio-segments-mvp-v2");
     assert_eq!(
         report["acceptancePolicyId"],
         PooledRecognitionPolicy::frozen().policy_id

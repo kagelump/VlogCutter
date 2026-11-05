@@ -207,8 +207,11 @@ cancellation reuses completed windows and any identity change recomputes.
 Creating the cancel file stops after the current batch: the command still
 exits 0 with `session.status: "cancelled"`, the remaining windows reported as
 incomplete, and `report.status: "incomplete"`. Recordings and each epoch are
-limited to one hour; batches are capped at 256 windows and 50 million offset
-cells.
+limited to one hour. Long epochs are searched in bounded query chunks: fixed
+128-second blocks from the epoch origin, each extended 3 seconds past its last
+window for landmark-pairing context. An epoch that fits one block keeps a
+single whole-epoch chunk. Pooled calls are capped at 256 windows and 50 million
+offset-cell scans.
 
 The stdout envelope is `tv-review.source-audio-session-report` with
 `data = {schemaVersion, session, report}`; `--output` receives the bare

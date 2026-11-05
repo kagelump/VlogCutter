@@ -212,6 +212,71 @@ fn boundary(id: &str, sample_index: u64, kind: SyncBoundaryKind) -> SyncBoundary
 // Required deterministic cases (constructed evidence).
 
 #[test]
+fn isolated_cells_outside_a_windows_main_support_run_stay_unknown() {
+    // Release-comparison regression (rewind capture): the window at 28 s is
+    // accepted on its post-rewind run (cells 33-37), but a repetitive
+    // soundtrack passage also matched its offset in cell 29, three seconds
+    // before that run. Cell 29 is uncorroborated and must not become a
+    // one-second segment at the wrong place.
+    let range = domain(0, secs(40));
+    let report = assemble(&assembly(
+        clock(0, secs(40)),
+        vec![epoch("e0", 0, secs(40))],
+        range,
+        vec![accepted_window(
+            0,
+            "e0",
+            "w28",
+            28,
+            30_569,
+            &[29, 33, 34, 35, 36, 37],
+        )],
+        vec![],
+    ))
+    .unwrap();
+    assert_eq!(report.assembler_id, "source-audio-segments-mvp-v2");
+    assert_eq!(report.segments.len(), 1, "{report:?}");
+    assert_eq!(report.segments[0].start_sample, secs(33));
+    assert_eq!(report.segments[0].end_sample, secs(38));
+    assert!(
+        report
+            .unknown_ranges
+            .iter()
+            .any(|unknown| unknown.start_sample <= secs(29) && unknown.end_sample >= secs(30)),
+        "cell 29 stays unknown"
+    );
+    assert_accounting(&report, range);
+    assert_unknowns_have_no_movie_position(&report);
+
+    // A gap of at most two unsupported seconds still joins the run, and of
+    // two equally supported runs the earliest is kept.
+    let report = assemble(&assembly(
+        clock(0, secs(40)),
+        vec![epoch("e0", 0, secs(40))],
+        range,
+        vec![accepted_window(
+            0,
+            "e0",
+            "w10",
+            10,
+            25,
+            &[10, 11, 13, 17, 18, 19],
+        )],
+        vec![],
+    ))
+    .unwrap();
+    let supported: Vec<(u64, u64)> = report
+        .segments
+        .iter()
+        .flat_map(|segment| segment.supported_spans.iter())
+        .map(|span| (span.start_sample, span.end_sample))
+        .collect();
+    // Runs {10, 11, 13} (one unsupported second) and {17, 18, 19} tie.
+    assert_eq!(supported, vec![(secs(10), secs(12)), (secs(13), secs(14))]);
+    assert_accounting(&report, range);
+}
+
+#[test]
 fn continuous_playback_coalesces_multiple_accepted_windows_to_one_segment() {
     let range = domain(0, secs(30));
     let request = assembly(

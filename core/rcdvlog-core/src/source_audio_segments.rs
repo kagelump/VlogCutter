@@ -58,7 +58,11 @@ use std::path::Path;
 
 /// Versioned identity of this segment assembler. A semantics change requires a
 /// new identity; the frozen v3 acceptance verdicts are never re-labelled.
-pub const ASSEMBLER_ID: &str = "source-audio-segments-mvp-v1";
+///
+/// v2: a window supports only its main contiguous run of cells; cells
+/// separated from that run by more than [`MAX_INTERNAL_GAP_SECONDS`] of
+/// unsupported time are uncorroborated and stay unknown.
+pub const ASSEMBLER_ID: &str = "source-audio-segments-mvp-v2";
 
 /// Report schema version of [`SegmentReport`].
 pub const SEGMENT_REPORT_SCHEMA_VERSION: u32 = 1;
@@ -559,6 +563,46 @@ fn opaque_window_id(evidence_id: &str) -> String {
         .collect()
 }
 
+/// The main contiguous support run of one accepted window. A 10-second
+/// acceptance is evidence for continuous playback where its support is
+/// contiguous; a cell separated from the window's main run by more than
+/// [`MAX_INTERNAL_GAP_SECONDS`] of unsupported time is not corroborated by it
+/// (repetitive soundtrack passages can match the window's offset in an
+/// unrelated second). Runs split exactly like segment envelopes; the run with
+/// the most distinct query anchors wins and ties keep the earliest run.
+fn main_support_run(cells: &[SupportCell]) -> Vec<SupportCell> {
+    let mut ordered: Vec<&SupportCell> = cells.iter().collect();
+    ordered.sort_by(|left, right| left.time_bin_seconds.total_cmp(&right.time_bin_seconds));
+    let max_step = f64::from(TIME_BIN_SECONDS + MAX_INTERNAL_GAP_SECONDS) + 1e-6;
+    let mut runs: Vec<Vec<&SupportCell>> = Vec::new();
+    for cell in ordered {
+        match runs.last_mut() {
+            Some(run)
+                if cell.time_bin_seconds
+                    - run.last().expect("runs are non-empty").time_bin_seconds
+                    <= max_step =>
+            {
+                run.push(cell)
+            }
+            _ => runs.push(vec![cell]),
+        }
+    }
+    let anchors = |run: &Vec<&SupportCell>| {
+        run.iter()
+            .flat_map(|cell| cell.query_anchor_frames.iter())
+            .collect::<BTreeSet<_>>()
+            .len()
+    };
+    let mut best: Option<&Vec<&SupportCell>> = None;
+    for run in &runs {
+        if best.is_none_or(|current| anchors(run) > anchors(current)) {
+            best = Some(run);
+        }
+    }
+    best.map(|run| run.iter().map(|cell| (*cell).clone()).collect())
+        .unwrap_or_default()
+}
+
 /// Frozen offset convention: `movieElapsedSeconds =
 /// recordingSecondsWithinEpoch + offsetSeconds`.
 pub fn movie_elapsed_seconds(recording_seconds_within_epoch: f64, offset_seconds: f64) -> f64 {
@@ -812,10 +856,17 @@ pub fn assemble(request: &SegmentAssemblyRequest) -> Result<SegmentReport> {
 
     // Retained support comes only from complete accepted windows; every other
     // window is evidence without support.
-    let effective: Vec<&AcceptedWindow> = request
+    // Each supporting window contributes only its main contiguous support run
+    // (see [`main_support_run`]); isolated cells are uncorroborated.
+    let effective: Vec<AcceptedWindow> = request
         .windows
         .iter()
         .filter(|window| window.provides_support())
+        .map(|window| {
+            let mut window = window.clone();
+            window.supporting_cells = main_support_run(&window.supporting_cells);
+            window
+        })
         .collect();
     let non_effective_ranges: Vec<(u64, u64)> = request
         .windows
