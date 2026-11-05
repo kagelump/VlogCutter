@@ -3,6 +3,9 @@ use anyhow::{Result, ensure};
 use clap::Subcommand;
 use rcdvlog_core::{
     HistoricalRenderedArtifactReview, ReviewTargetHandoff,
+    source_audio_pooled::{self, PooledOffsetWindow, PooledRecognitionRequest},
+    source_audio_segments::{self, QueryMappingRequest, ReportRequest, SegmentReport},
+    source_audio_sessions::SessionProgress,
     tv_review_sync::{SYNC_MAX_BYTES, SyncMovieClock, SyncQuery, SyncRequest},
     tv_soundtrack::{
         SoundtrackCapture, SoundtrackIndex, SoundtrackPolicy, SoundtrackReferenceSpec,
@@ -129,6 +132,36 @@ pub enum TvReviewCommand {
         #[arg(long)]
         cancel_file: Option<PathBuf>,
     },
+    /// Run the frozen pooled session schedule over a full recording and emit the conservative segment report.
+    SourceAudioSessionReport {
+        /// Report request JSON: explicit `source-audio-pooled-mvp-v1` recipe
+        /// selection, capture clock, epochs, requested domain and boundaries.
+        #[arg(long)]
+        input: PathBuf,
+        /// Immutable landmark index built by source-audio-landmark-index.
+        #[arg(long)]
+        index: PathBuf,
+        /// Local microphone recording WAV.
+        #[arg(long)]
+        recording: PathBuf,
+        /// Derived-data directory for resumable per-window session results.
+        #[arg(long)]
+        cache: PathBuf,
+        /// Optional path for the bare SegmentReport JSON (also returned on stdout).
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        cancel_file: Option<PathBuf>,
+    },
+    /// Map one recording-time query through the shared mapper using a report's retained support.
+    SourceAudioMapQuery {
+        /// SegmentReport JSON produced by source-audio-session-report.
+        #[arg(long)]
+        report: PathBuf,
+        /// Query mapping request JSON (sessionId, query, policy).
+        #[arg(long)]
+        input: PathBuf,
+    },
 }
 
 #[derive(Deserialize)]
@@ -154,7 +187,12 @@ struct LandmarkMatchInput {
     search_policy: Option<LandmarkSearchPolicy>,
     #[serde(default)]
     diagnostic_offset_evidence_per_tile: Option<u16>,
+    #[serde(default)]
+    pooled_offset_windows: Option<Vec<PooledOffsetWindow>>,
+    #[serde(default)]
+    pooled_offset_mode_limit: Option<u8>,
 }
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PreviewInput {
@@ -197,6 +235,8 @@ pub fn command_name(command: &TvReviewCommand) -> &'static str {
         }
         TvReviewCommand::SourceAudioLandmarkIndex { .. } => "tv-review.source-audio-landmark-index",
         TvReviewCommand::SourceAudioLandmarkMatch { .. } => "tv-review.source-audio-landmark-match",
+        TvReviewCommand::SourceAudioSessionReport { .. } => "tv-review.source-audio-session-report",
+        TvReviewCommand::SourceAudioMapQuery { .. } => "tv-review.source-audio-map-query",
     }
 }
 pub fn execute(command: &TvReviewCommand) -> Result<Value> {
@@ -418,11 +458,19 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
                         + 0.1,
                 "invalid input: capture clock is shorter than recording audio"
             );
-            let search = index.search_pcm_with_policy(
+            let recognition = source_audio_pooled::recognize(
+                &index,
                 &pcm,
-                request.search_policy.take().unwrap_or_default(),
+                &PooledRecognitionRequest {
+                    search_policy: request.search_policy.take(),
+                    windows: request.pooled_offset_windows.take(),
+                    mode_limit: request.pooled_offset_mode_limit.take(),
+                    include_mode_support: None,
+                },
                 &cancel,
             )?;
+            let search = &recognition.search;
+            let pooled_offset_evidence = recognition.evidence;
             let offset_evidence_limit = usize::from(
                 request
                     .diagnostic_offset_evidence_per_tile
@@ -441,9 +489,9 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
                 );
             }
             let offset_evidence_count = search.offsets.len();
-            let offset_evidence = bounded_landmark_offset_evidence(&search, offset_evidence_limit);
+            let offset_evidence = bounded_landmark_offset_evidence(search, offset_evidence_limit);
             let policy = request.policy.take().unwrap_or_default();
-            let alignment = tv_soundtrack_alignment::infer(&search, &clock, &index.movie, policy)?;
+            let alignment = tv_soundtrack_alignment::infer(search, &clock, &index.movie, policy)?;
             let mapping = tv_soundtrack_alignment::attach_and_map(
                 &mut request.sync,
                 &alignment,
@@ -453,6 +501,7 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
             Ok(
                 serde_json::json!({"schemaVersion":1,"movieDigest":index.movie.movie_digest,
                 "indexDigest":index.index_digest,"recordingDigest":before.hex_digest,
+                "pooledOffsetEvidence":pooled_offset_evidence,
                 "search":{"complete":search.complete,"queryLandmarkCount":search.query_landmark_count,
                     "matchedLandmarkCount":search.matched_landmark_count,
                     "candidatePairCount":search.candidate_pair_count,
@@ -461,6 +510,53 @@ pub fn execute(command: &TvReviewCommand) -> Result<Value> {
                     "rawOffsetEvidence":offset_evidence},
                 "alignment":alignment,"mapping":mapping}),
             )
+        }
+        TvReviewCommand::SourceAudioSessionReport {
+            input,
+            index,
+            recording,
+            cache,
+            output,
+            cancel_file,
+        } => {
+            let request: ReportRequest = read_json(input, SYNC_MAX_BYTES)?;
+            ensure!(
+                recording.is_file(),
+                "invalid input: source-audio recording media not found"
+            );
+            let cancel = || cancel_file.as_ref().is_some_and(|p| p.exists());
+            let _heavy = rcdvlog_core::acquire_local_heavy_at_cancellable(
+                &rcdvlog_core::default_local_heavy_lock_path(),
+                &cancel,
+            )?;
+            let index = LandmarkIndex::from_json(&read_bytes(index, 64 * 1024 * 1024)?)?;
+            let outcome = source_audio_segments::report(
+                &index,
+                recording,
+                cache,
+                &request,
+                &mut |update: SessionProgress| {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"event":"source-audio.session.progress",
+                            "completed":update.completed_windows,"total":update.total_windows})
+                    );
+                },
+                &cancel,
+            )?;
+            if let Some(path) = output {
+                write_report_artifact(path, &serde_json::to_vec(&outcome.report)?)?;
+            }
+            Ok(
+                serde_json::json!({"schemaVersion":1,"session":outcome.session,"report":outcome.report}),
+            )
+        }
+        TvReviewCommand::SourceAudioMapQuery { report, input } => {
+            let report: SegmentReport = read_json(report, 64 * 1024 * 1024)?;
+            let request: QueryMappingRequest = read_json(input, SYNC_MAX_BYTES)?;
+            Ok(serde_json::to_value(
+                source_audio_segments::map_recording_query(&report, &request)?,
+            )?)
         }
     }
 }
@@ -526,4 +622,16 @@ fn write_immutable_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// Persist a derived SegmentReport JSON. Reports are regenerable derived
+/// output (unlike immutable indexes), so a newer report replaces an older one.
+fn write_report_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    std::fs::write(path, bytes)?;
+    Ok(())
 }

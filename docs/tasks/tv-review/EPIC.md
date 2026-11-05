@@ -24,6 +24,11 @@ byte-identically.
 
 ## Frozen context
 
+The subsequent source-audio eval work has a separate bounded delivery scope:
+[source-audio MVP design](SOURCE_AUDIO_MVP_DESIGN.md) and
+[implementation plan](SOURCE_AUDIO_MVP_PLAN.md). These preserve pooled recognition
+improvements without claiming completion of the V01 real-room acceptance gate.
+
 - Architecture contract: `docs/tasks/tv-review/ARCHITECTURE.md`
 - Evidence: `../data/editorial-review/rc6-passive-sync-2026-11-03/REPORT.md`, `diagnose_probe.py`
 - Existing behaviour: `docs/tv-soundtrack-matching.md`, `docs/tv-review-local-session.md`, `docs/tv-review-sync.md`
