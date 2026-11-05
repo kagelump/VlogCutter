@@ -1360,6 +1360,8 @@ separate explicit operations.
 
 `tv-review soundtrack-reference` and `tv-review soundtrack-match` are bounded local final-mix diagnostics. See [soundtrack matching](tv-soundtrack-matching.md).
 
+`tv-review source-audio-landmark-index|source-audio-landmark-match` build an immutable full-movie landmark index and run the experimental single-recording alignment. The opt-in `source-audio-pooled-mvp-v1` path adds `tv-review source-audio-session-report` (bounded, resumable, cancellable full-recording schedule producing a conservative segment/offset report) and `tv-review source-audio-map-query` (read-only mapping of a recording-time range through the shared mapper; unknown, conflicting and gap-crossing queries get no movie location). See [full-recording source-audio alignment](tv-source-audio-matching.md).
+
 `tv-review soundtrack-session-plan|soundtrack-session-run|soundtrack-session-evidence|soundtrack-session-sync`
 plans complete-reference searches, runs bounded resumable local batches and maps
 native utterance frames through the shared engine. Media/path bindings stay on

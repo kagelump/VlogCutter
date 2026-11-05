@@ -627,6 +627,16 @@ fn recording_shorter_than_ten_seconds_yields_valid_all_unknown_result() {
     assert_eq!(report.unknown_ranges[0].reason, REASON_SHORT_EPOCH);
     assert_eq!(report.completeness.supported_seconds, 0.0);
     assert_eq!(report.completeness.unknown_seconds, 8.0);
+    // Empty totals serialize as positive zero, never `-0.0`.
+    let completeness = serde_json::to_string(&report.completeness).unwrap();
+    assert!(
+        completeness.contains("\"supportedSeconds\":0.0"),
+        "{completeness}"
+    );
+    assert!(
+        completeness.contains("\"envelopeUnknownSeconds\":0.0"),
+        "{completeness}"
+    );
     assert_accounting(&report, range);
     assert_unknowns_have_no_movie_position(&report);
 }
@@ -957,6 +967,294 @@ fn from_pooled_reads_best_mode_support_and_chunk_relative_cells() {
     );
     assert_eq!(fractional.accepted, Some(true));
     assert!(fractional.complete);
+}
+
+// ---------------------------------------------------------------------------
+// Session-window bridging: assembler input for scheduled session results.
+
+#[test]
+fn from_session_window_rebases_offsets_and_never_supports_incomplete_windows() {
+    use crate::source_audio_sessions::{SessionWindowResult, SessionWindowState};
+
+    let pooled = PooledWindowResult {
+        start_seconds: 0,
+        duration_seconds: 10,
+        end_seconds: 10,
+        complete: true,
+        internal_offset_cell_count: 1,
+        offset_cells_scanned: 1,
+        offset_cells_pooled_for_window: 1,
+        offset_cells_dropped: 0,
+        ranked_offset_bin_count: 1,
+        returned_offset_bin_count: 1,
+        best_distinct_competitor: None,
+        best_anchor_margin: None,
+        best_unique_anchor_margin: None,
+        modes: vec![PooledOffsetModeRow {
+            offset_bin: 25,
+            offset_seconds: 2.0,
+            independent_anchors: 2,
+            summed_cell_anchor_count: 2,
+            duplicate_anchor_votes_removed: 0,
+            occupied_time_bins: 1,
+            support_span_seconds: 1,
+            rarity_weight: 2.0,
+            frequency_diversity_median_per_time_bin: 4.0,
+            saturated_anchors: 0,
+            shared_query_anchors_with_best: 0,
+            supporting_cells: Some(vec![PooledModeSupportCell {
+                time_bin: 3,
+                query_anchor_frames: vec![258, 268],
+            }]),
+        }],
+        acceptance: PooledWindowAcceptance {
+            floors_calibrated: true,
+            recipe_calibrated: true,
+            accepted: Some(true),
+            failure_reasons: vec![],
+            gate_failure_reasons: vec![],
+        },
+    };
+    let rate = u64::from(RATE);
+    let start_sample = (0.5 * f64::from(RATE)) as u64;
+    let end_sample = start_sample + 10 * rate;
+    let completed = SessionWindowResult {
+        capture_clock_id: CLOCK_ID.into(),
+        epoch_id: "e0".into(),
+        window_evidence_id: format!("saw:{CLOCK_ID}:e0:{start_sample}-{end_sample}"),
+        start_sample,
+        end_sample,
+        window_start_seconds: start_sample as f64 / f64::from(RATE),
+        duration_seconds: 10,
+        state: SessionWindowState::Completed,
+        incomplete_reason: None,
+        // Epoch convention after the own-chunk rebase: 2.0 - 0.5.
+        offset_seconds: Some(1.5),
+        offset_bin: Some(25),
+        chunk_start_seconds_within_epoch: Some(0.5),
+        acceptance: Some(pooled.acceptance.clone()),
+        pooled: Some(pooled),
+    };
+    let bridged = AcceptedWindow::from_session_window(&completed);
+    assert_eq!(
+        bridged.window_id,
+        format!("saw-{CLOCK_ID}-e0-{start_sample}-{end_sample}")
+    );
+    assert_eq!(bridged.offset_seconds, Some(1.5));
+    // The hypothesis bin is the nearest 80 ms bin of the reported epoch
+    // offset, never the raw chunk-local bin.
+    assert_eq!(
+        bridged.offset_bin,
+        Some((1.5 / OFFSET_BIN_SECONDS).round() as i32)
+    );
+    assert!((bridged.window_start_seconds - completed.window_start_seconds).abs() < 1e-12);
+    assert!((bridged.supporting_cells[0].time_bin_seconds - 3.5).abs() < 1e-12);
+    assert_eq!(
+        bridged.supporting_cells[0].query_anchor_frames,
+        vec![258, 268]
+    );
+    assert!(bridged.complete);
+    assert_eq!(bridged.accepted, Some(true));
+
+    // The documented rebased pair validates and assembles at the epoch offset.
+    let report = assemble(&assembly(
+        clock(0, secs(30)),
+        vec![epoch("e0", 0, secs(30))],
+        domain(0, secs(30)),
+        vec![AcceptedWindow::from_session_window(&completed)],
+        vec![],
+    ))
+    .unwrap();
+    assert_eq!(report.segments.len(), 1);
+    assert!((report.segments[0].offset_seconds - 1.5).abs() < 1e-9);
+
+    // An incomplete (cancelled/truncated/budget) window is explicit evidence
+    // without support: no offset, no cells, never accepted or retained.
+    let incomplete = SessionWindowResult {
+        state: SessionWindowState::Incomplete,
+        incomplete_reason: Some("cancelled".into()),
+        offset_seconds: None,
+        offset_bin: None,
+        chunk_start_seconds_within_epoch: None,
+        acceptance: None,
+        pooled: None,
+        ..completed
+    };
+    let bridged = AcceptedWindow::from_session_window(&incomplete);
+    assert!(!bridged.complete);
+    assert_eq!(bridged.accepted, None);
+    assert!(bridged.offset_seconds.is_none() && bridged.offset_bin.is_none());
+    assert!(bridged.supporting_cells.is_empty());
+    let report = assemble(&assembly(
+        clock(0, secs(30)),
+        vec![epoch("e0", 0, secs(30))],
+        domain(0, secs(30)),
+        vec![AcceptedWindow::from_session_window(&incomplete)],
+        vec![],
+    ))
+    .unwrap();
+    assert_eq!(report.segments.len(), 0);
+    assert!(!report.recognized_windows[0].retained);
+    assert!(
+        report.recognized_windows[0]
+            .failure_reasons
+            .iter()
+            .any(|reason| reason == REASON_INCOMPLETE_EVIDENCE)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Full-recording report entrypoint: the core-owned validation the CLI adapter
+// only invokes (request shapes and digest pins are enforced here, not in the
+// CLI).
+
+/// A real small index over the committed synthetic movie for entrypoint
+/// validation tests that must fail before any recognition work.
+fn report_test_index() -> Index {
+    let pcm = decode_wav(&Path::new(SYNTHETIC_ROOT).join("movie.wav"), &|| false).unwrap();
+    Index::from_pcm(movie(), &pcm, Recipe::default(), &|| false).unwrap()
+}
+
+#[test]
+fn report_rejects_domain_and_epoch_shapes_before_any_media_work() {
+    let index = report_test_index();
+    // The recording path is deliberately absent: structural validation must
+    // fail before any media work touches the file system.
+    let recording = Path::new("absent-recording.wav");
+    let derived = Path::new("absent-derived");
+    let valid = ReportRequest {
+        recipe_identity: RECIPE_ID.into(),
+        capture_clock: clock(0, secs(30)),
+        epochs: vec![epoch("e0", 0, secs(30))],
+        domain: domain(0, secs(30)),
+        boundaries: vec![],
+        movie_digest: None,
+        recording_digest: None,
+        pooled_mode_limit: None,
+    };
+
+    // A domain outside the capture clock is refused.
+    let mut request = valid.clone();
+    request.domain = domain(0, secs(40));
+    let error = report(&index, recording, derived, &request, &mut |_| {}, &|| false).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("domain must lie inside the capture clock"),
+        "{error:#}"
+    );
+
+    // Unordered and outside-domain epochs are refused.
+    let mut request = valid.clone();
+    request.epochs = vec![epoch("e1", secs(5), secs(15)), epoch("e0", 0, secs(30))];
+    let error = report(&index, recording, derived, &request, &mut |_| {}, &|| false).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("epochs must be ordered and inside the requested domain"),
+        "{error:#}"
+    );
+    let mut request = valid.clone();
+    request.epochs = vec![epoch("e0", 0, secs(40))];
+    let error = report(&index, recording, derived, &request, &mut |_| {}, &|| false).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("epochs must be ordered and inside the requested domain"),
+        "{error:#}"
+    );
+
+    // With valid shapes the pipeline proceeds to recording identity work.
+    let error = report(&index, recording, derived, &valid, &mut |_| {}, &|| false).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("stat file before hash"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn report_rejects_a_recording_digest_mismatch_before_decoding() {
+    let index = report_test_index();
+    let recording = Path::new(SYNTHETIC_ROOT).join("recording-continuous.wav");
+    let request = ReportRequest {
+        recipe_identity: RECIPE_ID.into(),
+        capture_clock: clock(0, secs(30)),
+        epochs: vec![epoch("e0", 0, secs(30))],
+        domain: domain(0, secs(30)),
+        boundaries: vec![],
+        movie_digest: None,
+        recording_digest: Some("f".repeat(64)),
+        pooled_mode_limit: None,
+    };
+    let error = report(
+        &index,
+        &recording,
+        Path::new("absent-derived"),
+        &request,
+        &mut |_| {},
+        &|| false,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("recording digest mismatch"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn report_rejects_a_recording_whose_native_rate_differs_from_the_capture_clock() {
+    let index = report_test_index();
+    let recording = Path::new(SYNTHETIC_ROOT).join("recording-continuous.wav");
+    let mut capture_clock = clock(0, 30 * 48_000);
+    capture_clock.sample_rate = 48_000;
+    let request = ReportRequest {
+        recipe_identity: RECIPE_ID.into(),
+        capture_clock,
+        epochs: vec![epoch("e0", 0, 15 * 48_000)],
+        domain: domain(0, 15 * 48_000),
+        boundaries: vec![],
+        movie_digest: None,
+        recording_digest: None,
+        pooled_mode_limit: None,
+    };
+    let error = report(
+        &index,
+        &recording,
+        Path::new("absent-derived"),
+        &request,
+        &mut |_| {},
+        &|| false,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains(
+            "recording sample rate 11025 does not match the declared capture clock rate 48000"
+        ),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn map_recording_query_rejects_unknown_report_schema_versions() {
+    let current = assemble(&assembly(
+        clock(0, secs(30)),
+        vec![epoch("e0", 0, secs(30))],
+        domain(0, secs(30)),
+        vec![],
+        vec![],
+    ))
+    .unwrap();
+    let request = QueryMappingRequest {
+        session_id: "queries".into(),
+        query: SyncQuery {
+            clock_id: CLOCK_ID.into(),
+            start_sample: 0,
+            end_sample: secs(1),
+        },
+        policy: SyncPolicy::default(),
+    };
+    // The known report schema is consumed...
+    assert!(map_recording_query(&current, &request).is_ok());
+    // ...but an unknown report schema version is rejected outright instead of
+    // being consumed.
+    let mut future = current.clone();
+    future.schema_version = SEGMENT_REPORT_SCHEMA_VERSION + 1;
+    let error = map_recording_query(&future, &request).unwrap_err();
+    assert!(format!("{error:#}").contains("schema version"), "{error:#}");
 }
 
 // ---------------------------------------------------------------------------

@@ -42,14 +42,19 @@ use crate::source_audio_pooled::{
     OFFSET_BIN_SECONDS, PooledRecognitionPolicy, PooledWindowResult, REASON_INCOMPLETE_EVIDENCE,
     RECIPE_ID,
 };
+use crate::source_audio_sessions::{
+    SCHEDULE_STEP_SECONDS, SCHEDULE_WINDOW_SECONDS, SchedulingIdentity, SessionIdentity,
+    SessionProgress, SessionResult, SessionRunRequest, SessionWindowResult,
+};
 use crate::tv_review_sync::{
     CaptureClock, CapturePosition, MovieEstimate, SYNC_VERSION, SyncAnchor, SyncAnchorSource,
     SyncBoundary, SyncMovieClock, SyncPolicy, SyncQuery, SyncRequest, SyncState,
 };
-use crate::tv_soundtrack_landmarks::{HOP, RATE as FEATURE_RATE};
+use crate::tv_soundtrack_landmarks::{HOP, Index, RATE as FEATURE_RATE, decode_wav};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// Versioned identity of this segment assembler. A semantics change requires a
 /// new identity; the frozen v3 acceptance verdicts are never re-labelled.
@@ -153,6 +158,10 @@ pub struct AcceptedWindow {
     /// `None` exactly when no offset mode exists. Callers with a rebased final
     /// window set their epoch-convention value here.
     pub offset_seconds: Option<f64>,
+    /// 80 ms hypothesis bin of `offset_seconds` (the nearest bin for a rebased
+    /// final window whose epoch-convention offset is off the chunk lattice).
+    /// Hypothesis identities key on this bin; hypothesis compatibility is
+    /// decided in offset space (at most one 80 ms bin apart).
     pub offset_bin: Option<i32>,
     /// Complete reference search AND complete accumulation.
     pub complete: bool,
@@ -218,6 +227,51 @@ impl AcceptedWindow {
                 .collect(),
             supporting_cells,
         }
+    }
+
+    /// Build the assembler input for one session window result. Completed
+    /// windows carry their pooled best-mode evidence with the session's
+    /// epoch-convention offset (the pooled rows are chunk-local and get
+    /// rebased); incomplete windows (cancelled, truncated, budget-infeasible)
+    /// arrive as explicit non-supporting evidence and can never match.
+    pub fn from_session_window(window: &SessionWindowResult) -> Self {
+        let window_id = opaque_window_id(&window.window_evidence_id);
+        let Some(pooled) = window.pooled.as_ref() else {
+            return AcceptedWindow {
+                window_id,
+                capture_clock_id: window.capture_clock_id.clone(),
+                epoch_id: window.epoch_id.clone(),
+                start_sample: window.start_sample,
+                end_sample: window.end_sample,
+                window_start_seconds: window.window_start_seconds,
+                duration_seconds: window.duration_seconds,
+                offset_seconds: None,
+                offset_bin: None,
+                complete: false,
+                accepted: None,
+                failure_reasons: Vec::new(),
+                supporting_cells: Vec::new(),
+            };
+        };
+        let mut accepted = Self::from_pooled(
+            window_id,
+            window.capture_clock_id.clone(),
+            window.epoch_id.clone(),
+            window.start_sample,
+            window.end_sample,
+            window.chunk_start_seconds_within_epoch,
+            pooled,
+        );
+        // The session already rebased the best-mode offset into the epoch
+        // convention and carries the schedule-exact window start. The
+        // hypothesis bin is the nearest 80 ms bin of that epoch-convention
+        // offset (the session's raw bin is chunk-local evidence).
+        accepted.window_start_seconds = window.window_start_seconds;
+        accepted.offset_seconds = window.offset_seconds;
+        accepted.offset_bin = window
+            .offset_seconds
+            .map(|offset| (offset / OFFSET_BIN_SECONDS).round() as i32);
+        accepted
     }
 
     /// A window provides support only with a complete search AND the accepted
@@ -474,6 +528,23 @@ fn opaque(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
+/// Map a generated session window evidence id (which embeds `:` separators)
+/// onto the opaque identifier vocabulary the assembler enforces. Session
+/// evidence ids are machine-generated `saw:<clock>:<epoch>:<start>-<end>`
+/// strings, so the mapping is deterministic and collision-free for one clock.
+fn opaque_window_id(evidence_id: &str) -> String {
+    evidence_id
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
+                byte as char
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 /// Frozen offset convention: `movieElapsedSeconds =
 /// recordingSecondsWithinEpoch + offsetSeconds`.
 pub fn movie_elapsed_seconds(recording_seconds_within_epoch: f64, offset_seconds: f64) -> f64 {
@@ -662,7 +733,9 @@ fn validate_request(request: &SegmentAssemblyRequest) -> Result<()> {
         );
         match (window.offset_seconds, window.offset_bin) {
             (Some(offset), Some(bin)) => ensure!(
-                offset.is_finite() && (offset - f64::from(bin) * OFFSET_BIN_SECONDS).abs() <= 1e-6,
+                offset.is_finite()
+                    && (offset - f64::from(bin) * OFFSET_BIN_SECONDS).abs()
+                        <= 0.5 * OFFSET_BIN_SECONDS + 1e-6,
                 "invalid input: window offset must match its offset bin"
             ),
             (None, None) => {}
@@ -750,11 +823,9 @@ pub fn assemble(request: &SegmentAssemblyRequest) -> Result<SegmentReport> {
             let cell_start = (cell.time_bin_seconds * f64::from(rate)).round() as u64;
             let builder = cells.entry(cell_start).or_default();
             builder.time_bin_seconds = cell.time_bin_seconds;
-            if !builder
-                .hypotheses
-                .iter()
-                .any(|hypothesis| hypothesis.offset_bin == offset_bin)
-            {
+            if !builder.hypotheses.iter().any(|hypothesis| {
+                hypothesis.offset_bin == offset_bin && hypothesis.offset_seconds == offset_seconds
+            }) {
                 builder.hypotheses.push(Hypothesis {
                     offset_bin,
                     offset_seconds,
@@ -794,20 +865,24 @@ pub fn assemble(request: &SegmentAssemblyRequest) -> Result<SegmentReport> {
             if boundary_in_cell {
                 continue;
             }
-            let min_bin = builder
+            // Frozen compatibility rule in offset space: hypotheses are
+            // compatible iff every pair differs by at most one 80 ms bin
+            // (exact on the bin lattice; correct for a rebased final window
+            // whose offset is off the chunk lattice).
+            let mut hypothesis_offsets: Vec<f64> = builder
                 .hypotheses
                 .iter()
-                .map(|hypothesis| hypothesis.offset_bin)
-                .min()
-                .expect("cell hypotheses are non-empty");
-            let max_bin = builder
-                .hypotheses
-                .iter()
-                .map(|hypothesis| hypothesis.offset_bin)
-                .max()
-                .expect("cell hypotheses are non-empty");
-            if max_bin - min_bin > 1 {
-                let mut merged: BTreeMap<i32, OffsetHypothesis> = BTreeMap::new();
+                .map(|hypothesis| hypothesis.offset_seconds)
+                .collect();
+            hypothesis_offsets.sort_by(|left, right| left.total_cmp(right));
+            let spread = hypothesis_offsets
+                .last()
+                .expect("cell hypotheses are non-empty")
+                - hypothesis_offsets
+                    .first()
+                    .expect("cell hypotheses are non-empty");
+            if spread > OFFSET_TOLERANCE {
+                let mut merged: Vec<OffsetHypothesis> = Vec::new();
                 for window in &effective {
                     if window.epoch_id != epoch_id {
                         continue;
@@ -821,21 +896,31 @@ pub fn assemble(request: &SegmentAssemblyRequest) -> Result<SegmentReport> {
                         if (cell.time_bin_seconds * f64::from(rate)).round() as u64 != cell_start {
                             continue;
                         }
-                        let entry = merged
-                            .entry(offset_bin)
-                            .or_insert_with(|| OffsetHypothesis {
+                        match merged.iter_mut().find(|hypothesis| {
+                            hypothesis.offset_bin == offset_bin
+                                && hypothesis.offset_seconds == offset_seconds
+                        }) {
+                            Some(hypothesis) => {
+                                hypothesis.window_ids.push(window.window_id.clone())
+                            }
+                            None => merged.push(OffsetHypothesis {
                                 offset_seconds,
                                 offset_bin,
-                                window_ids: Vec::new(),
-                            });
-                        entry.window_ids.push(window.window_id.clone());
+                                window_ids: vec![window.window_id.clone()],
+                            }),
+                        }
                     }
                 }
-                let mut hypotheses: Vec<OffsetHypothesis> = merged.into_values().collect();
+                let mut hypotheses: Vec<OffsetHypothesis> = merged;
                 for hypothesis in &mut hypotheses {
                     hypothesis.window_ids.sort();
                     hypothesis.window_ids.dedup();
                 }
+                hypotheses.sort_by(|left, right| {
+                    left.offset_bin
+                        .cmp(&right.offset_bin)
+                        .then(left.offset_seconds.total_cmp(&right.offset_seconds))
+                });
                 alternatives.push(Alternative {
                     capture_clock_id: clock.clock_id.clone(),
                     epoch_id: epoch_id.clone(),
@@ -1153,21 +1238,23 @@ pub fn assemble(request: &SegmentAssemblyRequest) -> Result<SegmentReport> {
         "internal: segment accounting must cover the requested domain"
     );
 
+    // Fold from +0.0: an empty float `sum()` is -0.0, which would serialize
+    // as `-0.0` seconds in reports without any support or holes.
     let supported_seconds: f64 = segments
         .iter()
         .flat_map(|segment| segment.supported_spans.iter())
         .map(|span| (span.end_sample - span.start_sample) as f64 / f64::from(rate))
-        .sum();
+        .fold(0.0, |total, seconds| total + seconds);
     let envelope_unknown_seconds: f64 = segments
         .iter()
         .flat_map(|segment| segment.unknown_spans.iter())
         .map(|span| (span.end_sample - span.start_sample) as f64 / f64::from(rate))
-        .sum();
+        .fold(0.0, |total, seconds| total + seconds);
     let unknown_seconds: f64 = envelope_unknown_seconds
         + unknown_ranges
             .iter()
             .map(|range| (range.end_sample - range.start_sample) as f64 / f64::from(rate))
-            .sum::<f64>();
+            .fold(0.0, |total, seconds| total + seconds);
     let search_complete = request.windows.iter().all(|window| window.complete);
     let incomplete_window_count = request
         .windows
@@ -1350,6 +1437,188 @@ fn unknown_reason(
 }
 
 // ---------------------------------------------------------------------------
+// Full-recording report entrypoint: one core-owned pipeline from the recording
+// file to the bounded session run and the conservative segment report.
+
+/// Full-recording report request: the explicit pooled matcher selection plus
+/// the recording's capture clock, its continuous capture epochs and the
+/// requested recording domain the report accounting must cover.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReportRequest {
+    /// Explicit opt-in matcher selection; must be `source-audio-pooled-mvp-v1`.
+    pub recipe_identity: String,
+    pub capture_clock: CaptureClock,
+    pub epochs: Vec<CaptureEpoch>,
+    pub domain: SampleRange,
+    /// Known pause/seek/rewind/interruption evidence; transition cells stay
+    /// unknown and prevent interpolation.
+    #[serde(default)]
+    pub boundaries: Vec<SyncBoundary>,
+    /// Optional pin: must match the index's movie identity when present.
+    #[serde(default)]
+    pub movie_digest: Option<String>,
+    /// Optional pin: must match the recording file's BLAKE3 when present.
+    #[serde(default)]
+    pub recording_digest: Option<String>,
+    /// Diagnostic returned mode rows per window (1..=64; decisions never
+    /// depend on it).
+    #[serde(default)]
+    pub pooled_mode_limit: Option<u8>,
+}
+
+/// The full-recording report outcome: the bounded session run (window work,
+/// resume/reuse accounting and progress totals) plus the conservative
+/// [`SegmentReport`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReportOutcome {
+    pub session: SessionResult,
+    pub report: SegmentReport,
+}
+
+/// Run the frozen pooled session schedule over a full recording and assemble
+/// the conservative segment report: the single core-owned source-audio report
+/// pipeline. Validates the request (matcher selection is enforced by the
+/// session run; movie/recording digest pins, clock/epoch/domain shapes),
+/// verifies the recording identity around decoding (a changed recording can
+/// never be reported), executes the bounded resumable session through
+/// [`crate::source_audio_sessions::run_session`] and assembles the
+/// [`SegmentReport`] from the session windows. Callers only read files, invoke
+/// this function and format the JSON; incomplete work is returned explicitly
+/// and no hole, conflict or unknown ever receives a movie position.
+pub fn report(
+    index: &Index,
+    recording: &Path,
+    derived_data_dir: &Path,
+    request: &ReportRequest,
+    on_progress: &mut dyn FnMut(SessionProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<ReportOutcome> {
+    if let Some(expected) = request.movie_digest.as_deref() {
+        ensure!(
+            expected == index.movie.movie_digest,
+            "invalid input: source-audio index movie identity mismatch"
+        );
+    }
+    // Structural request validation before any media work.
+    ensure!(
+        !request.epochs.is_empty()
+            && request.domain.start_sample < request.domain.end_sample
+            && request.domain.start_sample >= request.capture_clock.first_sample
+            && request.domain.end_sample <= request.capture_clock.last_sample,
+        "invalid input: source-audio report domain must lie inside the capture clock"
+    );
+    let mut previous_end: Option<u64> = None;
+    for epoch in &request.epochs {
+        ensure!(
+            epoch.start_sample < epoch.end_sample
+                && epoch.start_sample >= request.domain.start_sample
+                && epoch.end_sample <= request.domain.end_sample
+                && previous_end.is_none_or(|end| epoch.start_sample >= end),
+            "invalid input: source-audio report epochs must be ordered and inside the requested domain"
+        );
+        previous_end = Some(epoch.end_sample);
+    }
+    let before = crate::full_file_blake3(recording, cancel)?;
+    if let Some(expected) = request.recording_digest.as_deref() {
+        ensure!(
+            expected == before.hex_digest,
+            "invalid input: recording digest mismatch"
+        );
+    }
+    // Native sample coordinates are interpreted on the declared capture
+    // clock; a recording whose first audio stream runs at another rate would
+    // silently rescale every position, so it is refused before decoding.
+    let native_rate = probe_recording_sample_rate(recording, cancel)?;
+    ensure!(
+        native_rate == request.capture_clock.sample_rate,
+        "invalid input: recording sample rate {native_rate} does not match the declared capture clock rate {}",
+        request.capture_clock.sample_rate
+    );
+    let pcm = decode_wav(recording, cancel)?;
+    let after = crate::full_file_blake3(recording, cancel)?;
+    ensure!(
+        before.hex_digest == after.hex_digest && before.byte_count == after.byte_count,
+        "input_changed"
+    );
+    let session = crate::source_audio_sessions::run_session(
+        index,
+        &SessionRunRequest {
+            identity: SessionIdentity {
+                recording_digest: before.hex_digest.clone(),
+                index_identity: index.index_digest.clone(),
+                recipe_identity: request.recipe_identity.clone(),
+                policy_identity: PooledRecognitionPolicy::frozen().policy_id.clone(),
+                scheduling_identity: SchedulingIdentity {
+                    window_seconds: SCHEDULE_WINDOW_SECONDS,
+                    step_seconds: SCHEDULE_STEP_SECONDS,
+                    epochs: request.epochs.clone(),
+                },
+                capture_clock: request.capture_clock.clone(),
+            },
+            pcm: &pcm,
+            pcm_origin_sample: request.capture_clock.first_sample,
+            derived_data_dir: derived_data_dir.to_path_buf(),
+            search_policy: None,
+            mode_limit: request.pooled_mode_limit,
+        },
+        on_progress,
+        cancel,
+    )?;
+    let report = assemble(&SegmentAssemblyRequest {
+        capture_clock: request.capture_clock.clone(),
+        movie: index.movie.clone(),
+        epochs: request.epochs.clone(),
+        domain: request.domain,
+        windows: session
+            .windows
+            .iter()
+            .map(AcceptedWindow::from_session_window)
+            .collect(),
+        boundaries: request.boundaries.clone(),
+        recording_identity: Some(before.hex_digest),
+        index_identity: Some(index.index_digest.clone()),
+    })?;
+    Ok(ReportOutcome { session, report })
+}
+
+/// Native sample rate of the recording's first audio stream (local file
+/// protocol only, bounded and cancellable like the capture decode).
+fn probe_recording_sample_rate(recording: &Path, cancel: &dyn Fn() -> bool) -> Result<u32> {
+    let mut command = crate::tool_command("ffprobe");
+    command
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(recording);
+    let output = crate::stall::output_with_timeout_cancellation_and_limit(
+        &mut command,
+        "source-audio capture probe",
+        std::time::Duration::from_secs(60),
+        &|| cancel(),
+        4096,
+    )?;
+    ensure!(
+        output.status.success(),
+        "media tool failed: source-audio capture probe"
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("media tool failed: source-audio capture has no audio stream"))
+}
+
+// ---------------------------------------------------------------------------
 // tv_review_sync adapter (read-only).
 
 /// Query-level mapping outcome. Unknown, conflicting and gap-crossing queries
@@ -1424,6 +1693,11 @@ pub fn map_recording_query(
     report: &SegmentReport,
     request: &QueryMappingRequest,
 ) -> Result<MappedQueryResult> {
+    ensure!(
+        report.schema_version == SEGMENT_REPORT_SCHEMA_VERSION,
+        "invalid input: unsupported source-audio segment report schema version {}; expected {SEGMENT_REPORT_SCHEMA_VERSION}",
+        report.schema_version
+    );
     ensure!(
         request.query.clock_id == report.capture_clock.clock_id,
         "invalid input: query capture clock mismatch"

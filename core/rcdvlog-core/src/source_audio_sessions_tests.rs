@@ -90,15 +90,19 @@ fn identity() -> SessionIdentity {
         scheduling_identity: SchedulingIdentity {
             window_seconds: SCHEDULE_WINDOW_SECONDS,
             step_seconds: SCHEDULE_STEP_SECONDS,
-            epochs: vec![EpochSegment {
+            epochs: vec![CaptureEpoch {
                 epoch_id: "e1".into(),
-                origin_sample: 0,
+                start_sample: 0,
                 end_sample: 15 * u64::from(RATE),
             }],
         },
-        capture_clock_identity: CaptureClockIdentity {
+        capture_clock: CaptureClock {
             clock_id: "capture-clock".into(),
             sample_rate: RATE,
+            first_sample: 0,
+            last_sample: 3_600 * u64::from(RATE),
+            monotonic_origin_ns: 0,
+            monotonic_tolerance_ns: 1_000,
         },
     }
 }
@@ -158,24 +162,24 @@ fn schedule_regular_grid_final_window_and_exact_dedup() {
     let rate = u64::from(RATE);
     let mut identity = identity();
     identity.scheduling_identity.epochs = vec![
-        EpochSegment {
+        CaptureEpoch {
             epoch_id: "dedup".into(),
-            origin_sample: 0,
+            start_sample: 0,
             end_sample: 22 * rate,
         },
-        EpochSegment {
+        CaptureEpoch {
             epoch_id: "added".into(),
-            origin_sample: 22 * rate,
+            start_sample: 22 * rate,
             end_sample: 43 * rate,
         },
-        EpochSegment {
+        CaptureEpoch {
             epoch_id: "odd".into(),
-            origin_sample: 43 * rate,
+            start_sample: 43 * rate,
             end_sample: 58 * rate,
         },
-        EpochSegment {
+        CaptureEpoch {
             epoch_id: "edge".into(),
-            origin_sample: 58 * rate,
+            start_sample: 58 * rate,
             end_sample: 68 * rate,
         },
     ];
@@ -208,7 +212,7 @@ fn schedule_regular_grid_final_window_and_exact_dedup() {
             .find(|epoch| epoch.epoch_id == window.epoch_id)
             .unwrap();
         assert_eq!(
-            window.start_sample - epoch.origin_sample,
+            window.start_sample - epoch.start_sample,
             (window.window_start_seconds * rate as f64) as u64
         );
         assert_eq!(window.end_sample, window.start_sample + 10 * rate);
@@ -236,9 +240,9 @@ fn schedule_regular_grid_final_window_and_exact_dedup() {
 fn short_epochs_stay_unknown_and_surface_in_the_session_result() {
     let rate = u64::from(RATE);
     let mut identity = identity();
-    identity.scheduling_identity.epochs = vec![EpochSegment {
+    identity.scheduling_identity.epochs = vec![CaptureEpoch {
         epoch_id: "short".into(),
-        origin_sample: 0,
+        start_sample: 0,
         end_sample: 9 * rate,
     }];
     let schedule = build_schedule(&identity).unwrap();
@@ -270,9 +274,9 @@ fn short_epochs_stay_unknown_and_surface_in_the_session_result() {
 fn offset_sign_follows_the_frozen_design_example() {
     let rate = u64::from(RATE);
     let mut identity = identity();
-    identity.scheduling_identity.epochs = vec![EpochSegment {
+    identity.scheduling_identity.epochs = vec![CaptureEpoch {
         epoch_id: "e".into(),
-        origin_sample: 0,
+        start_sample: 0,
         end_sample: 40 * rate,
     }];
     let schedule = build_schedule(&identity).unwrap();
@@ -312,10 +316,10 @@ fn offset_sign_holds_through_own_chunks_and_nonzero_epoch_origins() {
     let native_rate = 22_050u32;
     let origin = 3 * u64::from(native_rate) + 1;
     let mut identity = identity();
-    identity.capture_clock_identity.sample_rate = native_rate;
-    identity.scheduling_identity.epochs = vec![EpochSegment {
+    identity.capture_clock.sample_rate = native_rate;
+    identity.scheduling_identity.epochs = vec![CaptureEpoch {
         epoch_id: "e".into(),
-        origin_sample: origin,
+        start_sample: origin,
         end_sample: origin + 231_525, // 10.5 s at 22050 Hz
     }];
     let schedule = build_schedule(&identity).unwrap();
@@ -346,10 +350,10 @@ fn resampling_to_the_extractor_rate_never_shifts_native_origins() {
     let native_rate = 22_050u32;
     let origin = 3 * u64::from(native_rate) + 1;
     let mut identity = identity();
-    identity.capture_clock_identity.sample_rate = native_rate;
-    identity.scheduling_identity.epochs = vec![EpochSegment {
+    identity.capture_clock.sample_rate = native_rate;
+    identity.scheduling_identity.epochs = vec![CaptureEpoch {
         epoch_id: "e".into(),
-        origin_sample: origin,
+        start_sample: origin,
         end_sample: origin + 12 * u64::from(native_rate),
     }];
     let index = silence_index();
@@ -414,9 +418,9 @@ fn batch_planner_enforces_the_window_and_scan_caps() {
 #[test]
 fn execution_batches_windows_and_publishes_completed_counts() {
     let mut identity = identity();
-    identity.scheduling_identity.epochs = vec![EpochSegment {
+    identity.scheduling_identity.epochs = vec![CaptureEpoch {
         epoch_id: "e".into(),
-        origin_sample: 0,
+        start_sample: 0,
         end_sample: 60 * u64::from(RATE),
     }];
     let index = silence_index();
@@ -469,9 +473,9 @@ fn assert_truncated(result: &SessionWindowResult) {
 fn truncated_searches_never_become_matches() {
     let rate = u64::from(RATE);
     let mut identity = identity();
-    identity.scheduling_identity.epochs = vec![EpochSegment {
+    identity.scheduling_identity.epochs = vec![CaptureEpoch {
         epoch_id: "e".into(),
-        origin_sample: 0,
+        start_sample: 0,
         end_sample: 10 * rate,
     }];
     let schedule = build_schedule(&identity).unwrap();
@@ -501,9 +505,9 @@ fn truncated_searches_never_become_matches() {
 #[test]
 fn cancellation_leaves_resumable_state_and_resume_continues_without_redoing() {
     let mut identity = identity();
-    identity.scheduling_identity.epochs = vec![EpochSegment {
+    identity.scheduling_identity.epochs = vec![CaptureEpoch {
         epoch_id: "e".into(),
-        origin_sample: 0,
+        start_sample: 0,
         end_sample: 60 * u64::from(RATE),
     }];
     let index = silence_index();
@@ -599,7 +603,7 @@ fn derived_results_are_keyed_by_all_identities_and_staleness_is_refused() {
     let mut by_recording = identity.clone();
     by_recording.recording_digest = "other-recording".into();
     let mut by_clock = identity.clone();
-    by_clock.capture_clock_identity.clock_id = "other-clock".into();
+    by_clock.capture_clock.clock_id = "other-clock".into();
     let mut by_schedule = identity.clone();
     by_schedule.scheduling_identity.step_seconds = 3;
     for variant in [by_recording, by_clock, by_schedule] {
@@ -752,10 +756,10 @@ fn end_to_end_schedule_and_recognize_on_the_generated_synthetic_audio() {
     let mut epoch1 = identity();
     epoch1.recording_digest = "synthetic-ci-v1-recording-continuous".into();
     epoch1.index_identity = index.index_digest.clone();
-    epoch1.capture_clock_identity.clock_id = "synthetic-ci-v1-continuous".into();
-    epoch1.scheduling_identity.epochs = vec![EpochSegment {
+    epoch1.capture_clock.clock_id = "synthetic-ci-v1-continuous".into();
+    epoch1.scheduling_identity.epochs = vec![CaptureEpoch {
         epoch_id: "e1".into(),
-        origin_sample: 0,
+        start_sample: 0,
         end_sample: 165_375,
     }];
     let result = run_session(
@@ -795,10 +799,10 @@ fn end_to_end_schedule_and_recognize_on_the_generated_synthetic_audio() {
     let mut epoch2 = identity();
     epoch2.recording_digest = "synthetic-ci-v1-recording-continuous".into();
     epoch2.index_identity = index.index_digest.clone();
-    epoch2.capture_clock_identity.clock_id = "synthetic-ci-v1-continuous".into();
-    epoch2.scheduling_identity.epochs = vec![EpochSegment {
+    epoch2.capture_clock.clock_id = "synthetic-ci-v1-continuous".into();
+    epoch2.scheduling_identity.epochs = vec![CaptureEpoch {
         epoch_id: "e2".into(),
-        origin_sample: 55_125,
+        start_sample: 55_125,
         end_sample: 165_375,
     }];
     let result = run_session(

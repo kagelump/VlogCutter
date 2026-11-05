@@ -42,6 +42,8 @@ use crate::source_audio_pooled::{
     self, PooledOffsetWindow, PooledRecognitionPolicy, PooledRecognitionRequest,
     PooledWindowAcceptance, PooledWindowResult, RECIPE_ID,
 };
+use crate::source_audio_segments::CaptureEpoch;
+use crate::tv_review_sync::CaptureClock;
 use crate::tv_soundtrack_landmarks::{Index, RATE, SearchPolicy};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -80,27 +82,11 @@ const REASON_BUDGET_INFEASIBLE: &str = "budget_infeasible";
 const REASON_TRUNCATED_SEARCH: &str = "truncated_search";
 const REASON_NOT_ATTEMPTED: &str = "not_attempted";
 
-/// Capture-clock identity of the recording a session was scheduled against.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CaptureClockIdentity {
-    pub clock_id: String,
-    /// Original capture rate (native samples per second), NOT the extractor
-    /// rate. Native sample ranges on this clock never move under resampling.
-    pub sample_rate: u32,
-}
-
-/// One continuous capture-clock epoch: a stretch of recording with a
-/// continuous capture clock. `origin_sample` is this epoch's own
-/// recording-time origin on the capture clock; recording seconds within the
-/// epoch count from it. `end_sample` is the exclusive epoch end.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EpochSegment {
-    pub epoch_id: String,
-    pub origin_sample: u64,
-    pub end_sample: u64,
-}
+// Scheduling, session results, assembler inputs and the report share ONE
+// capture clock (`crate::tv_review_sync::CaptureClock`) and ONE capture-epoch
+// type (`crate::source_audio_segments::CaptureEpoch`, whose `start_sample` is
+// the epoch's own recording-time origin on the capture clock). No private
+// duplicates or translation layers exist here.
 
 /// Scheduling identity: the schedule shape (window and step seconds) plus the
 /// epoch segmentation. Any change here invalidates persisted derived results.
@@ -109,7 +95,7 @@ pub struct EpochSegment {
 pub struct SchedulingIdentity {
     pub window_seconds: u16,
     pub step_seconds: u32,
-    pub epochs: Vec<EpochSegment>,
+    pub epochs: Vec<CaptureEpoch>,
 }
 
 /// Complete identity of a session's derived results. Every field participates
@@ -125,7 +111,9 @@ pub struct SessionIdentity {
     /// Acceptance policy identity of the vendored v3 policy.
     pub policy_identity: String,
     pub scheduling_identity: SchedulingIdentity,
-    pub capture_clock_identity: CaptureClockIdentity,
+    /// Shared capture-clock type. The whole clock participates in the
+    /// persistence key: recalibration safely recomputes, never reuses.
+    pub capture_clock: CaptureClock,
 }
 
 /// One scheduled recognition window. `start_sample`/`end_sample` are native
@@ -290,7 +278,7 @@ pub struct SessionRunRequest<'a> {
 /// and explicit [`ShortEpoch`] rows for epochs shorter than one window.
 pub fn build_schedule(identity: &SessionIdentity) -> Result<SessionSchedule> {
     let scheduling = &identity.scheduling_identity;
-    let clock = &identity.capture_clock_identity;
+    let clock = &identity.capture_clock;
     validate_capture_clock(clock)?;
     ensure!(
         matches!(scheduling.window_seconds, 10 | 20 | 30),
@@ -309,16 +297,16 @@ pub fn build_schedule(identity: &SessionIdentity) -> Result<SessionSchedule> {
             "invalid input: duplicate source-audio epoch id"
         );
         ensure!(
-            epoch.end_sample > epoch.origin_sample,
+            epoch.end_sample > epoch.start_sample,
             "invalid input: source-audio epoch must span at least one sample"
         );
         ensure!(
-            epoch.end_sample - epoch.origin_sample <= rate * 3600,
+            epoch.end_sample - epoch.start_sample <= rate * 3600,
             "invalid input: source-audio epoch exceeds the one-hour limit"
         );
         if let Some(previous) = previous_end {
             ensure!(
-                epoch.origin_sample >= previous,
+                epoch.start_sample >= previous,
                 "invalid input: source-audio epochs must not overlap"
             );
         }
@@ -330,11 +318,11 @@ pub fn build_schedule(identity: &SessionIdentity) -> Result<SessionSchedule> {
     let mut windows = Vec::new();
     let mut short_epochs = Vec::new();
     for epoch in &scheduling.epochs {
-        let duration_samples = epoch.end_sample - epoch.origin_sample;
+        let duration_samples = epoch.end_sample - epoch.start_sample;
         if duration_samples < window_samples {
             short_epochs.push(ShortEpoch {
                 epoch_id: epoch.epoch_id.clone(),
-                start_sample: epoch.origin_sample,
+                start_sample: epoch.start_sample,
                 end_sample: epoch.end_sample,
                 duration_seconds: duration_samples as f64 / rate as f64,
                 reason: SHORT_EPOCH_REASON.to_string(),
@@ -346,8 +334,8 @@ pub fn build_schedule(identity: &SessionIdentity) -> Result<SessionSchedule> {
             windows.push(scheduled_window(
                 identity,
                 epoch,
-                epoch.origin_sample + start_in_epoch,
-                epoch.origin_sample + start_in_epoch + window_samples,
+                epoch.start_sample + start_in_epoch,
+                epoch.start_sample + start_in_epoch + window_samples,
             ));
             start_in_epoch += step_samples;
         }
@@ -358,7 +346,7 @@ pub fn build_schedule(identity: &SessionIdentity) -> Result<SessionSchedule> {
             windows.push(scheduled_window(
                 identity,
                 epoch,
-                epoch.origin_sample + final_start_in_epoch,
+                epoch.start_sample + final_start_in_epoch,
                 epoch.end_sample,
             ));
         }
@@ -373,19 +361,19 @@ pub fn build_schedule(identity: &SessionIdentity) -> Result<SessionSchedule> {
 
 fn scheduled_window(
     identity: &SessionIdentity,
-    epoch: &EpochSegment,
+    epoch: &CaptureEpoch,
     start_sample: u64,
     end_sample: u64,
 ) -> ScheduledWindow {
-    let rate = u64::from(identity.capture_clock_identity.sample_rate);
+    let rate = u64::from(identity.capture_clock.sample_rate);
     ScheduledWindow {
-        capture_clock_id: identity.capture_clock_identity.clock_id.clone(),
+        capture_clock_id: identity.capture_clock.clock_id.clone(),
         epoch_id: epoch.epoch_id.clone(),
         window_evidence_id: format!(
             "saw:{}:{}:{}-{}",
-            identity.capture_clock_identity.clock_id, epoch.epoch_id, start_sample, end_sample
+            identity.capture_clock.clock_id, epoch.epoch_id, start_sample, end_sample
         ),
-        window_start_seconds: (start_sample - epoch.origin_sample) as f64 / rate as f64,
+        window_start_seconds: (start_sample - epoch.start_sample) as f64 / rate as f64,
         duration_seconds: identity.scheduling_identity.window_seconds,
         start_sample,
         end_sample,
@@ -426,7 +414,7 @@ pub fn run_session(
         identity,
         pcm: request.pcm,
         pcm_origin_sample: request.pcm_origin_sample,
-        rate: identity.capture_clock_identity.sample_rate,
+        rate: identity.capture_clock.sample_rate,
         search_policy: request.search_policy,
         mode_limit: request.mode_limit,
         store_path,
@@ -548,7 +536,7 @@ fn coverage_accounting(rate: u32, ranges: &[(u64, u64)]) -> WindowCoverageAccoun
     }
 }
 
-fn validate_capture_clock(clock: &CaptureClockIdentity) -> Result<()> {
+fn validate_capture_clock(clock: &CaptureClock) -> Result<()> {
     ensure!(
         !clock.clock_id.is_empty(),
         "invalid input: source-audio capture clock id must not be empty"
@@ -573,9 +561,9 @@ fn validate_pcm_coverage(
         !pcm.is_empty() && pcm.len() <= RATE as usize * 60 * 60,
         "invalid input: bounded query PCM required"
     );
-    let rate = identity.capture_clock_identity.sample_rate;
+    let rate = identity.capture_clock.sample_rate;
     for epoch in &identity.scheduling_identity.epochs {
-        extractor_end(epoch.origin_sample, pcm_origin_sample, rate, pcm.len())?;
+        extractor_end(epoch.start_sample, pcm_origin_sample, rate, pcm.len())?;
         extractor_end(epoch.end_sample, pcm_origin_sample, rate, pcm.len())?;
     }
     for window in &schedule.windows {
@@ -746,11 +734,11 @@ impl SessionExecutor<'_> {
             // at the window itself (chunk-local start 0).
             let (fractional, integral): (Vec<usize>, Vec<usize>) =
                 pending.into_iter().partition(|index| {
-                    !(schedule.windows[*index].start_sample - epoch.origin_sample)
+                    !(schedule.windows[*index].start_sample - epoch.start_sample)
                         .is_multiple_of(rate)
                 });
             if !integral.is_empty() {
-                let epoch_origin = epoch.origin_sample;
+                let epoch_origin = epoch.start_sample;
                 let epoch_end = epoch.end_sample;
                 let e0 = ((epoch_origin - self.pcm_origin_sample) as u128 * u128::from(RATE)
                     / u128::from(self.rate)) as usize;
@@ -792,7 +780,7 @@ impl SessionExecutor<'_> {
                 let chunk0_samples =
                     self.pcm_origin_sample as f64 + e0 as f64 * self.rate as f64 / RATE as f64;
                 let chunk_start_within_epoch =
-                    (chunk0_samples - epoch.origin_sample as f64) / self.rate as f64;
+                    (chunk0_samples - epoch.start_sample as f64) / self.rate as f64;
                 if self.execute_group(
                     chunk,
                     chunk_start_within_epoch,
