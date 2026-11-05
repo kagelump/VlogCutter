@@ -973,6 +973,105 @@ fn from_pooled_reads_best_mode_support_and_chunk_relative_cells() {
 // Session-window bridging: assembler input for scheduled session results.
 
 #[test]
+fn rebased_final_window_cells_stay_inside_the_window_at_48_khz() {
+    use crate::source_audio_sessions::{SessionWindowResult, SessionWindowState};
+
+    // Release-comparison regression: a 69.391 s epoch at 48 kHz schedules a
+    // final window at 59.391 s (native sample 2_850_768). Its extractor chunk
+    // starts at floor(2_850_768 * 11025 / 48000) / 11025 = 59.39093 s, i.e.
+    // three native samples early, so chunk bin 0 used to land outside the
+    // window and the whole report was refused.
+    const NATIVE: u32 = 48_000;
+    let start_sample = 2_850_768_u64;
+    let end_sample = start_sample + 10 * u64::from(NATIVE);
+    let window_start_seconds = start_sample as f64 / f64::from(NATIVE);
+    let chunk_start = (start_sample * u64::from(FEATURE_RATE) / u64::from(NATIVE)) as f64
+        / f64::from(FEATURE_RATE);
+    assert!(chunk_start < window_start_seconds);
+    let cells = (0..10)
+        .map(|bin| PooledModeSupportCell {
+            time_bin: bin,
+            query_anchor_frames: vec![bin * 86 + 1, bin * 86 + 9, bin * 86 + 17, bin * 86 + 25],
+        })
+        .collect();
+    let pooled = PooledWindowResult {
+        start_seconds: 0,
+        duration_seconds: 10,
+        end_seconds: 10,
+        complete: true,
+        internal_offset_cell_count: 40,
+        offset_cells_scanned: 40,
+        offset_cells_pooled_for_window: 40,
+        offset_cells_dropped: 0,
+        ranked_offset_bin_count: 1,
+        returned_offset_bin_count: 1,
+        best_distinct_competitor: None,
+        best_anchor_margin: None,
+        best_unique_anchor_margin: None,
+        modes: vec![PooledOffsetModeRow {
+            offset_bin: 10_356,
+            offset_seconds: 828.48,
+            independent_anchors: 40,
+            summed_cell_anchor_count: 40,
+            duplicate_anchor_votes_removed: 0,
+            occupied_time_bins: 10,
+            support_span_seconds: 10,
+            rarity_weight: 40.0,
+            frequency_diversity_median_per_time_bin: 4.0,
+            saturated_anchors: 0,
+            shared_query_anchors_with_best: 0,
+            supporting_cells: Some(cells),
+        }],
+        acceptance: PooledWindowAcceptance {
+            floors_calibrated: true,
+            recipe_calibrated: true,
+            accepted: Some(true),
+            failure_reasons: vec![],
+            gate_failure_reasons: vec![],
+        },
+    };
+    let offset = 828.48 - chunk_start;
+    let window = SessionWindowResult {
+        capture_clock_id: CLOCK_ID.into(),
+        epoch_id: "e0".into(),
+        window_evidence_id: format!("saw:{CLOCK_ID}:e0:{start_sample}-{end_sample}"),
+        start_sample,
+        end_sample,
+        window_start_seconds,
+        duration_seconds: 10,
+        state: SessionWindowState::Completed,
+        incomplete_reason: None,
+        offset_seconds: Some(offset),
+        offset_bin: Some((offset / OFFSET_BIN_SECONDS).round() as i32),
+        chunk_start_seconds_within_epoch: Some(chunk_start),
+        acceptance: Some(pooled.acceptance.clone()),
+        pooled: Some(pooled),
+    };
+    let bridged = AcceptedWindow::from_session_window(&window);
+    for (bin, cell) in bridged.supporting_cells.iter().enumerate() {
+        assert_eq!(
+            (cell.time_bin_seconds * f64::from(NATIVE)).round() as u64,
+            start_sample + bin as u64 * u64::from(NATIVE),
+            "cell {bin} must sit on the window's own one-second grid"
+        );
+    }
+    let mut capture_clock = clock(0, end_sample);
+    capture_clock.sample_rate = NATIVE;
+    let report = assemble(&assembly(
+        capture_clock,
+        vec![epoch("e0", 0, end_sample)],
+        domain(0, end_sample),
+        vec![bridged],
+        vec![],
+    ))
+    .unwrap();
+    assert_eq!(report.segments.len(), 1);
+    assert_eq!(report.segments[0].start_sample, start_sample);
+    assert_eq!(report.segments[0].end_sample, end_sample);
+    assert_accounting(&report, domain(0, end_sample));
+}
+
+#[test]
 fn from_session_window_rebases_offsets_and_never_supports_incomplete_windows() {
     use crate::source_audio_sessions::{SessionWindowResult, SessionWindowState};
 
@@ -1048,7 +1147,13 @@ fn from_session_window_rebases_offsets_and_never_supports_incomplete_windows() {
         Some((1.5 / OFFSET_BIN_SECONDS).round() as i32)
     );
     assert!((bridged.window_start_seconds - completed.window_start_seconds).abs() < 1e-12);
-    assert!((bridged.supporting_cells[0].time_bin_seconds - 3.5).abs() < 1e-12);
+    // Chunk bin 3 is the window's own fourth cell: it sits on the window grid
+    // (start sample 5512 = 0.49995 s), not on the sub-sample chunk origin.
+    assert!(
+        (bridged.supporting_cells[0].time_bin_seconds - (completed.window_start_seconds + 3.0))
+            .abs()
+            < 1e-12
+    );
     assert_eq!(
         bridged.supporting_cells[0].query_anchor_frames,
         vec![258, 268]

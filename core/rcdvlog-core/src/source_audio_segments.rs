@@ -267,6 +267,20 @@ impl AcceptedWindow {
         // hypothesis bin is the nearest 80 ms bin of that epoch-convention
         // offset (the session's raw bin is chunk-local evidence).
         accepted.window_start_seconds = window.window_start_seconds;
+        // A rebased final window's chunk origin is quantized to the extractor
+        // rate, so it can sit up to one extractor sample before the native
+        // window start (e.g. 59.39093 s for a 59.391 s window at 48 kHz). Its
+        // one-second cells are the window's own cells: snap them back onto the
+        // window grid when the difference is within that quantization, so a
+        // sub-sample artefact never pushes a cell outside its window.
+        let quantization = 1.0 / f64::from(FEATURE_RATE) + 1e-9;
+        for cell in &mut accepted.supporting_cells {
+            let relative = cell.time_bin_seconds - window.window_start_seconds;
+            let snapped = relative.round();
+            if (relative - snapped).abs() <= quantization {
+                cell.time_bin_seconds = window.window_start_seconds + snapped;
+            }
+        }
         accepted.offset_seconds = window.offset_seconds;
         accepted.offset_bin = window
             .offset_seconds
