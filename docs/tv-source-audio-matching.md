@@ -137,7 +137,9 @@ What it does:
    at least 33 independent anchors, 5 occupied one-second bins, a 2.0 ratio to
    the strongest non-adjacent competitor, and a 2.0 unique-anchor margin). A
    truncated, cancelled or budget-infeasible search never becomes a match.
-3. Assembles accepted windows into segments: compatible offsets differ by at
+3. Assembles accepted windows into segments (assembler
+   `source-audio-segments-mvp-v2`). Each accepted window supports only its
+   main contiguous run of one-second cells. Compatible offsets differ by at
    most one 80 ms bin, every member stays within 80 ms of the segment's median
    offset, conflicting cells stay unknown, and gaps of up to 2 seconds may sit
    inside one segment as explicit unknown spans. Longer gaps, seeks, rewinds,
@@ -336,8 +338,11 @@ candidates.
 - At least ten seconds of usable audio is needed before anything can match.
 - Coverage in difficult audio (heavy noise, reverb, foreground speech or codec
   damage) is incomplete: those spans stay unknown rather than being guessed.
-  The bounded release comparison is summarized in
-  `core/rcdvlog-core/tests/source_audio_eval/release/`.
+  In the bounded release comparison
+  (`core/rcdvlog-core/tests/source_audio_eval/release/`), moderate synthetic
+  room captures recovered 20–73% of their playback and a 45-minute replay
+  48%, with zero accepted wrong seconds. Four of six difficult historical
+  windows stayed entirely unknown.
 - Short pauses or seeks of under about two seconds can be missed inside an
   envelope; boundaries are only known to roughly one second, separately from
   the offset precision.

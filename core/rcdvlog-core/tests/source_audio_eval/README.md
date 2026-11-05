@@ -20,6 +20,7 @@ Layout:
 | `synthetic/synthetic-ci-v1.json` | generated fixture manifest with expected offsets and SHA-256 digests |
 | `synthetic/movie.wav`, `synthetic/recording-continuous.wav` | generated public fixtures (about 580 KiB total) |
 | `runner/run-source-audio-eval.mjs` | reusable evaluation runner (index -> match -> collect) |
+| `release/README.md`, `release/release-comparison-v1.sanitized.json` | step-5 release comparison of the `source-audio-pooled-mvp-v1` session report: results, fixed defects, scoring rules and invocation (sanitized; private scripts and predictions stay in `$SOURCE_AUDIO_EVAL_ROOT/mvp/release-v1/`) |
 
 ## Vendored artifact provenance
 

@@ -225,6 +225,8 @@ fn derived_assets_are_free_of_private_paths_and_ids() {
         "README.md",
         "runner/run-source-audio-eval.mjs",
         "synthetic/generate-synthetic-fixtures.mjs",
+        "release/README.md",
+        "release/release-comparison-v1.sanitized.json",
     ];
     // Fragments of the private evaluation root path and private media layout,
     // used only as leak-detection needles.
@@ -246,10 +248,13 @@ fn derived_assets_are_free_of_private_paths_and_ids() {
     }
     // The sanitized metrics redact sessionId values (24-hex private filename
     // stems); only 64-hex SHA-256 identity fields may appear as hex runs.
-    let metrics =
-        read_json(&root.join("expected/m1-small-set-anchor-aware-results-v2.sanitized.json"));
     let mut strings = Vec::new();
-    collect_strings(&metrics, &mut strings);
+    for sanitized in [
+        "expected/m1-small-set-anchor-aware-results-v2.sanitized.json",
+        "release/release-comparison-v1.sanitized.json",
+    ] {
+        collect_strings(&read_json(&root.join(sanitized)), &mut strings);
+    }
     for s in &strings {
         for len in hex_runs(s) {
             assert_ne!(len, 24, "possible private sessionId stem in {s:?}");
