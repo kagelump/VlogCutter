@@ -87,17 +87,17 @@ impl Fixture {
         )
         .unwrap();
         connection.execute(
-                "INSERT INTO media_objects(media_object_id,size_bytes,full_content_hash,verification_state,created_at,updated_at) VALUES(?1,?2,?3,'verified',?4,?4)",
-                rusqlite::params!["media_http_fixture", bytes.len() as i64, "a".repeat(64), now],
-            ).unwrap();
+            "INSERT INTO media_objects(media_object_id,size_bytes,full_content_hash,verification_state,created_at,updated_at) VALUES(?1,?2,?3,'verified',?4,?4)",
+            rusqlite::params!["media_http_fixture", bytes.len() as i64, "a".repeat(64), now],
+        ).unwrap();
         connection.execute(
-                "INSERT INTO representations(representation_id,media_object_id,source_content_hash,source_size_bytes,kind,recipe_key,settings_identity,state,output_content_hash,byte_length,content_type,created_at,completed_at,updated_at) VALUES(?1,'media_http_fixture',?2,?3,'proxy','proxy.h264-720p.orientation-v3',?4,'available',?5,?3,'video/mp4',?6,?6,?6)",
-                rusqlite::params![id.as_str(), "a".repeat(64), bytes.len() as i64, "b".repeat(64), blake3::hash(bytes).to_hex().to_string(), now],
-            ).unwrap();
+            "INSERT INTO representations(representation_id,media_object_id,source_content_hash,source_size_bytes,kind,recipe_key,settings_identity,state,output_content_hash,byte_length,content_type,created_at,completed_at,updated_at) VALUES(?1,'media_http_fixture',?2,?3,'proxy','proxy.h264-720p.orientation-v3',?4,'available',?5,?3,'video/mp4',?6,?6,?6)",
+            rusqlite::params![id.as_str(), "a".repeat(64), bytes.len() as i64, "b".repeat(64), blake3::hash(bytes).to_hex().to_string(), now],
+        ).unwrap();
         connection.execute(
-                "INSERT INTO representation_locations(representation_id,node_id,location_kind,location_key,relative_path,state,verified_at,updated_at) VALUES(?1,?2,'shared_derived',?3,?3,'available',?4,?4)",
-                rusqlite::params![id.as_str(), self.foundation.catalog().node_id().as_str(), relative, now],
-            ).unwrap();
+            "INSERT INTO representation_locations(representation_id,node_id,location_kind,location_key,relative_path,state,verified_at,updated_at) VALUES(?1,?2,'shared_derived',?3,?3,'available',?4,?4)",
+            rusqlite::params![id.as_str(), self.foundation.catalog().node_id().as_str(), relative, now],
+        ).unwrap();
         id
     }
 }
@@ -1631,18 +1631,18 @@ async fn representation_batch_skips_unverified_sources_instead_of_enqueuing() {
         })
         .unwrap();
     let response = fixture
-            .app()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/v1/admin/representations/batch")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::from(r#"{"mediaObjectIds":["media_unverified_admin"],"kind":"proxy","idempotencyKey":"batch-1"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        .app()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/representations/batch")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(r#"{"mediaObjectIds":["media_unverified_admin"],"kind":"proxy","idempotencyKey":"batch-1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let body = json(response).await;
     assert_eq!(body["queuedCount"], 0);
@@ -2216,16 +2216,16 @@ async fn review_session_routes_record_hashed_chunks_finalize_and_delete_privatel
     assert_eq!(json(corrupt).await["code"], "review_session_chunk_corrupt");
 
     let cue = fixture
-            .app()
-            .oneshot(send(
-                Method::POST,
-                format!("{base}/{id}/events"),
-                "application/json",
-                serde_json::to_vec(&serde_json::json!({"eventId":"cue_1","kind":"manualSyncCue","audioFrame":2400,"performanceMs":60.0,"declaredMovieSeconds":0.0})).unwrap(),
-                Some(&csrf),
-            ))
-            .await
-            .unwrap();
+        .app()
+        .oneshot(send(
+            Method::POST,
+            format!("{base}/{id}/events"),
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({"eventId":"cue_1","kind":"manualSyncCue","audioFrame":2400,"performanceMs":60.0,"declaredMovieSeconds":0.0})).unwrap(),
+            Some(&csrf),
+        ))
+        .await
+        .unwrap();
     assert_eq!(cue.status(), StatusCode::OK);
 
     let early_audio = fixture
@@ -2369,12 +2369,12 @@ async fn review_transcription_routes_refuse_unauthorized_cloud_dispatch() {
         .review_target_id;
     let sessions = fixture.foundation.catalog().review_sessions(0);
     let recording = sessions.create(&project_id, &serde_json::from_value(serde_json::json!({
-            "reviewTargetId": target, "clientSessionKey": "http_asr",
-            "consent": {"allPresentAcknowledged": true, "additionalSpeakersDisclosed": false},
-            "audio": {"sampleRate": 48000, "channels": 1, "encoding": "pcm_s16le"},
-            "capture": {"echoCancellation": false, "noiseSuppression": false, "autoGainControl": false, "clock": "audioWorkletCurrentFrame", "baseLatencySeconds": null, "userAgentFamily": null},
-            "clientStartedPerformanceMs": null
-        })).unwrap(), &actor, chrono::Utc::now()).unwrap().summary.session_id;
+        "reviewTargetId": target, "clientSessionKey": "http_asr",
+        "consent": {"allPresentAcknowledged": true, "additionalSpeakersDisclosed": false},
+        "audio": {"sampleRate": 48000, "channels": 1, "encoding": "pcm_s16le"},
+        "capture": {"echoCancellation": false, "noiseSuppression": false, "autoGainControl": false, "clock": "audioWorkletCurrentFrame", "baseLatencySeconds": null, "userAgentFamily": null},
+        "clientStartedPerformanceMs": null
+    })).unwrap(), &actor, chrono::Utc::now()).unwrap().summary.session_id;
     let pcm = vec![0_u8; 9600];
     use sha2::Digest;
     let sha: String = sha2::Sha256::digest(&pcm)

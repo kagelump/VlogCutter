@@ -907,12 +907,12 @@ fn opens_existing_catalogs_without_mutating_unrelated_databases() {
     assert!(Catalog::open_existing(&unrelated_path).is_err());
     let unrelated = Connection::open(&unrelated_path).unwrap();
     let vlog_tables: i64 = unrelated
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('projects', 'assets')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('projects', 'assets')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(vlog_tables, 0);
     assert!(Catalog::open_existing(directory.path().join("missing.sqlite3")).is_err());
 }
@@ -1001,15 +1001,15 @@ fn migrates_legacy_catalogs_to_labels_removal_and_landscape_orientation() {
     assert!(asset_column_exists(&migrated, "removed").unwrap());
     assert!(asset_column_exists(&migrated, "media_object_id").unwrap());
     assert_eq!(
-            migrated
-                .query_row(
-                    "SELECT path FROM asset_thumbnails WHERE asset_id = 'asset_portrait' AND quality = 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "/legacy/cache/asset_portrait/q1.v2.jpg"
-        );
+        migrated
+            .query_row(
+                "SELECT path FROM asset_thumbnails WHERE asset_id = 'asset_portrait' AND quality = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "/legacy/cache/asset_portrait/q1.v2.jpg"
+    );
     let migration_count = migrated
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
             row.get::<_, i64>(0)
@@ -1085,13 +1085,13 @@ fn unversioned_current_catalog_upgrades_once_without_changing_ids_or_annotations
         )
         .unwrap();
     catalog.connection().unwrap().execute(
-            "INSERT INTO moment_artifacts(asset_id,identity,body_json,created_at) VALUES ('asset_existing','base-identity','{\"preserved\":\"artifact\"}','artifact-created')",
-            [],
-        ).unwrap();
+        "INSERT INTO moment_artifacts(asset_id,identity,body_json,created_at) VALUES ('asset_existing','base-identity','{\"preserved\":\"artifact\"}','artifact-created')",
+        [],
+    ).unwrap();
     catalog.connection().unwrap().execute(
-            "INSERT INTO moment_steps(asset_id,identity,step_key,body_json,created_at) VALUES ('asset_existing','base-identity','coarse:0','{\"preserved\":\"step\"}','step-created')",
-            [],
-        ).unwrap();
+        "INSERT INTO moment_steps(asset_id,identity,step_key,body_json,created_at) VALUES ('asset_existing','base-identity','coarse:0','{\"preserved\":\"step\"}','step-created')",
+        [],
+    ).unwrap();
     let expected_moment_rows = moment_rows(&catalog);
     assert_eq!(expected_moment_rows.2, 1);
     assert_eq!(expected_moment_rows.3, 1);
@@ -1198,9 +1198,9 @@ fn migration_four_upgrades_to_operation_baselines_without_inventing_history() {
         assert!(table_exists(&connection, table).unwrap(), "{table}");
     }
     assert_eq!(
-            connection.query_row("SELECT revision FROM materialized_revisions WHERE project_id='project_v4' AND aggregate_type='clock' AND aggregate_id='DJI'", [], |row| row.get::<_, i64>(0)).unwrap(),
-            1
-        );
+        connection.query_row("SELECT revision FROM materialized_revisions WHERE project_id='project_v4' AND aggregate_type='clock' AND aggregate_id='DJI'", [], |row| row.get::<_, i64>(0)).unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -1209,15 +1209,15 @@ fn writable_open_rejects_a_newer_catalog_with_an_actionable_error() {
     let path = directory.path().join("catalog.sqlite3");
     drop(Catalog::open(&path).unwrap());
     Connection::open(&path)
-            .unwrap()
-            .execute(
-                "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (?1, 'future', ?2, '2026-07-20T00:00:00.000Z')",
-                params![
-                    PROJECT_CATALOG_SCHEMA_VERSION + 1,
-                    format!("future/{}", PROJECT_CATALOG_SCHEMA_VERSION + 1)
-                ],
-            )
-            .unwrap();
+        .unwrap()
+        .execute(
+            "INSERT INTO schema_migrations (migration_id, name, source_identity, applied_at) VALUES (?1, 'future', ?2, '2026-07-20T00:00:00.000Z')",
+            params![
+                PROJECT_CATALOG_SCHEMA_VERSION + 1,
+                format!("future/{}", PROJECT_CATALOG_SCHEMA_VERSION + 1)
+            ],
+        )
+        .unwrap();
 
     let inspection = inspect_catalog(&path).unwrap();
     assert_eq!(
@@ -1253,12 +1253,12 @@ fn changed_migration_name_or_source_identity_is_inspectable_but_not_writable() {
         let path = directory.path().join("catalog.sqlite3");
         drop(Catalog::open(&path).unwrap());
         Connection::open(&path)
-                .unwrap()
-                .execute(
-                    "UPDATE schema_migrations SET name = ?1, source_identity = ?2 WHERE migration_id = 1",
-                    params![stored_name, stored_source_identity],
-                )
-                .unwrap();
+            .unwrap()
+            .execute(
+                "UPDATE schema_migrations SET name = ?1, source_identity = ?2 WHERE migration_id = 1",
+                params![stored_name, stored_source_identity],
+            )
+            .unwrap();
 
         let before = inspect_catalog(&path).unwrap();
         assert_eq!(
@@ -1478,9 +1478,9 @@ fn orientation_evidence_decodes_asymmetric_raw_and_effective_pixels() {
     catalog.ingest_file(&project.id, &source).unwrap();
     let asset = catalog.list_assets(&project.id).unwrap().remove(0);
     catalog.connection().unwrap().execute(
-            "UPDATE assets SET metadata_rotation_degrees=90,default_rotation_degrees=90,rotation_degrees=90,orientation_probed=0 WHERE id=?1",
-            [&asset.id],
-        ).unwrap();
+        "UPDATE assets SET metadata_rotation_degrees=90,default_rotation_degrees=90,rotation_degrees=90,orientation_probed=0 WHERE id=?1",
+        [&asset.id],
+    ).unwrap();
     let asset = catalog
         .decide_orientation(
             &asset.id,
@@ -1501,9 +1501,9 @@ fn orientation_evidence_decodes_asymmetric_raw_and_effective_pixels() {
         .unwrap();
     let asset = catalog.refresh_asset_orientation(&asset.id).unwrap();
     catalog.connection().unwrap().execute(
-            "UPDATE assets SET metadata_rotation_degrees=90,default_rotation_degrees=90,rotation_degrees=90 WHERE id=?1",
-            [&asset.id],
-        ).unwrap();
+        "UPDATE assets SET metadata_rotation_degrees=90,default_rotation_degrees=90,rotation_degrees=90 WHERE id=?1",
+        [&asset.id],
+    ).unwrap();
     let asset = catalog.get_asset(&asset.id).unwrap();
     assert_eq!(asset.rotation_degrees, 90);
     assert_eq!(
@@ -3449,36 +3449,36 @@ fn ledger_linked_chronology_cache_is_not_reclassified_as_untracked_legacy_spend(
         )
         .unwrap();
     catalog
-            .connection()
-            .unwrap()
-            .execute(
-                "INSERT INTO analysis_chronology_suggestions(
+        .connection()
+        .unwrap()
+        .execute(
+            "INSERT INTO analysis_chronology_suggestions(
                     request_key,project_id,facts_revision,status,result_json,model,attempts,
                     cost_usd,prompt_tokens,completion_tokens,latency_ms,created_at,updated_at)
                  VALUES('ledger-owned-cache',?1,'rev','completed',?2,'model',1,0.001,1,1,1,?3,?3)",
-                params![
-                    project.id,
-                    serde_json::json!({"provenance":{"usageComplete":true,"runId":run_id,"requestKeys":[request.request_key]}}).to_string(),
-                    now()
-                ],
-            )
-            .unwrap();
+            params![
+                project.id,
+                serde_json::json!({"provenance":{"usageComplete":true,"runId":run_id,"requestKeys":[request.request_key]}}).to_string(),
+                now()
+            ],
+        )
+        .unwrap();
     let foreign = catalog.create_project("foreign cache owner").unwrap();
     catalog
-            .connection()
-            .unwrap()
-            .execute(
-                "INSERT INTO analysis_chronology_suggestions(
+        .connection()
+        .unwrap()
+        .execute(
+            "INSERT INTO analysis_chronology_suggestions(
                 request_key,project_id,facts_revision,status,result_json,created_at,updated_at)
              VALUES('foreign-cache',?1,'rev','completed',?2,?3,?3)",
-                params![
-                    foreign.id,
-                    serde_json::json!({"provenance":{"runId":run_id,"requestKeys":[request.request_key]}})
-                        .to_string(),
-                    now()
-                ],
-            )
-            .unwrap();
+            params![
+                foreign.id,
+                serde_json::json!({"provenance":{"runId":run_id,"requestKeys":[request.request_key]}})
+                    .to_string(),
+                now()
+            ],
+        )
+        .unwrap();
     assert!(
         catalog
             .associate_analysis_request_cache_result(&request.request_key, "foreign-cache")
@@ -3524,10 +3524,10 @@ fn ledger_linked_chronology_cache_is_not_reclassified_as_untracked_legacy_spend(
         .collect::<Vec<String>>()
         .join(",");
     connection.execute(&format!(
-            "WITH RECURSIVE padding(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM padding WHERE n<1001)
+        "WITH RECURSIVE padding(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM padding WHERE n<1001)
              INSERT INTO analysis_request_reservations({}) SELECT {} FROM analysis_request_reservations,padding WHERE request_key=?1",
-            columns.join(","), selection
-        ), params![request.request_key, other_run]).unwrap();
+        columns.join(","), selection
+    ), params![request.request_key, other_run]).unwrap();
     let summary = catalog
         .analysis_operation_accounting_summary(
             &project.id,
@@ -4055,14 +4055,14 @@ fn chronology_catalog_legacy_pending_cache_remains_unknown_and_blocks_dispatch()
     );
     assert!(provider.calls().is_empty());
     let (status, result_json): (String, String) = catalog
-            .connection()
-            .unwrap()
-            .query_row(
-                "SELECT status,result_json FROM analysis_chronology_suggestions WHERE request_key='legacy-pending'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT status,result_json FROM analysis_chronology_suggestions WHERE request_key='legacy-pending'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
     assert_eq!(status, "running");
     assert!(result_json.is_empty());
     assert!(
@@ -4480,12 +4480,12 @@ fn chronology_completed_cache_and_links_roll_back_together_on_association_failur
         .is_err()
     );
     let cache_rows: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM analysis_chronology_suggestions WHERE request_key='atomic-cache-result'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        .query_row(
+            "SELECT COUNT(*) FROM analysis_chronology_suggestions WHERE request_key='atomic-cache-result'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(cache_rows, 0);
     let link_rows: i64 = connection
         .query_row(
