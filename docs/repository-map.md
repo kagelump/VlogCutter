@@ -1,7 +1,5 @@
 # Repository map
 
-Relocated verbatim from the repository-root `AGENTS.md` section 4 so the root file can stay a short index (issue #260).
-
 ```text
 .
 ├── AGENTS.md                         # This operational handoff

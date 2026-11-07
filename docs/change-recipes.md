@@ -1,7 +1,5 @@
 # Change recipes
 
-Relocated verbatim from the repository-root `AGENTS.md` section 14 so the root file can stay a short index (issue #260).
-
 ## Add a new domain operation
 
 1. Add or change canonical types and validation in `rcdvlog-core`.

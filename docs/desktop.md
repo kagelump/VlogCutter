@@ -1,7 +1,5 @@
 # Desktop app reference
 
-Relocated verbatim from the repository-root `AGENTS.md` (sections 7, 8, and 10) when the project pivoted to an agent-driven AI editing assistant (November 2026). The macOS desktop app is de-emphasized in favor of the agent CLI and companion web server, but it still ships, and the security rules below still hold. Some references are to planning documents that no longer exist; git history has them.
-
 See also [desktop-ui-conventions.md](desktop-ui-conventions.md) and [desktop/HARD_LESSONS.md](desktop/HARD_LESSONS.md).
 
 ## 7. Running the app

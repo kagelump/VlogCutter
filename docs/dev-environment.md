@@ -1,7 +1,5 @@
 # Development environment and running the app
 
-Relocated verbatim from the repository-root `AGENTS.md` sections 6 ("Toolchain and prerequisites") and 7 ("Running the app") so the root file can stay a short index (issue #260). Rules that must not be violated (fixed ports, debug-only seams, media-origin security) are repeated inline in `AGENTS.md`.
-
 ## Toolchain and prerequisites
 
 Minimum documented environment:

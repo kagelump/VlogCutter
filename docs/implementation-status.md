@@ -1,6 +1,6 @@
 # Implementation status
 
-Only the surprising parts; read the code for everything else. Versions: project schema 66, server control schema 17, sync protocol 1.0, backup format 1.
+Versions: project schema 66, server control schema 17, sync protocol 1.0, backup format 1.
 
 - **Legacy desktop surface.** Labels, notes, the review queue, the story ribbon and the Chronology desk are leftovers from the desktop-first CUJ. They still work, but they are not the direction (see [desktop.md](desktop.md)).
 - **No project-local agent workspace yet** (#48). The CLI only binds/checks `.vlogcutter/cli-binding.json`; nothing generates `PROJECT.md`, `script.md` or `edit-plan.json`.

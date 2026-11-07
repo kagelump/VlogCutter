@@ -1,7 +1,5 @@
 # Engineering reference
 
-Relocated verbatim from the repository-root `AGENTS.md` (sections 1, 2, 5, 9, and 11 through 16) when the project pivoted to an agent-driven AI editing assistant (November 2026). `AGENTS.md` now keeps only the essentials. This file is detailed background. Where it describes a human labeling workflow or a desktop-centered CUJ, the root `AGENTS.md` scope wins. Some references are to planning documents (`PRD.md`, `docs/tasks/`) that no longer exist; git history has them.
-
 ## 1. Product in one paragraph
 
 RCD VlogCutter is a local-first, single-user footage labeling system. The macOS desktop references immutable originals in place, except that its explicit card-import workflow may copy from a read-only removable card into a named create-only archive root, and keeps one laptop-local SQLite catalog per project. The optional private Ubuntu companion server keeps its own local-SSD control catalog and project replicas, indexes read-only NAS roots, runs durable media jobs, serves Chrome review/admin, synchronizes immutable project operations, and creates verified backups. The Mac remains useful offline and neither node shares live SQLite files.

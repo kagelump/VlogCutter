@@ -1,7 +1,5 @@
 # Core data, media and analysis reference
 
-Relocated verbatim from the repository-root `AGENTS.md` section 9 ("Core data and media behavior") so the root file can stay a short index (issue #260). This file holds the full text, recipes and measurements.
-
 ## Assets and patches
 
 `Asset` is defined canonically in `core/rcdvlog-core/src/lib.rs` and mirrored in `apps/desktop/src/types.ts`. Availability is computed on read:

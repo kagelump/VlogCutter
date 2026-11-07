@@ -1,6 +1,6 @@
 # Desktop UI conventions
 
-Relocated verbatim from the repository-root `AGENTS.md` section 10 ("Desktop UI conventions") so the root file can stay a short index (issue #260). The keyboard contract is in [desktop.md](desktop.md).
+Keyboard contract: [desktop.md](desktop.md).
 
 The UI is intentionally keyboard-first and dense, using one main `App.tsx` today. Keep domain logic out of it even if component extraction is useful.
 
