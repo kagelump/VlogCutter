@@ -18,7 +18,10 @@
 │   ├── server/                       # Axum runtime, admin CLI, HTTP/process tests
 │   └── web/                          # Authenticated Chrome review/admin app
 ├── core/
-│   ├── rcdvlog-core/src/lib.rs       # Canonical catalog, media, annotation, chronology logic
+│   ├── rcdvlog-core/src/lib.rs       # Module map and public re-exports
+│   ├── rcdvlog-core/src/catalog/     # `Catalog` methods: ingest, proxies, thumbnails, speech, analysis, chronology
+│   ├── rcdvlog-core/src/types.rs     # Public catalog data types (`Asset`, reports, progress)
+│   ├── rcdvlog-core/src/media.rs     # ffprobe/ExifTool probing, timestamps, fingerprints
 │   ├── rcdvlog-core/src/operations.rs # Typed operations, HLC, materialization, conflicts
 │   ├── rcdvlog-server/               # Server catalog, storage, jobs, auth, media, backup
 │   ├── rcdvlog-sync/                 # Baseline/reconciliation DTOs and apply logic

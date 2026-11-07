@@ -382,7 +382,7 @@ export function createInitialState(clock: HarnessClock): DesktopHarnessState {
  *
  *   ORDER BY best_time IS NULL, best_time, filename, id
  *
- * (`core/rcdvlog-core/src/lib.rs`, `list_assets`). Returning insertion order
+ * (`core/rcdvlog-core/src/catalog/assets.rs`, `list_assets`). Returning insertion order
  * instead would quietly give every CUJ a different queue than the real app.
  */
 export function projectAssets(state: DesktopHarnessState, projectId: string): Asset[] {

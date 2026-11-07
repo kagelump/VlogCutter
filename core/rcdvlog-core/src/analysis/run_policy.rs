@@ -5328,7 +5328,10 @@ mod recovery_tests {
             crate::analysis::vlm_store::load_analysis(&catalog.connection().unwrap(), &asset_id)
                 .unwrap()
                 .unwrap();
-        assert_eq!(saved.status, crate::AnalysisStatus::Rejected);
+        assert_eq!(
+            saved.status,
+            crate::analysis::vlm_store::AnalysisStatus::Rejected
+        );
         assert_eq!(saved.model, FALLBACK_MODEL);
 
         let repeat = ModelScriptProvider::new(0.01, |model, call| {
