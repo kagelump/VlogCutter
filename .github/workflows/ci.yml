@@ -131,6 +131,10 @@ jobs:
         uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
+      # Same check developers and the gate run; fails in seconds with the fix
+      # instead of hundreds of opaque fixture failures. Lint never runs nextest.
+      - name: Preflight (pinned toolchain and media tools)
+        run: node scripts/dev-preflight.mjs ${{ matrix.gate == 'lint' && '--skip nextest' || '' }}
       - name: cargo nextest run --workspace (shard ${{ matrix.shard }}/4)
         if: ${{ !cancelled() && matrix.gate == 'tests' }}
         run: |
@@ -346,6 +350,9 @@ jobs:
           fi
           ffmpeg -version | head -n 1
           ffprobe -version | head -n 1
+
+      - name: Preflight (pinned toolchain and media tools)
+        run: node scripts/dev-preflight.mjs --skip nextest
 
       # Prunes the target directory before saving, which plain `actions/cache`
       # cannot do — see the workflow README. `cache-on-failure` matters here

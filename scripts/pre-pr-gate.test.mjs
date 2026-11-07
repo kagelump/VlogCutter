@@ -55,7 +55,7 @@ function runScenario(name, { fail, missingCargo = false, emptyTests = false, wro
     }
     return { status: 0, stdout: "", stderr: "" };
   };
-  const code = runGate({ args: ["--scope", "pre-pr"], spawn, write: (chunk) => { output += chunk; } });
+  const code = runGate({ args: ["--scope", "pre-pr"], spawn, preflight: () => true, write: (chunk) => { output += chunk; } });
   return { code, output };
 }
 
@@ -79,7 +79,7 @@ test("local scope requires and runs structured focused checks after baseline che
     writeFileSync(file, JSON.stringify({ checks: [{ name: "focused case", command: "node", args: ["--test", "focused.test.mjs"] }] }));
     const calls = [];
     const output = [];
-    const code = runGate({ args: ["--checks", file], spawn: (command, args) => {
+    const code = runGate({ args: ["--checks", file], preflight: () => true, spawn: (command, args) => {
       calls.push([command, args]);
       if (command === "rustc") return { status: 0, stdout: "rustc 1.97.1 (fake)", stderr: "" };
       return { status: 0, stdout: "", stderr: "" };
@@ -99,7 +99,7 @@ test("local scope rejects missing, malformed, empty, and invalid plans before ch
     const invalidArgs = join(dir, "args.json"); writeFileSync(invalidArgs, JSON.stringify({ checks: [{ name: "bad", command: "node", args: [1] }] }));
     for (const args of [[], ["--checks", empty], ["--checks", malformed], ["--checks", join(dir, "missing.json")], ["--checks", invalidCommand], ["--checks", invalidArgs], ["--checks", empty, "--checks", empty]]) {
       let called = false;
-      assert.equal(runGate({ args, spawn: () => { called = true; return { status: 0 }; }, write: () => {} }), 2);
+      assert.equal(runGate({ args, spawn: () => { called = true; return { status: 0 }; }, preflight: () => true, write: () => {} }), 2);
       assert.equal(called, false);
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -111,7 +111,7 @@ test("local focused cargo test requires at least one reported executed test", ()
     const file = join(dir, "checks.json");
     writeFileSync(file, JSON.stringify({ checks: [{ name: "focused cargo test", command: "cargo", args: ["test", "-p", "fixture"] }] }));
     const output = [];
-    const code = runGate({ args: ["--checks", file], spawn: (command, args) => {
+    const code = runGate({ args: ["--checks", file], preflight: () => true, spawn: (command, args) => {
       if (command === "rustc") return { status: 0, stdout: "rustc 1.97.1 (fake)", stderr: "" };
       if (command === "cargo" && args[0] === "test") return { status: 0, stdout: "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out", stderr: "" };
       return { status: 0, stdout: "", stderr: "" };
@@ -184,4 +184,19 @@ after(() => {
   assert.ok(observedScenarios.size > 0, "the focused regression helper must execute tests");
   assert.equal(expectedScenarios.length, 10, "the regression matrix must retain its expected minimum test count");
   assert.deepEqual([...observedScenarios].sort(), [...expectedScenarios].sort(), "every expected named scenario must execute");
+});
+
+test("a failing preflight stops the gate before any check runs", () => {
+  let spawned = false;
+  let output = "";
+  const code = runGate({
+    args: ["--scope", "pre-pr"],
+    spawn: () => { spawned = true; return { status: 0, stdout: "", stderr: "" }; },
+    preflight: (write) => { write("FAIL nextest: cargo-nextest is not installed\n"); return false; },
+    write: (chunk) => { output += chunk; },
+  });
+  assert.equal(code, 1);
+  assert.equal(spawned, false, "no slow check may start after a failed preflight");
+  assert.match(output, /FAIL nextest/);
+  assert.match(output, /Gate summary \(pre-pr\): stopped by preflight/);
 });

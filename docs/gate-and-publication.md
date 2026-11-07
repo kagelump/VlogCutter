@@ -2,8 +2,10 @@
 
 Relocated verbatim from the repository-root `AGENTS.md` section 12 ("Testing and verification") so the root file can stay a short index (issue #260). The gate table and the CI/doc drift rule stay inline in `AGENTS.md`.
 
-Use `pnpm gate --scope fast` for a quick iteration check. The default local
-gate requires a JSON focused-check plan and runs the candidate diff checks,
+Every gate scope starts with `pnpm preflight` (see
+[dev-environment.md](dev-environment.md)) and stops before any slow check if a
+pinned tool is missing or wrong. Use `pnpm gate --scope fast` for a quick
+iteration check. The default local gate requires a JSON focused-check plan and runs the candidate diff checks,
 pinned formatter/toolchain, workspace Clippy, frontend typecheck, and the
 named checks in that plan. For example, save
 `{"checks":[{"name":"migration test","command":"pnpm","args":["test:focused","rcdvlog-core","migrations::tests::the_schema_version_constant_tracks_the_migration_list"]}]}`

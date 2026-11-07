@@ -8,7 +8,7 @@ The current product supports desktop project creation/opening, preflighted card 
 
 - Desktop development: Apple Silicon Mac, macOS 13+, Xcode command-line tools
 - Rust 1.85+, Node.js 22+, pnpm 10
-- FFmpeg 7+ with ffprobe, and ExifTool
+- FFmpeg 6.1+ (with libx264) and ffprobe, and ExifTool; `pnpm preflight` checks the pinned toolchain
 - Companion deployment: Ubuntu 24.04 x86-64 with Docker Engine/Compose and a host-mounted NFS (preferred) or SMB original-media share
 
 The Task 19 acceptance environment used Rust 1.97.1, Node 24.14, FFmpeg/ffprobe 8.1.2, ExifTool 13.36, and Chrome 150. See the [acceptance report](docs/tasks/server/ACCEPTANCE_TASK_19.md) for exactly what ran and which target-topology checks remain open.

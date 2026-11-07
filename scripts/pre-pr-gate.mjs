@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { runPreflight } from "./dev-preflight.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ci = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
@@ -11,7 +12,14 @@ const toolchainMatch = ci.match(/^  RUST_TOOLCHAIN: "([^"]+)"$/m);
 if (!toolchainMatch) throw new Error("Cannot determine pinned RUST_TOOLCHAIN from .github/workflows/ci.yml");
 const rustToolchain = toolchainMatch[1];
 
-export function runGate({ args = process.argv.slice(2), spawn = spawnSync, write = (value) => process.stdout.write(value) } = {}) {
+export function runGate({
+  args = process.argv.slice(2),
+  spawn = spawnSync,
+  write = (value) => process.stdout.write(value),
+  // Runs before any check so a missing or wrong tool fails in about a second,
+  // not after minutes of clippy. Returns true when the toolchain is usable.
+  preflight = (output) => runPreflight({ root, write: output }).ok,
+} = {}) {
   let scope = "local";
   let checksPath;
   let scopeSeen = false;
@@ -59,6 +67,11 @@ export function runGate({ args = process.argv.slice(2), spawn = spawnSync, write
   } else if (checksPath) {
     write("--checks is only valid with --scope local.\n");
     return 2;
+  }
+
+  if (!preflight(write)) {
+    write(`\nGate summary (${scope}): stopped by preflight; fix the FAIL lines above (\`pnpm preflight\` reruns just this).\n`);
+    return 1;
   }
 
   const rust = (name, argv) => ({ name, command: "cargo", args: [`+${rustToolchain}`, ...argv] });
