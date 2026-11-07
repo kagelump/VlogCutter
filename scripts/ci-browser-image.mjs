@@ -1,6 +1,4 @@
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
 export function browserImageVersion(lock, workflow) {
   const versions = [...lock.matchAll(/^\s+'?@playwright\/test@([\d.]+)'?:/gm)].map((m) => m[1]);
@@ -14,7 +12,8 @@ export function browserImageVersion(lock, workflow) {
   }
   return images[0][1];
 }
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// import.meta.main survives symlinked paths (macOS /var -> /private/var).
+if (import.meta.main) {
   const version = browserImageVersion(
     readFileSync(new URL("../pnpm-lock.yaml", import.meta.url), "utf8"),
     readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"),

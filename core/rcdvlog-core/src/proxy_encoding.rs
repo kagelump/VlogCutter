@@ -466,9 +466,8 @@ fn cached_linux_auto_probe(ffmpeg: &Path, ffprobe: &Path) -> ProxyEncoderProbeRe
     report
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn clear_proxy_encoder_probe_cache() {
-    #[cfg(target_os = "linux")]
     if let Ok(mut guard) = shared_auto_probe_cache().lock() {
         *guard = None;
     }
@@ -1575,6 +1574,7 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+#[cfg(target_os = "linux")]
 fn redact_probe_error(value: &str) -> String {
     let redacted = crate::redact_media_diagnostic(
         value,

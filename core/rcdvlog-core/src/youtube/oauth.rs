@@ -340,6 +340,11 @@ pub(super) fn receive_callback(
                 if remaining.is_zero() {
                     break;
                 }
+                // On macOS/BSD the accepted socket inherits the listener's
+                // O_NONBLOCK; without this a request whose bytes arrive just
+                // after the connection reads as WouldBlock and is rejected,
+                // and the read timeout below would never apply.
+                stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(remaining.min(Duration::from_secs(2))))?;
                 stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                 match callback(&mut stream, route, state) {

@@ -10466,7 +10466,12 @@ pub(crate) mod tests {
                 .resolve_camera_proxy_for_review(&asset_ids[i])
                 .unwrap()
                 .unwrap();
-            assert_eq!(offline.path, sidecars[i].1.to_string_lossy());
+            // Registration records the canonical sidecar path (macOS temp dirs
+            // sit behind the `/var` -> `/private/var` symlink).
+            assert_eq!(
+                offline.path,
+                fs::canonicalize(&sidecars[i].1).unwrap().to_string_lossy()
+            );
             fs::write(&sidecars[i].2, &original_before).unwrap();
             let mut changed = before.clone();
             changed.push(0);

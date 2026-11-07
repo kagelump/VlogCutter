@@ -15,6 +15,7 @@
     "check:deployment": "node scripts/check-server-deployment.mjs",
     "check:docs": "node scripts/check-docs.mjs",
     "gate": "node scripts/pre-pr-gate.mjs",
+    "preflight": "node scripts/dev-preflight.mjs",
     "publish:after-gate": "node scripts/publish-after-gate.mjs",
     "test:focused": "node scripts/run-focused-test.mjs",
     "generate:openapi": "node scripts/sync-openapi.mjs",

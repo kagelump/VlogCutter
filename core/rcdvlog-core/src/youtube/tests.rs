@@ -80,7 +80,12 @@ fn mock(steps: Vec<Step>) -> (Endpoints, Client, JoinHandle<()>) {
             let deadline = Instant::now() + Duration::from_secs(15);
             let mut socket = loop {
                 match listener.accept() {
-                    Ok((socket, _)) => break socket,
+                    // macOS/BSD accepted sockets inherit the listener's
+                    // O_NONBLOCK (Linux does not); reads here must block.
+                    Ok((socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
+                        break socket;
+                    }
                     Err(error)
                         if error.kind() == std::io::ErrorKind::WouldBlock
                             && Instant::now() < deadline =>
@@ -209,6 +214,29 @@ fn authorization_requests_only_upload_with_offline_consent_and_rfc_pkce() {
     assert_eq!(pairs["access_type"], "offline");
     assert_eq!(pairs["include_granted_scopes"], "false");
     assert!(pairs["prompt"].contains("consent"));
+}
+
+#[test]
+fn callback_accepts_a_request_whose_bytes_arrive_after_the_connection() {
+    // A browser, or a proxy such as Tailscale Serve, may connect before it
+    // sends the request line. On macOS the accepted socket inherits the
+    // listener's non-blocking mode, so this must not read as WouldBlock.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let receiver = thread::spawn(move || {
+        oauth::receive_code(&listener, "right", Duration::from_secs(5)).unwrap()
+    });
+    let mut stream = TcpStream::connect(address).unwrap();
+    thread::sleep(Duration::from_millis(300));
+    write!(
+        stream,
+        "GET /oauth/callback?state=right&code=late HTTP/1.1\r\nHost: {address}\r\n\r\n"
+    )
+    .unwrap();
+    let mut page = String::new();
+    stream.read_to_string(&mut page).unwrap();
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert_eq!(receiver.join().unwrap(), "late");
 }
 
 #[test]

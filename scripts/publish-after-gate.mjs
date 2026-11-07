@@ -93,6 +93,7 @@ export function publishAfterGate({ action, gate = runGate, gateArgs = [], spawn 
   return 0;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// import.meta.main survives symlinked paths (macOS /var -> /private/var).
+if (import.meta.main) {
   process.exitCode = publishAfterGate({ action: process.argv[2], gateArgs: process.argv.slice(3) });
 }

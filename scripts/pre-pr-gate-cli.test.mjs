@@ -7,6 +7,23 @@ import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const source = fileURLToPath(new URL("./pre-pr-gate.mjs", import.meta.url));
+const preflightSource = fileURLToPath(new URL("./dev-preflight.mjs", import.meta.url));
+
+// The gate imports the preflight, which reads pins from ci.yml and the FFmpeg
+// floor from prerequisites.rs, then probes these tools. Pin Node to the running
+// interpreter so the fixture passes on any host.
+function writePreflightFixture(temp, bin) {
+  copyFileSync(preflightSource, join(temp, "scripts", "dev-preflight.mjs"));
+  writeFileSync(join(temp, ".github", "workflows", "ci.yml"), `env:\n  RUST_TOOLCHAIN: "1.97.1"\n  NODE_VERSION: "${process.versions.node}"\n  PNPM_VERSION: "10.17.0"\n  NEXTEST_VERSION: "0.9.151"\n`);
+  mkdirSync(join(temp, "core", "rcdvlog-core", "src"), { recursive: true });
+  writeFileSync(join(temp, "core", "rcdvlog-core", "src", "prerequisites.rs"), "pub const MINIMUM_FFMPEG: (u32, u32) = (6, 1);\n");
+  const tools = {
+    ffmpeg: `case "$2" in\n  -version) echo "ffmpeg version 7.1.3";;\n  -encoders) printf ' V....D libx264  x\\n A....D aac  x\\n';;\nesac`,
+    ffprobe: 'echo "ffprobe version 7.1.3"',
+    exiftool: 'echo "13.36"',
+  };
+  for (const [name, body] of Object.entries(tools)) writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+}
 const expected = ["valid CLI pass", "format command failure", "clippy command failure", "test command failure preserves output", "frontend command failure", "missing command fails closed", "clean committed candidate with whitespace fails", "default local requires plan", "structured local plan runs", "failed focused check blocks gate"];
 const observed = new Set();
 
@@ -20,7 +37,7 @@ function runCli(name, { fail = "", omit = "", args = ["--scope", "pre-pr"], plan
   mkdirSync(workflow, { recursive: true });
   mkdirSync(bin);
   copyFileSync(source, join(scripts, "pre-pr-gate.mjs"));
-  writeFileSync(join(workflow, "ci.yml"), 'env:\n  RUST_TOOLCHAIN: "1.97.1"\n');
+  writePreflightFixture(temp, bin);
   if (plan) writeFileSync(join(temp, "checks.json"), JSON.stringify(plan));
 
   const commands = {
@@ -28,9 +45,11 @@ function runCli(name, { fail = "", omit = "", args = ["--scope", "pre-pr"], plan
     rustc: '#!/bin/sh\necho "rustc 1.97.1 (fake)"\n',
     cargo: `#!/bin/sh
 case "$2" in
+  --version) echo "cargo 1.97.1 (fake)"; exit 0 ;;
   fmt) if [ "$FAKE_FAIL" = format ]; then echo "forced fmt failure" >&2; exit 11; fi ;;
   clippy) if [ "$FAKE_FAIL" = clippy ]; then echo "forced clippy failure" >&2; exit 12; fi ;;
   nextest)
+    if [ "$3" = --version ]; then echo "cargo-nextest 0.9.151 (fake)"; exit 0; fi
     echo "     Summary [   1.000s] 1 test run: 1 passed, 0 skipped"
     if [ "$FAKE_FAIL" = test ]; then echo "forced cargo test failure" >&2; exit 13; fi
     ;;
@@ -46,6 +65,7 @@ fi
 exit 0
 `,
     pnpm: `#!/bin/sh
+if [ "$1" = --version ]; then echo "10.17.0"; exit 0; fi
 if [ "$FAKE_FAIL" = frontend ] && [ "$1" = check:frontend ]; then echo "forced frontend failure" >&2; exit 14; fi
 exit 0
 `,
@@ -131,8 +151,10 @@ test("CLI exits nonzero when the fake frontend check fails", () => {
 test("CLI fails closed when cargo is missing from PATH", () => {
   const result = runCli("missing command fails closed", { omit: "cargo" });
   assert.equal(result.status, 1);
-  assert.match(result.stdout, /RESULT cargo fmt --all -- --check: FAIL/);
-  assert.match(result.stdout, /spawnSync cargo ENOENT/);
+  // The preflight catches it in about a second, before any slow check starts.
+  assert.match(result.stdout, /FAIL rust: cargo not found on PATH/);
+  assert.match(result.stdout, /Gate summary \(pre-pr\): stopped by preflight/);
+  assert.doesNotMatch(result.stdout, /=== cargo fmt/);
 });
 
 test("a clean feature commit with trailing whitespace fails the committed-candidate check", () => {
@@ -145,16 +167,19 @@ test("a clean feature commit with trailing whitespace fails the committed-candid
   mkdirSync(workflow, { recursive: true });
   mkdirSync(bin);
   copyFileSync(source, join(scripts, "pre-pr-gate.mjs"));
-  writeFileSync(join(workflow, "ci.yml"), 'env:\n  RUST_TOOLCHAIN: "1.97.1"\n');
+  writePreflightFixture(temp, bin);
   writeFileSync(join(bin, "rustc"), '#!/bin/sh\necho "rustc 1.97.1 (fake)"\n', { mode: 0o755 });
   writeFileSync(join(bin, "cargo"), `#!/bin/sh
 case "$2" in
-  nextest) echo "     Summary [   1.000s] 1 test run: 1 passed, 0 skipped" ;;
+  --version) echo "cargo 1.97.1 (fake)"; exit 0 ;;
+  nextest)
+    if [ "$3" = --version ]; then echo "cargo-nextest 0.9.151 (fake)"; exit 0; fi
+    echo "     Summary [   1.000s] 1 test run: 1 passed, 0 skipped" ;;
   test) echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out" ;;
 esac
 exit 0
 `, { mode: 0o755 });
-  writeFileSync(join(bin, "pnpm"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  writeFileSync(join(bin, "pnpm"), '#!/bin/sh\nif [ "$1" = --version ]; then echo "10.17.0"; fi\nexit 0\n', { mode: 0o755 });
 
   const git = (args) => {
     const result = spawnSync("git", args, { cwd: temp, encoding: "utf8" });

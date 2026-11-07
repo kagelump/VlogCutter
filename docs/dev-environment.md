@@ -10,22 +10,20 @@ Minimum documented environment:
 - Xcode command-line tools
 - Rust 1.85+ and Cargo.
 - Node.js 22+ and pnpm 10.
-- FFmpeg 7+ and ffprobe on `PATH`
+- FFmpeg 6.1+ and ffprobe on `PATH`, built with libx264 and aac (test fixtures encode H.264)
 - ExifTool on `PATH`
+
+CI pins exact Rust, Node, pnpm and cargo-nextest versions in the `env:` block of `.github/workflows/ci.yml`. The FFmpeg floor is `MINIMUM_FFMPEG` in `core/rcdvlog-core/src/prerequisites.rs`: 6.1 is the first release with the `-display_rotation` input override that proxy generation uses, and it is what Ubuntu 24.04 (Linux CI and the server image) ships.
 
 The full local Task 19 gate was verified on 2026-07-28 with Rust/Cargo 1.97.1, Node 24.14, FFmpeg/ffprobe 8.1.2, ExifTool 13.36, and Chrome 150. Docker was unavailable, so the target Ubuntu/Compose topology is not accepted.
 
 Check the environment with:
 
 ```bash
-rustc --version
-cargo --version
-node --version
-pnpm --version
-ffmpeg -version | head -1
-ffprobe -version | head -1
-exiftool -ver
+pnpm preflight
 ```
+
+It reads those pins, takes about a second, and prints a `fix:` line for every failure. It checks that `cargo +<pin>` works (only rustup's proxy accepts `+toolchain`, so a Homebrew `rust` ahead of `~/.cargo/bin` on `PATH` fails here even when its version matches), and the pinned Node, pnpm and cargo-nextest; that the *first* `ffmpeg` on `PATH` meets the floor and has libx264 and aac; that `ffprobe` comes from the same install; and that ExifTool exists (a warning only, since tests do not need it). The first `ffmpeg` on `PATH` matters because tests run whatever `ffmpeg` resolves to. A conda base environment, for example, puts an FFmpeg without libx264 ahead of Homebrew's, and the preflight names the shadowed install that would pass. `pnpm gate` runs the preflight first and stops before any slow check if it fails. CI runs the same script.
 
 If Rust was just installed and `cargo` is not found, start a fresh login shell or load the standard Cargo environment before assuming the toolchain is missing. The app itself calls `prerequisite_status` at startup and reports missing media tools.
 

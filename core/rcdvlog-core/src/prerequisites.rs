@@ -259,7 +259,7 @@ fn inspect_tool(name: &str, path: PathBuf) -> ToolStatus {
     };
 
     if matches!(name, "ffmpeg" | "ffprobe") {
-        let Some(major) = numeric_major(&version) else {
+        let Some((major, minor)) = numeric_major_minor(&version) else {
             return base(
                 ToolPrerequisiteStatus::UnrecognizedVersion,
                 Some(version),
@@ -268,13 +268,14 @@ fn inspect_tool(name: &str, path: PathBuf) -> ToolStatus {
                 Some(install_remediation(name, true)),
             );
         };
-        if major < 7 {
+        if (major, minor) < MINIMUM_FFMPEG {
+            let (min_major, min_minor) = MINIMUM_FFMPEG;
             return base(
                 ToolPrerequisiteStatus::UnsupportedVersion,
                 Some(version.clone()),
                 false,
                 Some(format!(
-                    "FFmpeg major version {major} is older than the required minimum 7"
+                    "FFmpeg {version} is older than the required minimum {min_major}.{min_minor}"
                 )),
                 Some(install_remediation(name, true)),
             );
@@ -354,8 +355,18 @@ fn parse_version(name: &str, stdout: &[u8]) -> Option<String> {
     Some(token.to_string())
 }
 
-fn numeric_major(version: &str) -> Option<u32> {
-    version.split(['.', '-']).next()?.parse().ok()
+/// Oldest supported FFmpeg/ffprobe release. 6.1 is the first release with the
+/// `-display_rotation` input override proxy generation relies on, and it is
+/// what Ubuntu 24.04 (the server image and Linux CI) ships.
+/// `scripts/dev-preflight.mjs` mirrors this value; a script test keeps them equal.
+pub const MINIMUM_FFMPEG: (u32, u32) = (6, 1);
+
+fn numeric_major_minor(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.split(['.', '-']);
+    let major = parts.next()?.parse().ok()?;
+    // A bare major release (e.g. "7") is that release's .0.
+    let minor = parts.next().map_or(Some(0), |p| p.parse().ok())?;
+    Some((major, minor))
 }
 
 fn exit_description(status: &ExitStatus) -> String {
@@ -542,7 +553,14 @@ mod tests {
         assert_eq!(missing.status, ToolPrerequisiteStatus::Missing);
         assert!(!missing.available);
         assert!(!missing.supported);
-        assert!(missing.remediation.as_deref().unwrap().contains("PATH"));
+        // Remediation is platform-specific: a Homebrew command on macOS, a
+        // PATH instruction elsewhere.
+        let remediation = missing.remediation.as_deref().unwrap();
+        if cfg!(target_os = "macos") {
+            assert!(remediation.contains("brew install ffmpeg"), "{remediation}");
+        } else {
+            assert!(remediation.contains("PATH"), "{remediation}");
+        }
 
         let path = temp.path().join("ffprobe");
         fs::write(&path, "#!/bin/sh\nprintf 'ffprobe version 7.0.0\\n'\n").unwrap();
@@ -557,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_and_ffprobe_require_major_seven_and_accept_supported_versions() {
+    fn ffmpeg_and_ffprobe_require_six_one_and_accept_supported_versions() {
         let _fixture_guard = SCRIPT_FIXTURES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -565,11 +583,33 @@ mod tests {
         let old = executable(
             &temp,
             "ffmpeg-old",
-            "printf 'ffmpeg version 6.1.2 Copyright\\n'",
+            "printf 'ffmpeg version 6.0.1 Copyright\\n'",
         );
         let status = inspect_tool("ffmpeg", old);
         assert_eq!(status.status, ToolPrerequisiteStatus::UnsupportedVersion);
-        assert_eq!(status.version.as_deref(), Some("6.1.2"));
+        assert_eq!(status.version.as_deref(), Some("6.0.1"));
+        assert!(status.reason.as_deref().unwrap().contains("minimum 6.1"));
+
+        // Ubuntu 24.04's package (Linux CI and the server image).
+        let ubuntu = executable(
+            &temp,
+            "ffmpeg-ubuntu",
+            "printf 'ffmpeg version 6.1.1-3ubuntu5 Copyright\\n'",
+        );
+        let status = inspect_tool("ffmpeg", ubuntu);
+        assert_eq!(
+            status.status,
+            ToolPrerequisiteStatus::Supported,
+            "{status:?}"
+        );
+        assert_eq!(status.version.as_deref(), Some("6.1.1-3ubuntu5"));
+
+        let bare_major = executable(
+            &temp,
+            "ffmpeg-bare",
+            "printf 'ffmpeg version 7 Copyright\\n'",
+        );
+        assert!(inspect_tool("ffmpeg", bare_major).supported);
 
         let current = executable(
             &temp,
@@ -696,7 +736,7 @@ mod tests {
         let error = prerequisite_error(status).unwrap();
         assert_eq!(error.name, "ffmpeg");
         assert_eq!(error.status, ToolPrerequisiteStatus::UnsupportedVersion);
-        assert!(error.to_string().contains("minimum 7"));
+        assert!(error.to_string().contains("minimum 6.1"));
     }
 
     #[test]

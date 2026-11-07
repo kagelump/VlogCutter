@@ -100,9 +100,14 @@ impl Catalog {
                 r.get::<_, String>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // `root` is canonical, but recorded locations keep the spelling they were
+        // ingested under (e.g. macOS `/var/...` vs `/private/var/...`, or a
+        // symlinked library folder). Compare canonical forms; an offline
+        // location keeps its recorded spelling so verification can report it.
         Ok(paths
             .into_iter()
             .map(PathBuf::from)
+            .map(|p| fs::canonicalize(&p).unwrap_or(p))
             .filter(|p| p.starts_with(root))
             .collect())
     }
@@ -622,18 +627,33 @@ mod tests {
     }
 
     fn fixture(rate: &str) -> Fixture {
+        fixture_with(rate, false)
+    }
+
+    /// `via_symlink` ingests everything through a symlinked directory, so the
+    /// recorded locations differ from their canonical spelling on every OS.
+    fn fixture_with(rate: &str, via_symlink: bool) -> Fixture {
         let dir = tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite3")).unwrap();
         let project = catalog
             .create_project("Synthetic alternate sidecars")
             .unwrap();
-        let organized = dir.path().join("organized");
+        let base = if via_symlink {
+            let real = dir.path().join("real");
+            fs::create_dir_all(&real).unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            link
+        } else {
+            dir.path().to_path_buf()
+        };
+        let organized = base.join("organized");
         fs::create_dir_all(&organized).unwrap();
         let primary = organized.join("organized-name.MP4");
         original(&primary, "testsrc2", rate);
         catalog.ingest_folder(&project.id, &organized).unwrap();
         let asset = catalog.list_assets(&project.id).unwrap().remove(0);
-        let root = dir.path().join("card-a");
+        let root = base.join("card-a");
         let run = root.join("DCIM/run-001");
         fs::create_dir_all(&run).unwrap();
         let original = run.join("CLIP0001.MP4");
@@ -650,6 +670,31 @@ mod tests {
             original,
             sidecar,
         }
+    }
+
+    #[test]
+    fn locations_ingested_through_a_symlink_match_the_canonical_card_root() {
+        let f = fixture_with("60", true);
+        proxy(&f.original, &f.sidecar, "fps=30,scale=320:180");
+        let discovered = f
+            .catalog
+            .discover_camera_proxy_sidecars(&f.project.id, &f.root)
+            .unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].status, "candidate", "{discovered:?}");
+        let registered = f
+            .catalog
+            .register_camera_proxy_sidecar(&f.asset.id, &f.root, &f.sidecar)
+            .unwrap();
+        let provenance = registered.provenance.as_ref().unwrap();
+        assert_eq!(
+            provenance.original_location,
+            fs::canonicalize(&f.original).unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            provenance.original_relative_path,
+            "DCIM/run-001/CLIP0001.MP4"
+        );
     }
 
     #[test]
@@ -690,7 +735,12 @@ mod tests {
             .register_camera_proxy_sidecar(&f.asset.id, &f.root, &f.sidecar)
             .unwrap();
         let provenance = registered.provenance.as_ref().unwrap();
-        assert_eq!(provenance.original_location, f.original.to_string_lossy());
+        // Provenance records the canonical location, which differs from the
+        // ingested spelling when the temp dir is behind a symlink (macOS).
+        assert_eq!(
+            provenance.original_location,
+            fs::canonicalize(&f.original).unwrap().to_string_lossy()
+        );
         assert_eq!(
             provenance.original_relative_path,
             "DCIM/run-001/CLIP0001.MP4"

@@ -134,9 +134,9 @@ Rules for this boundary:
 
 ## 6. Toolchain and prerequisites
 
-Apple Silicon Mac, macOS 13+; Xcode command-line tools; Rust 1.85+; Node.js 22+ and pnpm 10; FFmpeg 7+/ffprobe and ExifTool on `PATH`. Install JS dependencies with `pnpm install` from the root. The app reports missing media tools at startup (`prerequisite_status`).
+Apple Silicon Mac, macOS 13+; Xcode command-line tools; Rust 1.85+; Node.js 22+ and pnpm 10; FFmpeg 6.1+ (with libx264)/ffprobe and ExifTool on `PATH`. Install JS dependencies with `pnpm install` from the root. The app reports missing media tools at startup (`prerequisite_status`).
 
-The pre-PR gate and CI pin Rust 1.97.1 (with `rustfmt` and `clippy`), Node.js 24.11.0, and pnpm 10.17.0. Never let a missing pinned tool silently fall back to another Rust version or formatter; `pnpm gate` verifies the pin. If `cargo` is not found, load `~/.cargo/env` or an explicitly configured `CARGO_HOME`/`RUSTUP_HOME` before assuming it is missing. For an agent development binding, build with `cargo +1.97.1 build --locked -p rcdvlog-cli` and pass the resulting absolute binary path to `workspace refresh`; `workspace check` never resolves a replacement executable. Install commands, version-check commands, and the verified-toolchain record: [docs/dev-environment.md](docs/dev-environment.md).
+The pre-PR gate and CI pin Rust 1.97.1 (with `rustfmt` and `clippy`), Node.js 24.11.0, pnpm 10.17.0, and cargo-nextest 0.9.151. Never let a missing pinned tool silently fall back to another Rust version or formatter. Run `pnpm preflight` first; `pnpm gate` and CI run it too. If `cargo` is not found, load `~/.cargo/env` or an explicitly configured `CARGO_HOME`/`RUSTUP_HOME` before assuming it is missing. For an agent development binding, build with `cargo +1.97.1 build --locked -p rcdvlog-cli` and pass the resulting absolute binary path to `workspace refresh`; `workspace check` never resolves a replacement executable. Install commands, version-check commands, and the verified-toolchain record: [docs/dev-environment.md](docs/dev-environment.md).
 
 ## 7. Running the app
 
