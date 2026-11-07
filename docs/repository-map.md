@@ -22,7 +22,8 @@
 │   ├── rcdvlog-core/src/catalog/     # `Catalog` methods: ingest, proxies, thumbnails, speech, analysis, chronology
 │   ├── rcdvlog-core/src/types.rs     # Public catalog data types (`Asset`, reports, progress)
 │   ├── rcdvlog-core/src/media.rs     # ffprobe/ExifTool probing, timestamps, fingerprints
-│   ├── rcdvlog-core/src/operations.rs # Typed operations, HLC, materialization, conflicts
+│   ├── rcdvlog-core/src/operations.rs # Typed operations, HLC, validation, conflicts
+│   ├── rcdvlog-core/src/operations/  # Operation `Catalog` methods and per-aggregate materializers
 │   ├── rcdvlog-server/               # Server catalog, storage, jobs, auth, media, backup
 │   ├── rcdvlog-sync/                 # Baseline/reconciliation DTOs and apply logic
 │   └── batch-estimator/src/lib.rs    # Domain-independent weighted ETA library
