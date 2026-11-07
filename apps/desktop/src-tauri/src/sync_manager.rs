@@ -225,6 +225,12 @@ impl SyncManager {
         });
     }
 
+    /// Signal that the server pairing (endpoint or credential) changed, so the
+    /// loop re-evaluates immediately, including restarting its hint client.
+    pub fn pairing_changed(&self) {
+        let _ = self.wake_tx.send(WakeEvent::PeriodicTick);
+    }
+
     /// Signal an explicit "sync now" request.
     pub fn sync_now(&self, project_id: &str) {
         let _ = self.wake_tx.send(WakeEvent::SyncNow {
@@ -270,7 +276,8 @@ impl SyncLoopHandle {
     const PERIODIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
     async fn run(mut self, mut wake_rx: tokio::sync::mpsc::UnboundedReceiver<WakeEvent>) {
-        let mut ws_task: Option<tokio::task::JoinHandle<()>> = None;
+        let mut ws_task: crate::hint_client_slot::HintClientSlot<WsSettings> =
+            crate::hint_client_slot::HintClientSlot::default();
         loop {
             let event = tokio::time::timeout(Self::PERIODIC_INTERVAL, wake_rx.recv()).await;
 
@@ -334,12 +341,12 @@ impl SyncLoopHandle {
             let paired_projects = self.list_paired_projects();
             if guard_state.ok() != Some(rcdvlog_sync::GuardState::Held) {
                 self.mark_guard_unavailable(&paired_projects);
-                ws_task = None;
+                ws_task.stop();
                 continue;
             }
             if paired_projects.is_empty() {
                 // Still ensure WS is cleaned up if no paired projects
-                ws_task = None;
+                ws_task.stop();
                 continue;
             }
 
@@ -358,8 +365,9 @@ impl SyncLoopHandle {
             // Ensure WebSocket hint listener is running
             self.ensure_ws_client(&mut ws_task);
         }
-        // Shutdown: drop ws_task, which aborts the spawned task
-        drop(ws_task);
+        // Shutdown: abort the hint client explicitly (dropping a JoinHandle
+        // alone would only detach it).
+        ws_task.stop();
     }
 
     fn current_catalog_path(&self) -> Option<std::path::PathBuf> {
@@ -402,17 +410,16 @@ impl SyncLoopHandle {
 
     // ── WebSocket hint client ───────────────────────────────────────
 
-    fn ensure_ws_client(&self, ws_task: &mut Option<tokio::task::JoinHandle<()>>) {
-        let needs_start = ws_task.as_ref().is_none_or(|t| t.is_finished());
-        if !needs_start {
-            return;
-        }
-        if let Some(settings) = self.read_ws_settings() {
-            let wake_tx = self.wake_tx.clone();
-            *ws_task = Some(tokio::spawn(async move {
+    /// Keeps the hint client matched to the current pairing: aborted when
+    /// unpaired, restarted when the endpoint or token changes.
+    fn ensure_ws_client(&self, ws_task: &mut crate::hint_client_slot::HintClientSlot<WsSettings>) {
+        let wake_tx = self.wake_tx.clone();
+        ws_task.sync(self.read_ws_settings(), |settings| {
+            let settings = settings.clone();
+            tokio::spawn(async move {
                 ws_client_loop(wake_tx, &settings.endpoint, &settings.token).await;
-            }));
-        }
+            })
+        });
     }
 
     fn read_ws_settings(&self) -> Option<WsSettings> {
@@ -1151,6 +1158,7 @@ impl CompleteNodeJobResult {
 
 // ── WebSocket client loop (runs as a spawned task) ──────────────────
 
+#[derive(Clone, PartialEq, Eq)]
 struct WsSettings {
     endpoint: String,
     token: String,
