@@ -23,7 +23,7 @@ env:
   # Pinned deliberately. Following the `stable` channel left `main` red for six
   # days when a new release changed what `rustfmt` accepted, with no code change
   # to explain it. Raise this on purpose, in its own commit, after running the
-  # gate locally on the new version; keep it in step with `AGENTS.md` §6.
+  # gate locally on the new version; keep it in step with the `AGENTS.md` "Toolchain" section.
   RUST_TOOLCHAIN: "1.97.1"
   NODE_VERSION: "24.11.0"
   PNPM_VERSION: "10.17.0"

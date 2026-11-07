@@ -78,7 +78,7 @@ Two details that will otherwise waste an hour:
   therefore no previews at all** — `Shift+G` (`makeMissingThumbnails`) is the
   cheap remedy, and images are unaffected by this limitation.
 - The real repair is to stop using the custom scheme for media. See
-  `docs/tasks/desktop/MEDIA_DELIVERY.md`.
+  `4c5eb2f:docs/tasks/desktop/MEDIA_DELIVERY.md`.
 - Assume this affects every future media surface — hover scrub, filmstrips,
   multi-clip contact sheets — not just the stage.
 

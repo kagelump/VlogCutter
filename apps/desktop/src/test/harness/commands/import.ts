@@ -7,7 +7,7 @@
  * checkable at all.
  *
  * Nothing here is evidence for real copying, hashing, or removable-volume
- * detection. `docs/tasks/import/EPIC.md` keeps its physical gate: one real card,
+ * detection. `4c5eb2f:docs/tasks/import/EPIC.md` keeps its physical gate: one real card,
  * inserted twice, and an archive moved between two physical volumes.
  */
 

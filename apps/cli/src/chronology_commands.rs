@@ -402,7 +402,7 @@ fn read_json(input: &str) -> Result<Value> {
 }
 
 /// A malformed chronology request or preview payload. The CLI maps it to the
-/// stable `invalid_input` code (AGENTS.md section 11) rather than
+/// stable `invalid_input` code (AGENTS.md "CLI contract") rather than
 /// `internal_error`, because the caller can fix the input.
 #[derive(Debug)]
 pub struct ChronologyInputError(String);

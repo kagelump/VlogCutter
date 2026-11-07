@@ -5,7 +5,6 @@ Relocated verbatim from the repository-root `AGENTS.md` section 4 so the root fi
 ```text
 .
 ├── AGENTS.md                         # This operational handoff
-├── PRD.md                            # Product scope, architecture, milestones, decisions
 ├── README.md                         # Short setup and usage guide
 ├── Cargo.toml                        # Rust workspace
 ├── package.json                      # Root pnpm command aliases

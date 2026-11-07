@@ -101,7 +101,7 @@ impl Catalog {
     /// Explains one clip's derived time in terms of the facts that produced it.
     ///
     /// Corrections are listed in *application* order — the order the solver's
-    /// pipeline consults them (`PRD.md` §9.5): capture sequence, clock epoch,
+    /// pipeline consults them: capture sequence, clock epoch,
     /// clip exception, trip phase, then event-order constraints.
     pub fn explain_chronology(&self, asset_id: &str) -> Result<ChronologyExplanation> {
         let asset = self.get_asset(asset_id)?;

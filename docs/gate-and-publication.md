@@ -1,6 +1,6 @@
 # Local gate, focused tests and publication
 
-Relocated verbatim from the repository-root `AGENTS.md` section 12 ("Testing and verification") so the root file can stay a short index (issue #260). The gate table and the CI/doc drift rule stay inline in `AGENTS.md`.
+Relocated verbatim from the repository-root `AGENTS.md` section 12 ("Testing and verification") so the root file can stay a short index (issue #260). The gate table and the CI/doc drift rule are in [engineering-reference.md](engineering-reference.md).
 
 Every gate scope starts with `pnpm preflight` (see
 [dev-environment.md](dev-environment.md)) and stops before any slow check if a

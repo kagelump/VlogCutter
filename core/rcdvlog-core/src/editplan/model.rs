@@ -1,5 +1,5 @@
 //! Edit-plan record types, frozen by D01-T019
-//! (`docs/tasks/desktop/EDIT_PLAN_MODEL.md`).
+//! (`4c5eb2f:docs/tasks/desktop/EDIT_PLAN_MODEL.md`).
 //!
 //! One picture track and hard picture cuts remain. Omitted audio retains the
 //! legacy linked behavior; versioned source audio can use independent ranges,

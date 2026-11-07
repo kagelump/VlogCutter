@@ -40,8 +40,8 @@ pnpm check:docs
 deterministic in-memory backend at `window.__TAURI_INTERNALS__`, so the real
 `api.ts`, `chronologyApi.ts`, command names, argument shapes, and event
 subscriptions are all under test while only the destination is faked. Its
-contract is `docs/tasks/harness/ARCHITECTURE.md`; the production findings it has
-produced so far are recorded in `docs/tasks/harness/FINDINGS.md`.
+contract is `4c5eb2f:docs/tasks/harness/ARCHITECTURE.md`; the production findings it has
+produced so far are recorded in `4c5eb2f:docs/tasks/harness/FINDINGS.md`.
 
 It does validate: that a reported write reached the backend and is visible to
 the next read, that reported generation counts equal the assets actually
@@ -89,4 +89,4 @@ The pure-Rust OTIO writer is implemented and covered by deterministic unit
 tests. DaVinci Resolve 20/21 import remains a manual desktop MVP release gate;
 headless tests do not establish editor compatibility.
 
-The authoritative last-run matrix, including every “not run” reason and residual risk, is [Task 19 acceptance](tasks/server/ACCEPTANCE_TASK_19.md). Passing local automation is not permission to relabel those external checks as passed.
+The authoritative last-run matrix, including every “not run” reason and residual risk, is the Task 19 acceptance report (`git show 4c5eb2f:docs/tasks/server/ACCEPTANCE_TASK_19.md`). Passing local automation is not permission to relabel those external checks as passed.

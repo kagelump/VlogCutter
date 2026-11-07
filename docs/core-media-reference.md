@@ -1,6 +1,6 @@
 # Core data, media and analysis reference
 
-Relocated verbatim from the repository-root `AGENTS.md` section 9 ("Core data and media behavior") so the root file can stay a short index (issue #260). The domain rules agents must not violate are repeated inline in `AGENTS.md`; this file holds the full text, recipes and measurements.
+Relocated verbatim from the repository-root `AGENTS.md` section 9 ("Core data and media behavior") so the root file can stay a short index (issue #260). This file holds the full text, recipes and measurements.
 
 ## Assets and patches
 
@@ -95,8 +95,8 @@ Q1 thumbnails and analysis-selected Q10 representative thumbnails use the same c
 
 Local speech-to-text ships. It runs entirely offline with no API key and never
 touches the network. Design and measurements:
-[spec](superpowers/specs/2026-08-03-stt-vlm-clip-analysis-design.md),
-[round-1 spike](spikes/2026-08-03-stt-analysis-spikes.md).
+spec (`4c5eb2f:docs/superpowers/specs/2026-08-03-stt-vlm-clip-analysis-design.md`),
+round-1 spike (`4c5eb2f:docs/spikes/2026-08-03-stt-analysis-spikes.md`).
 
 - **Audio comes from the proxy, never the original.** The original may be
   offline on the NAS, and transcription must work whenever proxies exist. A clip

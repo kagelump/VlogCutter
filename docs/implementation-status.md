@@ -1,10 +1,10 @@
 # Implementation status
 
-Relocated verbatim from the repository-root `AGENTS.md` section 3 ("Current implementation versus PRD target") so the root file can stay a short index (issue #260). `AGENTS.md` keeps a one-line index per capability and the condensed "Important gaps" list; this file holds the full detail.
+Relocated verbatim from the repository-root `AGENTS.md` section 3 ("Current implementation versus PRD target") so the root file can stay a short index (issue #260). This file holds the full detail.
 
-Convention: when a feature PR lands, put its detail here (or in a more focused doc under `docs/`) and add only an index line plus a link to `AGENTS.md`.
+Convention: when a feature PR lands, put its detail here or in a more focused doc under `docs/`.
 
-The implemented slice is intentionally smaller than the launch-critical list in `PRD.md`.
+The implemented slice is intentionally smaller than the launch-critical list in the (now removed) `PRD.md`.
 
 Implemented now:
 
@@ -176,7 +176,7 @@ Implemented now:
   again, and native/DOM fullscreen is gone. A Focus presentation (F) fills
   the window with the frame and floats the notes card, preserving the caret and
   the playback position because it restyles the mounted tree rather than
-  replacing it. See `docs/superpowers/specs/2026-08-04-desktop-review-layout-design.md`.
+  replacing it. See `4c5eb2f:docs/superpowers/specs/2026-08-04-desktop-review-layout-design.md`.
 - One owner for the open project's reads (`apps/desktop/src/session/projectSession.ts`):
   the queue, chronology overview, analysis index, readiness, and the selected
   clip's evidence, with explicit `reload`/`reloadAssets`/`reloadChronology`/
@@ -244,7 +244,7 @@ Important gaps; do not accidentally describe these as complete:
   play*, and the selected clip's File shelf reaches the same project-wide
   relink, so repair no longer requires knowing the chronology desk's
   diagnostics exist. Removable-card detection and archive-root rebinding
-  are implemented; see `docs/tasks/import/EPIC.md` for the remaining physical
+  are implemented; see `4c5eb2f:docs/tasks/import/EPIC.md` for the remaining physical
   card/volume acceptance gate.
 - Full-patch writes carry an optimistic `expectedRevision`. `Asset.revision` is
   the materialized operation revision; `update_asset` refuses a patch built
@@ -285,7 +285,7 @@ Important gaps; do not accidentally describe these as complete:
   catalog in `<project-root>/.vlogcutter/cli-binding.json`. This binding never
   generates or edits project instructions. Materializing `AGENTS.md`,
   `PROJECT.md`, `script.md`, `project.json`, and `edit-plan.json` into the
-  video project root remains planned under issue #48 and PRD Milestone 5.
+  video project root remains planned under issue #48.
   Script revisions do not exist either.
 - Trip phases and timezone display are persisted and solved, and the ribbon can
   add a location/transit phase forward or backward from a hovered clip, edit an
@@ -320,6 +320,6 @@ Important gaps; do not accidentally describe these as complete:
   per-suggestion accept/reject workflow: an AI title or description is simply an
   editable field, and a forced re-run overwrites it.
 - Native media playback, filesystem permission prompts, sleep/wake, and NAS-scale behavior remain manual acceptance checks. The loopback media origin's three webview-observable acceptance criteria — an un-played clip's first frame, non-zero `drawImage` alpha before `play()`, and seeking to an unbuffered region — have not been run. Resolve import returns as a later edit-planning acceptance check.
-- Ubuntu/Compose, physical NFS/SMB outage behavior, Caddy/Tailscale HTTPS, native pairing/playback, and target resource/thermal acceptance remain unrun; see `docs/tasks/server/ACCEPTANCE_TASK_19.md`.
+- Ubuntu/Compose, physical NFS/SMB outage behavior, Caddy/Tailscale HTTPS, native pairing/playback, and target resource/thermal acceptance remain unrun; see `git show 4c5eb2f:docs/tasks/server/ACCEPTANCE_TASK_19.md`.
 
 Before implementing persisted trip context, resolve the domain question of whether story beats are independent overlapping ranges or must be nested under physical phases. The current recommendation is independent ranges because narrative beats may cross a location or timezone transition.

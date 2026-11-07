@@ -8,7 +8,7 @@
  *
  * What it cannot prove — and what no assertion in this file claims — is that
  * anything decoded, that a first frame painted, or that an unbuffered seek
- * works. Those are `docs/tasks/desktop/MEDIA_DELIVERY.md`'s native acceptance
+ * works. Those are `4c5eb2f:docs/tasks/desktop/MEDIA_DELIVERY.md`'s native acceptance
  * criteria and they stay in the native tier.
  */
 

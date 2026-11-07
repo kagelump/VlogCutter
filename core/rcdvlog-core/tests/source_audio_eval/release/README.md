@@ -1,6 +1,6 @@
 # Source-audio MVP release comparison v1
 
-Plan step 5 of `docs/tasks/tv-review/SOURCE_AUDIO_MVP_PLAN.md`: one bounded
+Plan step 5 of `4c5eb2f:docs/tasks/tv-review/SOURCE_AUDIO_MVP_PLAN.md`: one bounded
 release comparison of the opt-in `source-audio-pooled-mvp-v1` workflow
 (`tv-review source-audio-session-report`). The machine-readable result is
 `release-comparison-v1.sanitized.json` in this directory. Private media,

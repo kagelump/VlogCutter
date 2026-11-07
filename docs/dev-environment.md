@@ -139,7 +139,7 @@ full media paths, so it must stay compiled out of release like the eval bridge;
 `apps/desktop/src-tauri/tests/release_dev_seams_absent.rs` proves both are.
 
 The client prints JSON values and structured JavaScript errors. Every probe is
-logged by the running app. See `docs/tasks/desktop/DEV_EVAL_BRIDGE.md` for the
+logged by the running app. See `4c5eb2f:docs/tasks/desktop/DEV_EVAL_BRIDGE.md` for the
 contract, tests, and release-binary absence check.
 
 The Vite-only browser preview is useful for fast layout and interaction work:

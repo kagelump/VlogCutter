@@ -39,7 +39,7 @@ Use `edit-plan audio-audit create|get` for a bounded, local audit of original an
 
 Use `native-video preflight|authorize|pilot|prepare|windows|run|status|wait|cancel|result|evidence-list|run-windows` for explicit bounded direct video review. Policy and window inputs are typed capped JSON files; local preparation and read-only planning are separate from provider execution. See [native video review](native-video-review.md) for the full contract and examples.
 
-The accepted product architecture (PRD §6.3, §15, §25.1 item 18) pairs this CLI
+The accepted product architecture pairs this CLI
 with a project-local *agent workspace*. The CLI now reports its own build and
 readiness, and can explicitly bind or verify the selected executable and
 catalog for an existing project root. Issue #48 still owns materializing

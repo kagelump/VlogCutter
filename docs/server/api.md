@@ -29,4 +29,4 @@ Host, Origin, trusted-forwarded-header, CSRF, body-size, path-containment, and a
 4. Update the typed client and consumers.
 5. Run `pnpm check:openapi`, server tests, frontend checks, and relevant browser tests.
 
-Do not edit the checked OpenAPI JSON by hand. The protocol-v1 baseline/reconcile schemas under [`docs/tasks/server/schemas`](../tasks/server/schemas/) are frozen compatibility artifacts and follow a new-version migration process rather than OpenAPI regeneration.
+Do not edit the checked OpenAPI JSON by hand. The protocol-v1 baseline/reconcile schemas under `docs/contracts/sync-*-v1.schema.json` ([contracts](../contracts/)) are frozen compatibility artifacts and follow a new-version migration process rather than OpenAPI regeneration.

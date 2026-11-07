@@ -2614,7 +2614,7 @@ fn add_transcripts(transaction: &Transaction<'_>) -> Result<()> {
 /// Its binding is where that root is mounted on this node right now. Storing an
 /// absolute path on the asset instead would recreate the offline defect at
 /// archive scale, because an external drive is itself a thing that remounts
-/// elsewhere. See `docs/tasks/import/ARCHITECTURE.md` §4.1.
+/// elsewhere. See `4c5eb2f:docs/tasks/import/ARCHITECTURE.md` §4.1.
 fn add_archive_roots(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(
         r#"
@@ -2947,7 +2947,7 @@ fn add_camera_identity_aliases(transaction: &Transaction<'_>) -> Result<()> {
 /// point was reported as a duplicate and the asset was left pointing at the old
 /// offline path, and a reformatted card that reuses a pathname could make an
 /// asset resolve to entirely different bytes. See
-/// `docs/tasks/import/ARCHITECTURE.md` §3.2.
+/// `4c5eb2f:docs/tasks/import/ARCHITECTURE.md` §3.2.
 ///
 /// The primary key also relaxes to include the path, because an asset can
 /// legitimately be reachable at more than one place on one node — a mounted card

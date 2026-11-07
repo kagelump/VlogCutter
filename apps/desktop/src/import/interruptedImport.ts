@@ -5,7 +5,7 @@
  * enclosure browns out, a cable is nudged, a card is pulled a second early —
  * and the architecture's durability model already anticipates it: every file
  * commits atomically, so an interruption leaves committed work committed and
- * the remainder simply undone (`docs/tasks/import/ARCHITECTURE.md` §4.4).
+ * the remainder simply undone (`4c5eb2f:docs/tasks/import/ARCHITECTURE.md` §4.4).
  *
  * What was missing was the way back. This module holds the session identity
  * and the user's choices across the gap, and answers the two questions the

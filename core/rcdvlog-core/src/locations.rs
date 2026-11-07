@@ -7,7 +7,7 @@
 //! fact about this machine and no other.
 //!
 //! The rule this module exists to enforce: **a pathname is not an identity.**
-//! Before `docs/tasks/import/ARCHITECTURE.md` §3, "the original is available"
+//! Before `4c5eb2f:docs/tasks/import/ARCHITECTURE.md` §3, "the original is available"
 //! meant "some file exists at that pathname," which let a reformatted card that
 //! reused `.../C0012.MP4` silently bind an old asset to entirely new bytes.
 //! Availability now requires that the bytes were checked.

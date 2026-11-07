@@ -40,7 +40,7 @@ function rememberMediaOrigin(settings: DesktopSettings): DesktopSettings {
  *     RCDVLOG_EVAL_BRIDGE=1 RCDVLOG_MEDIA_DEBUG=1 pnpm dev
  *     pnpm eval -- 'window.__RCDVLOG_MEDIA_ORIGIN__.debugUrl'
  *
- * See `docs/tasks/desktop/MEDIA_DELIVERY.md`.
+ * See `4c5eb2f:docs/tasks/desktop/MEDIA_DELIVERY.md`.
  */
 function publishDevMediaHandle() {
   const global = window as unknown as Record<string, unknown>;
@@ -507,7 +507,7 @@ export const api = {
    * the asset protocol, because `WKWebView` will not produce video frames for a
    * custom scheme: an un-played clip has no first frame to paint, and neither
    * would a hover scrub, a filmstrip, or a contact sheet. See
-   * `docs/tasks/desktop/MEDIA_DELIVERY.md`.
+   * `4c5eb2f:docs/tasks/desktop/MEDIA_DELIVERY.md`.
    *
    * The proxy-versus-original choice is unchanged and stays here, on the side
    * that also decides rotation and poster agreement; it rides along as `rep` so

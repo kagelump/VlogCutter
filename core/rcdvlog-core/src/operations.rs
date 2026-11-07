@@ -416,7 +416,7 @@ struct MediaLinkedPayload {
 }
 
 /// Chronology operation payloads, frozen by D01-T007
-/// (`docs/tasks/desktop/CHRONOLOGY_MODEL.md`). All are payload version 1 with
+/// (`4c5eb2f:docs/tasks/desktop/CHRONOLOGY_MODEL.md`). All are payload version 1 with
 /// `deny_unknown_fields`, matching the existing operation payload discipline.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

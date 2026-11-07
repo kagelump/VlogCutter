@@ -20,6 +20,6 @@ Notes preserve revisions and choose a deterministic active value. Labels use add
 
 A server restore can roll its operation allocator behind a Mac. The restored replica enters sequence recovery and emits no new server-origin operation until exact contiguous retained operations are replayed or a divergence is explicitly diagnosed. Do not force cursors or edit the database. Follow [backup-and-recovery.md](backup-and-recovery.md).
 
-The protocol v1 schemas in [`docs/tasks/server/schemas`](../tasks/server/schemas/) are frozen compatibility artifacts. They are not generated-current files and must not be edited when implementation evolves; introduce a new version and compatibility path.
+The protocol v1 schemas in `docs/contracts/sync-*-v1.schema.json` ([contracts](../contracts/)) are frozen compatibility artifacts. They are not generated-current files and must not be edited when implementation evolves; introduce a new version and compatibility path.
 
 Use `rcdvlog server ... sync status|diagnose|now` for machine-readable state. The local `project diagnose` and `desktop last-opened` commands connect a screenshot breadcrumb to paired node, project, and conflict state.

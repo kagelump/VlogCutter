@@ -52,5 +52,5 @@ result is stale. After the pre-PR run, report its full output or the completed
 CI run URL and its failed-step logs. Do not summarize an incomplete or failed
 run as a pass.
 
-See `AGENTS.md` §6 and §12 for portable prerequisites and the verification
+See the `AGENTS.md` "Toolchain" and "Testing" sections for portable prerequisites and the verification
 contract.

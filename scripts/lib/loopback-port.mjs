@@ -1,6 +1,6 @@
 // A loopback port nobody else is using.
 //
-// Fixed ports are contracts; ephemeral ports are implementation (AGENTS.md §7).
+// Fixed ports are contracts; ephemeral ports are implementation (docs/desktop.md).
 // A test fixture is never a contract, so it asks the kernel for a port instead
 // of hoping a hard-coded one is free. Two checkouts, or a run alongside a
 // leftover server from an interrupted one, then cannot collide — and, more

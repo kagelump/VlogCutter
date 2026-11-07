@@ -26,7 +26,7 @@ function createFixture() {
   // Stub the required documentation artifacts.
   const requiredDirs = [
     "docs/server",
-    "docs/tasks/server/schemas",
+    "docs/contracts",
   ];
   for (const dir of requiredDirs) {
     mkdirSync(join(root, dir), { recursive: true });
@@ -49,9 +49,9 @@ function createFixture() {
   }
 
   const requiredJsonFiles = [
-    "docs/tasks/server/schemas/baseline-v1.schema.json",
-    "docs/tasks/server/schemas/reconcile-v1.schema.json",
-    "docs/tasks/server/schemas/reconcile-response-v1.schema.json",
+    "docs/contracts/sync-baseline-v1.schema.json",
+    "docs/contracts/sync-reconcile-v1.schema.json",
+    "docs/contracts/sync-reconcile-response-v1.schema.json",
   ];
   for (const f of requiredJsonFiles) {
     writeFileSync(join(root, f), "{}");

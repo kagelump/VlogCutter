@@ -7,7 +7,7 @@
 #
 # The Rust toolchain is not covered here: it is the `RUST_TOOLCHAIN` env value
 # in `ci.yml`, raised by hand after the gate has been run locally on the new
-# version. See that file's comment and `AGENTS.md` §6.
+# version. See that file's comment and the `AGENTS.md` "Toolchain" section.
 version: 2
 updates:
   - package-ecosystem: github-actions

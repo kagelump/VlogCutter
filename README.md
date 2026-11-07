@@ -11,7 +11,7 @@ The current product supports desktop project creation/opening, preflighted card 
 - FFmpeg 6.1+ (with libx264) and ffprobe, and ExifTool; `pnpm preflight` checks the pinned toolchain
 - Companion deployment: Ubuntu 24.04 x86-64 with Docker Engine/Compose and a host-mounted NFS (preferred) or SMB original-media share
 
-The Task 19 acceptance environment used Rust 1.97.1, Node 24.14, FFmpeg/ffprobe 8.1.2, ExifTool 13.36, and Chrome 150. See the [acceptance report](docs/tasks/server/ACCEPTANCE_TASK_19.md) for exactly what ran and which target-topology checks remain open.
+The Task 19 acceptance environment used Rust 1.97.1, Node 24.14, FFmpeg/ffprobe 8.1.2, ExifTool 13.36, and Chrome 150. The acceptance report (removed from the tree; read it with `git show 4c5eb2f:docs/tasks/server/ACCEPTANCE_TASK_19.md`) records exactly what ran and which target-topology checks remain open.
 
 ## Desktop fast start
 
@@ -69,8 +69,8 @@ See [OAuth setup, headless consent and resumable uploads](docs/youtube-upload.md
 
 ## Documentation
 
-- [Product scope and decisions](PRD.md)
 - [Agent operational handoff](AGENTS.md)
+- [Engineering reference](docs/engineering-reference.md)
 - [Companion-server operations](docs/server/README.md)
 - [Batch ETA semantics](docs/batch-estimation.md)
 - [Integration and manual acceptance boundaries](docs/integration-testing.md)

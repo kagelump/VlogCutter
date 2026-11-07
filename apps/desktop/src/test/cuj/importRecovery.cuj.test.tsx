@@ -4,7 +4,7 @@
  * The failure this covers is ordinary in the field: a bus-powered enclosure
  * browns out, a cable is nudged, a card is pulled a second early. The import
  * architecture already survives it — every file commits atomically, so the
- * bytes are safe (`docs/tasks/import/ARCHITECTURE.md` §4.4).
+ * bytes are safe (`4c5eb2f:docs/tasks/import/ARCHITECTURE.md` §4.4).
  *
  * ## What #79 took over, and what stayed here
  *

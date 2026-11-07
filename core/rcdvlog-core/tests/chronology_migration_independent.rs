@@ -1,7 +1,7 @@
 //! Independent falsification tests for D01-T007 ("Chronology domain model and
 //! operation vocabulary").
 //!
-//! Mandate: `docs/tasks/desktop/tasks/D01-T007-chronology-domain-model.md`,
+//! Mandate: `4c5eb2f:docs/tasks/desktop/tasks/D01-T007-chronology-domain-model.md`,
 //! "## Independent test charter". The principal invariant under attack:
 //!
 //! > Migration 9 replaces the flat clock-event model with the full persisted

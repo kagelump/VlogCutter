@@ -101,9 +101,9 @@ const required = [
   "docs/server/api.md",
   "docs/server/development-and-testing.md",
   "docs/server/troubleshooting.md",
-  "docs/tasks/server/schemas/baseline-v1.schema.json",
-  "docs/tasks/server/schemas/reconcile-v1.schema.json",
-  "docs/tasks/server/schemas/reconcile-response-v1.schema.json",
+  "docs/contracts/sync-baseline-v1.schema.json",
+  "docs/contracts/sync-reconcile-v1.schema.json",
+  "docs/contracts/sync-reconcile-response-v1.schema.json",
 ];
 for (const path of required) {
   if (!existsSync(join(root, path)) || !statSync(join(root, path)).isFile()) {
