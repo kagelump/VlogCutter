@@ -66,7 +66,12 @@ fn fixture(responses: Vec<Value>) -> (String, thread::JoinHandle<Vec<(String, Va
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
                     match listener.accept() {
-                        Ok((stream, _)) => break respond(stream, &body),
+                        // macOS/BSD accepted sockets inherit the listener's
+                        // O_NONBLOCK (Linux does not); `respond` reads blocking.
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            break respond(stream, &body);
+                        }
                         Err(error)
                             if error.kind() == std::io::ErrorKind::WouldBlock
                                 && Instant::now() < deadline =>

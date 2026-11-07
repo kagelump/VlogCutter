@@ -744,7 +744,7 @@ fn kernel_identity() -> String {
 fn platform_cpu_model() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        return crate::prerequisites::run_bounded_command(
+        crate::prerequisites::run_bounded_command(
             Path::new("/usr/sbin/sysctl"),
             &[OsString::from("-n"), OsString::from("hw.model")],
             Duration::from_secs(1),
@@ -752,7 +752,7 @@ fn platform_cpu_model() -> Option<String> {
         )
         .ok()
         .filter(|result| result.status.success())
-        .map(|result| String::from_utf8_lossy(&result.stdout).trim().to_string());
+        .map(|result| String::from_utf8_lossy(&result.stdout).trim().to_string())
     }
     #[cfg(not(target_os = "macos"))]
     {

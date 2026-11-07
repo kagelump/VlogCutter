@@ -798,7 +798,10 @@ fn camera_proxy_cli_round_trips_a_generated_lrf_without_changing_media() {
     );
     assert_eq!(
         registered.json["data"]["provenance"]["originalLocation"],
-        original.to_string_lossy().as_ref()
+        fs::canonicalize(&original)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
     );
     assert_eq!(
         registered.json["data"]["provenance"]["originalRelativePath"],

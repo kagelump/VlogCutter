@@ -1,7 +1,5 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
 // Only existing, modified Linux deployment files. Server Rust, Docker build
 // recipes, docs and new/renamed paths deliberately remain platform-relevant.
@@ -43,7 +41,8 @@ export function decidePlatform(eventName, event, git = (args) => {
     return { macos: true, reason: "Change detection unavailable or ambiguous; running macOS" };
   }
 }
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// import.meta.main survives symlinked paths (macOS /var -> /private/var).
+if (import.meta.main) {
   let result;
   try { result = decidePlatform(process.env.GITHUB_EVENT_NAME, JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"))); }
   catch { result = { macos: true, reason: "Event unavailable; running macOS" }; }

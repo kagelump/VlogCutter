@@ -148,6 +148,7 @@ export function runGate({ args = process.argv.slice(2), spawn = spawnSync, write
   return failedChecks === 0 ? 0 : 1;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// import.meta.main survives symlinked paths (macOS /var -> /private/var).
+if (import.meta.main) {
   process.exitCode = runGate();
 }

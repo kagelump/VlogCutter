@@ -1,5 +1,3 @@
-import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
 export function requiredFailures(needs) {
   const failures = [];
@@ -10,7 +8,8 @@ export function requiredFailures(needs) {
   if (needs?.macos?.result !== (macosRequired ? "success" : "skipped")) failures.push("macos");
   return failures;
 }
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// import.meta.main survives symlinked paths (macOS /var -> /private/var).
+if (import.meta.main) {
   const needs = JSON.parse(process.env.CI_NEEDS ?? "{}");
   const failures = requiredFailures(needs);
   console.log(JSON.stringify(needs, null, 2));

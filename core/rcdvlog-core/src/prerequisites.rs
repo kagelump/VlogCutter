@@ -542,7 +542,14 @@ mod tests {
         assert_eq!(missing.status, ToolPrerequisiteStatus::Missing);
         assert!(!missing.available);
         assert!(!missing.supported);
-        assert!(missing.remediation.as_deref().unwrap().contains("PATH"));
+        // Remediation is platform-specific: a Homebrew command on macOS, a
+        // PATH instruction elsewhere.
+        let remediation = missing.remediation.as_deref().unwrap();
+        if cfg!(target_os = "macos") {
+            assert!(remediation.contains("brew install ffmpeg"), "{remediation}");
+        } else {
+            assert!(remediation.contains("PATH"), "{remediation}");
+        }
 
         let path = temp.path().join("ffprobe");
         fs::write(&path, "#!/bin/sh\nprintf 'ffprobe version 7.0.0\\n'\n").unwrap();
