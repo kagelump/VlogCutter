@@ -675,7 +675,7 @@ pub fn detect(facts: &ChronologyFacts, solved: &[AssetChronology]) -> Vec<Contra
 
 /// Turns persisted chronology evidence into a derived solution.
 ///
-/// Pure. Deterministic. Total. The pipeline follows `PRD.md` §9.5: capture
+/// Pure. Deterministic. Total. The pipeline order: capture
 /// chains, raw hypotheses, clock epochs, trip-context timezones, user
 /// constraints, contradiction detection, best times, total order, confidence
 /// and evidence.

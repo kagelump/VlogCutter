@@ -84,7 +84,7 @@ if (existsSync(agentsMdPath)) {
     failures.push(
       `AGENTS.md is ${size} bytes, over the ${agentsMdLimitBytes}-byte limit. ` +
         "AGENTS.md is an index: put feature detail (schema numbers, contracts, " +
-        "measurements) in a focused doc under docs/ (e.g. docs/implementation-status.md) " +
+        "measurements) in a focused doc under docs/ " +
         "and keep only one index line plus a link here.",
     );
   }
@@ -101,9 +101,9 @@ const required = [
   "docs/server/api.md",
   "docs/server/development-and-testing.md",
   "docs/server/troubleshooting.md",
-  "docs/tasks/server/schemas/baseline-v1.schema.json",
-  "docs/tasks/server/schemas/reconcile-v1.schema.json",
-  "docs/tasks/server/schemas/reconcile-response-v1.schema.json",
+  "docs/contracts/sync-baseline-v1.schema.json",
+  "docs/contracts/sync-reconcile-v1.schema.json",
+  "docs/contracts/sync-reconcile-response-v1.schema.json",
 ];
 for (const path of required) {
   if (!existsSync(join(root, path)) || !statSync(join(root, path)).isFile()) {

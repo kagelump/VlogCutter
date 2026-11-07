@@ -1,6 +1,6 @@
 # Native macOS desktop smoke test checklist
 
-Repeatable checklist for exercising the implemented portion of the `PRD.md`
+Repeatable checklist for exercising the implemented portion of the (now removed) `PRD.md`
 §21.1 user journey against the real native macOS application. CI cannot do
 this; every row here tests something headless runners cannot reach.
 
@@ -15,7 +15,7 @@ claims are established.
 
 One row to read carefully: row 12 expects the review position to be restored on
 relaunch. The frontend records it on every selection change and never reads it
-back (`docs/tasks/harness/FINDINGS.md` §2), so if that row passes, something on
+back (`4c5eb2f:docs/tasks/harness/FINDINGS.md` §2), so if that row passes, something on
 the Rust side is doing it — record which.
 
 ## Preconditions
@@ -40,7 +40,7 @@ the Rust side is doing it — record which.
 | 5 | Thumbnails generated | After ingest, observe the review lane. | Every asset shows a thumbnail. Progress bar and ETA update during batch generation. |
 | 6 | Proxies generated | Trigger proxy generation for all assets. Interrupt by quitting mid-batch. Relaunch. | Completed proxies survive interruption. Batch resumes from where it stopped, not from the beginning. |
 | 7 | Loopback media playback | Click a clip with a proxy. Press play. | Video plays with audio in the Tauri webview (not a browser). Seek to middle: frame updates. |
-| 7a | Un-played first frame | Open a project with no proxies and no thumbnails. Select a clip and do not press play. | The first frame is on screen. This is what the loopback origin exists for; see `docs/tasks/desktop/MEDIA_DELIVERY.md`. |
+| 7a | Un-played first frame | Open a project with no proxies and no thumbnails. Select a clip and do not press play. | The first frame is on screen. This is what the loopback origin exists for; see `4c5eb2f:docs/tasks/desktop/MEDIA_DELIVERY.md`. |
 | 8 | Rotation | Find a portrait clip (e.g. phone video). Observe orientation. Rotate 90°. Relaunch. | Initial orientation matches camera metadata. Rotation change persists across relaunch. |
 | 9 | Labels, notes, reversible removal | Add a label, type a note, remove a clip. Relaunch. | Label persists. Note persists (Enter saves, Shift+Enter saves-and-advances). Removed clip appears in removed list and can be restored. |
 | 10 | Keyboard-first review | Navigate with j/k (next/previous), space (toggle removal), +/- (zoom), return (centre). Type in notes field. | All keyboard shortcuts work without mouse. Typing in notes does not trigger review shortcuts (focus isolation). |

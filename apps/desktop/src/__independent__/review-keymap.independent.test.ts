@@ -86,7 +86,7 @@ describe("independent: acceptance oracle case 8 + charter — system shortcuts a
 });
 
 describe("independent: acceptance oracle case 9 — every current App.tsx review binding resolves", () => {
-  // Enumerated independently from AGENTS.md section 10 ("Keyboard contract")
+  // Enumerated independently from docs/desktop.md ("Keyboard contract")
   // and the packet's own description of the keydown handler, NOT copied from
   // any implementer test file: J/K or arrow keys move; R toggles removed;
   // [ / ] zoom the story ribbon; C centers the selection.

@@ -9,7 +9,7 @@
  *
  * What this can never establish: whether WKWebView paints a first frame,
  * whether a codec decodes, whether an unbuffered seek works. Those are the
- * three acceptance criteria in `docs/tasks/desktop/MEDIA_DELIVERY.md`, and they
+ * three acceptance criteria in `4c5eb2f:docs/tasks/desktop/MEDIA_DELIVERY.md`, and they
  * stay in the native tier.
  */
 

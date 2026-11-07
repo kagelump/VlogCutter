@@ -1,5 +1,5 @@
 //! Diagnostic record types, frozen by D01-T027
-//! (`docs/tasks/desktop/DIAGNOSTICS_MODEL.md`).
+//! (`4c5eb2f:docs/tasks/desktop/DIAGNOSTICS_MODEL.md`).
 //!
 //! A diagnostic is a durable, local observation about one node's view of the
 //! world. It is not a typed operation: it carries no HLC time, takes no part in

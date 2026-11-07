@@ -35,4 +35,4 @@ The OpenAPI document is Rust-owned. Run `pnpm generate:openapi` only after an in
 
 Tests must use temporary directories and explicit catalog/server selection. Never aim a test at a real project root, `/Volumes`, a live server data root, or a NAS original tree. Keep original mounts read-only even in fixtures that exercise failure paths.
 
-See [integration-testing.md](../integration-testing.md) for the exact automated/manual boundary and the [Task 19 report](../tasks/server/ACCEPTANCE_TASK_19.md) for the last accepted environment.
+See [integration-testing.md](../integration-testing.md) for the exact automated/manual boundary and the Task 19 report (`git show 4c5eb2f:docs/tasks/server/ACCEPTANCE_TASK_19.md`) for the last accepted environment.

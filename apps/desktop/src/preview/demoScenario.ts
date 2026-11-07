@@ -301,7 +301,7 @@ export function previewScenario(): ScenarioBuilder {
 /**
  * A project at the scale the product is designed for.
  *
- * AGENTS.md §1 sets it: thousands of mostly 4K/60 clips across about five
+ * AGENTS.md (scale target) sets it: thousands of mostly 4K/60 clips across about five
  * cameras. Nothing here is staged for legibility — there is no card in the
  * slot, no chronology problem, no edit plan — because the only question this
  * scenario exists to answer is what the two review surfaces cost to mount when

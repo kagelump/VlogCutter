@@ -27,7 +27,7 @@ pub struct PreviewRequest {
 }
 
 /// One clip that could not be rendered. Per-clip failures never abort the batch
-/// silently (`AGENTS.md` §15): outcomes name failures and block publication.
+/// silently (`docs/engineering-reference.md`, "Safety and working-tree discipline"): outcomes name failures and block publication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewFailure {
@@ -291,7 +291,7 @@ impl Catalog {
             let duration = (operation.source_out_seconds - operation.source_in_seconds).max(0.0);
             // Arguments are structured through `Command`, never assembled as a
             // shell string: media paths contain spaces and non-ASCII characters
-            // (`AGENTS.md` §15).
+            // (`docs/engineering-reference.md`, "Safety and working-tree discipline").
             let canvas_height = request.max_height.max(2) / 2 * 2;
             let canvas_width = (canvas_height * 16 / 9) / 2 * 2;
             let rotation = match asset.rotation_degrees % 360 {

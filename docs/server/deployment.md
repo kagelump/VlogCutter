@@ -46,4 +46,4 @@ Migrations are forward-only and transactional. Do not downgrade against migrated
 
 ## Evidence boundary
 
-The deployment invariants are statically tested, but Docker was unavailable during Task 19; Compose rendering and the real Ubuntu/NAS topology were not executed. Complete the 17-row target-topology matrix in the [acceptance report](../tasks/server/ACCEPTANCE_TASK_19.md) before calling a release deployment accepted.
+The deployment invariants are statically tested, but Docker was unavailable during Task 19; Compose rendering and the real Ubuntu/NAS topology were not executed. Complete the 17-row target-topology matrix in the Task 19 acceptance report (`git show 4c5eb2f:docs/tasks/server/ACCEPTANCE_TASK_19.md`) before calling a release deployment accepted.

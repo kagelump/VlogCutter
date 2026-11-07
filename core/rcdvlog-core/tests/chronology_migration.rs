@@ -123,7 +123,7 @@ fn build_schema8_catalog(
     path
 }
 
-/// The review order of record (`AGENTS.md` §9): `best_time IS NULL`,
+/// The review order of record (`docs/engineering-reference.md`, "Core data and media behavior"): `best_time IS NULL`,
 /// `best_time`, `filename`, `id`.
 fn ordered_asset_ids(connection: &Connection, project_id: &str) -> Vec<String> {
     let mut statement = connection

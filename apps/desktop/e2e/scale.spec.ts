@@ -4,7 +4,7 @@ import { SIZES } from "./support";
 /**
  * What the two review surfaces cost to mount at the scale the product targets.
  *
- * AGENTS.md §1: thousands of mostly 4K/60 clips. The queue and the story ribbon
+ * AGENTS.md (scale target): thousands of mostly 4K/60 clips. The queue and the story ribbon
  * both position fixed-geometry children absolutely and window them, and the
  * property that makes that worth having — the DOM stays bounded while the
  * project grows — is exactly the one jsdom cannot check, because it has no

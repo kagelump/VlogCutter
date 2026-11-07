@@ -32,7 +32,7 @@ declare global {
  * How many clips the preview should seed, from `?clips=` in the URL.
  *
  * The demo project is fourteen clips, chosen to make every surface legible.
- * Nothing in it can answer "what does this cost at the scale AGENTS.md §1
+ * Nothing in it can answer "what does this cost at the scale AGENTS.md (scale target)
  * sets" — thousands of clips — and that is a real-engine question: mounting
  * three thousand rows is a reconciliation and layout cost jsdom does not have.
  * So the preview takes a size, and the browser tier asks the question.

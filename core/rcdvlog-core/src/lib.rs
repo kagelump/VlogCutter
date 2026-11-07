@@ -1761,7 +1761,7 @@ impl Catalog {
     /// user can read rather than an import they have to undo.
     ///
     /// Matching is by content. Filenames and folder structure are not evidence —
-    /// two cards legitimately both contain `C0001.MP4` (`PRD.md` §8.2).
+    /// two cards legitimately both contain `C0001.MP4`.
     pub fn relink_folder<F>(
         &self,
         project_id: &str,
@@ -2209,7 +2209,7 @@ impl Catalog {
     /// Every operation that reads original media goes through here. Path
     /// existence is not enough: a reformatted card can put a different clip at
     /// the same `.../C0012.MP4`, and transcoding or exporting that would produce
-    /// silently wrong output. See `docs/tasks/import/ARCHITECTURE.md` §3.2.
+    /// silently wrong output. See `4c5eb2f:docs/tasks/import/ARCHITECTURE.md` §3.2.
     ///
     /// The fingerprint is computed at most once per file version. A location
     /// already verified, whose size and modification time are unchanged, is

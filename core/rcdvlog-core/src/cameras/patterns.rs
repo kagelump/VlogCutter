@@ -1,5 +1,5 @@
 //! The camera filename-pattern table (D01-T028), documented in
-//! `docs/tasks/desktop/CAMERA_PATTERNS.md`.
+//! `4c5eb2f:docs/tasks/desktop/CAMERA_PATTERNS.md`.
 //!
 //! This is deliberately *data*, not scattered branches: adding support for a
 //! new camera is a new row here plus a row in the documentation, and nothing

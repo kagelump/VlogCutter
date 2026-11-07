@@ -1,7 +1,5 @@
 # Development environment and running the app
 
-Relocated verbatim from the repository-root `AGENTS.md` sections 6 ("Toolchain and prerequisites") and 7 ("Running the app") so the root file can stay a short index (issue #260). Rules that must not be violated (fixed ports, debug-only seams, media-origin security) are repeated inline in `AGENTS.md`.
-
 ## Toolchain and prerequisites
 
 Minimum documented environment:
@@ -139,7 +137,7 @@ full media paths, so it must stay compiled out of release like the eval bridge;
 `apps/desktop/src-tauri/tests/release_dev_seams_absent.rs` proves both are.
 
 The client prints JSON values and structured JavaScript errors. Every probe is
-logged by the running app. See `docs/tasks/desktop/DEV_EVAL_BRIDGE.md` for the
+logged by the running app. See `4c5eb2f:docs/tasks/desktop/DEV_EVAL_BRIDGE.md` for the
 contract, tests, and release-binary absence check.
 
 The Vite-only browser preview is useful for fast layout and interaction work:

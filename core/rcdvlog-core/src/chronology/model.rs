@@ -1,5 +1,5 @@
 //! Persisted chronology fact types, frozen by D01-T007
-//! (`docs/tasks/desktop/CHRONOLOGY_MODEL.md`).
+//! (`4c5eb2f:docs/tasks/desktop/CHRONOLOGY_MODEL.md`).
 //!
 //! These rows are *evidence only*. Trip time, local display time, confidence,
 //! evidence, uncertainty, and total order are derived by the solver (D01-T008)
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// One capture sequence: a likely monotonic filename chain scoped to one card.
 /// Filename identity is scoped to the capture sequence because two cards reuse
-/// the same counter (`PRD.md` §8.2).
+/// the same counter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureSequence {
@@ -21,7 +21,7 @@ pub struct CaptureSequence {
 }
 
 /// The per-asset hypothesis the solver starts from: what the camera claimed.
-/// Raw camera timestamps are never edited (`PRD.md` §9.1).
+/// Raw camera timestamps are never edited.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetTimeHypothesis {
@@ -102,7 +102,7 @@ pub enum PhaseSplitDirection {
     From,
 }
 
-/// Where the user physically was, with timezone context (`PRD.md` §10).
+/// Where the user physically was, with timezone context.
 /// Local display time derives from the covering phase, never from camera
 /// metadata timezone (architecture contract §3.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,7 +138,7 @@ pub enum ConstraintStrength {
     Soft,
 }
 
-/// Ordering knowledge independent of exact time (`PRD.md` §9.3).
+/// Ordering knowledge independent of exact time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventOrderConstraint {

@@ -96,7 +96,7 @@ export interface ServerEndpoint {
 /**
  * The loopback HTTP origin review media is served from, and the token that
  * opens it. Minted per session by the desktop app, never persisted, and gone
- * when the process is. See `docs/tasks/desktop/MEDIA_DELIVERY.md`.
+ * when the process is. See `4c5eb2f:docs/tasks/desktop/MEDIA_DELIVERY.md`.
  */
 export interface MediaOrigin {
   baseUrl: string;

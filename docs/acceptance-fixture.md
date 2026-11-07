@@ -1,7 +1,5 @@
 # Real-project acceptance fixture
 
-Relocated verbatim from the repository-root `AGENTS.md` section 13 so the root file can stay a short index (issue #260). `AGENTS.md` keeps the never-hard-code-the-path and read-only rules inline.
-
 Scale acceptance runs against a large real corpus that is **not** named in this
 repository. Point the tooling at it through local configuration:
 

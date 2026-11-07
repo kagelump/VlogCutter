@@ -8,13 +8,13 @@
 //! recognized and named in a banner before a single byte is read. This is a
 //! card-level hint for the banner and the archive path; per-asset camera
 //! identity still comes from EXIF first and the filename-pattern table second
-//! (`docs/tasks/desktop/CAMERA_PATTERNS.md`), and folder structure never
+//! (`4c5eb2f:docs/tasks/desktop/CAMERA_PATTERNS.md`), and folder structure never
 //! overrides either.
 //!
 //! **Is this the same card as last time?** Answered by a session identity built
 //! from the volume label and the card's **earliest** media entry in sorted order
 //! — its relative path, size, and modification time. Adapted from
-//! `docs/tasks/travel/ARCHITECTURE.md` §5.3, lifted here so the desktop does not
+//! `4c5eb2f:docs/tasks/travel/ARCHITECTURE.md` §5.3, lifted here so the desktop does not
 //! wait on the travel epic to use it.
 //!
 //! Three properties the import workflow depends on, and why the anchor is one

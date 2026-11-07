@@ -121,7 +121,7 @@ private and local.
 microphone recording into conservative recording segments with movie offsets.
 It does not replace `source-audio-landmark-match`; selecting the older command
 (or not running this one) is the rollback, and no catalog state changes either
-way. Design and plan: `docs/tasks/tv-review/SOURCE_AUDIO_MVP_DESIGN.md` and
+way. Design and plan: `4c5eb2f:docs/tasks/tv-review/SOURCE_AUDIO_MVP_DESIGN.md` and
 `SOURCE_AUDIO_MVP_PLAN.md`. Domain behavior lives in `rcdvlog-core`
 (`source_audio_pooled`, `source_audio_sessions`, `source_audio_segments`); the
 CLI only reads files, calls core and formats JSON.

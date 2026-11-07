@@ -119,7 +119,7 @@ candidate; the wrapper rechecks identity before external actions.
 ### Pins, cache and disk
 
 Rust 1.97.1, Node 24.11.0, pnpm 10.17.0 and all action commit pins remain
-explicit. Rust components include rustfmt/Clippy. Keep `AGENTS.md` section 6
+explicit. Rust components include rustfmt/Clippy. Keep the `AGENTS.md` "Toolchain" section
 in step with deliberate toolchain updates. `Swatinem/rust-cache` prunes
 workspace artifacts before saving, with `cache-on-failure: true`; plain caches
 of the roughly 14 GB target tree grow without pruning. The Rust matrix uses distinct lint/tests cache keys so the first job to finish
@@ -174,4 +174,4 @@ CI does not prove Resolve import, native dialogs/permissions/playback,
 sleep/wake or volume reconnect, NAS scale, real Ubuntu/Compose/NFS/SMB
 restart behavior, LAN Caddy trust or Tailscale topology, signing/notarization,
 or laptop CPU/RSS/thermals. Browser tests prove Chromium behavior against the
-in-memory IPC harness, not native media/persistence. See `AGENTS.md` section 12.
+in-memory IPC harness, not native media/persistence. See `docs/engineering-reference.md` ("Testing and verification").

@@ -1,6 +1,6 @@
 # Desktop UI conventions
 
-Relocated verbatim from the repository-root `AGENTS.md` section 10 ("Desktop UI conventions") so the root file can stay a short index (issue #260). The keyboard contract and the rules that must not be violated are repeated inline in `AGENTS.md`; this file holds the full text.
+Keyboard contract: [desktop.md](desktop.md).
 
 The UI is intentionally keyboard-first and dense, using one main `App.tsx` today. Keep domain logic out of it even if component extraction is useful.
 
@@ -61,7 +61,7 @@ Review video is **not** served over the Tauri asset protocol. `WKWebView` never
 produces a video frame for media delivered through a custom scheme, so an
 un-played clip has no first frame; the app binds its own loopback HTTP origin at
 startup and `api.mediaUrl` points at that instead. See
-`apps/desktop/src-tauri/src/media_server.rs`, `docs/tasks/desktop/MEDIA_DELIVERY.md`,
+`apps/desktop/src-tauri/src/media_server.rs`, `4c5eb2f:docs/tasks/desktop/MEDIA_DELIVERY.md`,
 and the evidence in `docs/desktop/HARD_LESSONS.md`. Its eight security
 requirements — loopback bind, session token, asset ids rather than paths,
 storage-root re-validation, `Host`/`Origin` checks, `GET`/`HEAD` only, no token

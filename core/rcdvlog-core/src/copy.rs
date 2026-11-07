@@ -1,7 +1,7 @@
 //! Committing original bytes into an archive root.
 //!
 //! This is the one place in the application that writes original media, and it
-//! is deliberately the most conservative code in the repository. `AGENTS.md` §2
+//! is deliberately the most conservative code in the repository. `AGENTS.md` (Invariants)
 //! is amended only far enough to permit *copying from a removable card into a
 //! configured archive root* — the card is read-only throughout, and nothing here
 //! renames, overwrites, truncates, or deletes anything, on the card or under the

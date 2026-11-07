@@ -1,7 +1,7 @@
 //! Deterministic OpenTimelineIO export (D01-T022).
 //!
 //! A pure-Rust writer. No Python, no `otiotool`, no shelling out to the
-//! reference implementation — `PRD.md` §21.3 forbids a permanent Python
+//! reference implementation — the project forbids a permanent Python
 //! dependency, and an export path is not sufficient reason to breach it. The
 //! accepted cost is that this repository owns schema fidelity, which is exactly
 //! why D01-T024's real Resolve import gate is required rather than optional.

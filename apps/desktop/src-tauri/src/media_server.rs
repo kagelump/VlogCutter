@@ -5,7 +5,7 @@
 //! macOS: an element that has never been played reports `readyState 4`, correct
 //! dimensions and no error, and holds nothing paintable. That is a property of
 //! the transport, so the fix is a different transport rather than a workaround
-//! at the call site. See `docs/tasks/desktop/MEDIA_DELIVERY.md`.
+//! at the call site. See `4c5eb2f:docs/tasks/desktop/MEDIA_DELIVERY.md`.
 //!
 //! A loopback listener is reachable by every process on the machine and, for
 //! some request shapes, by any web page the user has open. The defences below

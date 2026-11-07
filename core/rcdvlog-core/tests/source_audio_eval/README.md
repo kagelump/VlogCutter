@@ -1,7 +1,7 @@
 # Source-audio evaluation assets
 
 Vendored evaluation assets for the source-audio MVP
-(`docs/tasks/tv-review/SOURCE_AUDIO_MVP_PLAN.md`, step 1) plus deterministic
+(`4c5eb2f:docs/tasks/tv-review/SOURCE_AUDIO_MVP_PLAN.md`, step 1) plus deterministic
 public synthetic audio for CI. This directory is the repo-side eval/test home
 for the source-audio recognizer: it sits under `core/rcdvlog-core/tests/`
 because the frozen policy and expected metrics are fixtures for the core

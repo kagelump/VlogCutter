@@ -11,7 +11,7 @@
 //! ## The line this module must not cross
 //!
 //! Originals and archive copies are never deleted, moved, renamed, or
-//! rewritten (`AGENTS.md` §2, and the import epic's §2.1 amendment which only
+//! rewritten (`AGENTS.md` (Invariants), and the import epic's §2.1 amendment which only
 //! ever *adds* a copy). Nothing here deletes by path pattern or by walking
 //! upward. Cleanup deletes inside one `cache` directory whose location is
 //! derived from the catalog file, and `audit_project_removal` refuses to
