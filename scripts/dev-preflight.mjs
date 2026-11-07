@@ -99,15 +99,30 @@ export function runPreflight({
       record("pnpm", "fail", result.ok ? `${version}, but CI pins ${pins.pnpm}` : "not found on PATH", `Install pnpm ${pins.pnpm} (\`corepack enable && corepack prepare pnpm@${pins.pnpm} --activate\`).`);
     },
     rust() {
-      const result = run("rustc", [`+${pins.rust}`, "--version"]);
-      const fix = `Install the pinned toolchain: \`rustup toolchain install ${pins.rust} --component rustfmt clippy\` (rustup is required; source ~/.cargo/env if cargo is missing).`;
-      if (!result.ok) return record("rust", "fail", `rustc +${pins.rust} is unavailable`, fix);
-      if (!new RegExp(`^rustc ${pins.rust.replaceAll(".", "\\.")}\\b`, "m").test(result.output)) {
-        return record("rust", "fail", `rustc +${pins.rust} reported: ${result.output.trim().split("\n")[0]}`, fix);
+      // The gate runs `cargo +<pin> ...`, which only rustup's proxy understands.
+      // Check cargo itself: a Homebrew rustc of the same version ignores `+<pin>`
+      // and would pass a rustc-only check while every gate cargo command fails.
+      const install = `\`rustup toolchain install ${pins.rust} --component rustfmt clippy\` (rustup is required; source ~/.cargo/env if cargo is missing).`;
+      const [cargo] = findOnPath("cargo", env.PATH);
+      if (!cargo) return record("rust", "fail", "cargo not found on PATH", install);
+      const result = run("cargo", [`+${pins.rust}`, "--version"]);
+      if (/no such (?:command|subcommand): `?\+/.test(result.output)) {
+        return record("rust", "fail", `${cargo} is not rustup's proxy, so \`cargo +${pins.rust}\` fails`, `Put rustup's bin directory (usually ~/.cargo/bin) before ${dirname(cargo)} on PATH, or uninstall the non-rustup Rust (e.g. \`brew uninstall rust\`).`);
       }
-      record("rust", "pass", pins.rust);
+      if (!result.ok) return record("rust", "fail", `cargo +${pins.rust} is unavailable`, install);
+      if (!new RegExp(`^cargo ${pins.rust.replaceAll(".", "\\.")}\\b`, "m").test(result.output)) {
+        return record("rust", "fail", `cargo +${pins.rust} reported: ${result.output.trim().split("\n")[0]}`, install);
+      }
+      const [rustc] = findOnPath("rustc", env.PATH);
+      if (rustc && dirname(rustc) !== dirname(cargo)) {
+        return record("rust", "warn", `${pins.rust} via ${cargo}, but rustc resolves to ${rustc}`, `Put ${dirname(cargo)} before ${dirname(rustc)} on PATH so tools that call rustc directly use the pin.`);
+      }
+      record("rust", "pass", `${pins.rust} via ${cargo}`);
     },
     nextest() {
+      if (results.find((result) => result.name === "rust")?.level === "fail") {
+        return record("nextest", "fail", "not checked: `cargo +<pin>` is unusable (see rust above)", "Fix the rust check first.");
+      }
       const result = run("cargo", [`+${pins.rust}`, "nextest", "--version"]);
       const version = result.output.match(/nextest\S* (\d+\.\d+\.\d+)/)?.[1];
       const fix = `\`cargo install --locked cargo-nextest@${pins.nextest}\``;

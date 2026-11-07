@@ -37,13 +37,17 @@ function ffmpegInstall(dir, { version = "7.1.3", encoders = ["libx264", "aac"] }
   executable(dir, "ffprobe", `echo "ffprobe version ${version} Copyright"`);
 }
 
+function fakeCargo({ version = "1.97.1", nextest = 'echo "cargo-nextest 0.9.151 (fake)"' } = {}) {
+  return `case "$2" in\n  --version) echo "cargo ${version} (fake)";;\n  nextest) ${nextest};;\n  *) exit 1;;\nesac`;
+}
+
 /** A complete passing toolchain; `overrides` replace or (with null) remove tools. */
 function toolchain(overrides = {}) {
   const bin = join(tempDir(), "bin");
   const tools = {
     pnpm: 'echo "10.17.0"',
     rustc: 'echo "rustc 1.97.1 (fake)"',
-    cargo: 'if [ "$2" = nextest ] && [ "$3" = --version ]; then echo "cargo-nextest 0.9.151 (fake)"; exit 0; fi\nexit 1',
+    cargo: fakeCargo(),
     exiftool: 'echo "13.36"',
     ...overrides,
   };
@@ -105,12 +109,12 @@ test("the ffmpeg floor comes from the Rust constant, not a copy", () => {
 test("missing or mismatched cargo-nextest fails with the pinned install command", () => {
   const ffmpeg = join(tempDir(), "ffmpeg");
   ffmpegInstall(ffmpeg);
-  const missing = preflight({ path: `${toolchain({ cargo: 'echo "error: no such command: \\`nextest\\`" >&2; exit 101' })}:${ffmpeg}` });
+  const missing = preflight({ path: `${toolchain({ cargo: fakeCargo({ nextest: 'echo "error: no such command: \\`nextest\\`" >&2; exit 101' }) })}:${ffmpeg}` });
   assert.equal(missing.level("nextest"), "fail");
   assert.match(missing.output, /cargo-nextest is not installed \(CI pins 0\.9\.151\)/);
   assert.match(missing.output, /cargo install --locked cargo-nextest@0\.9\.151/);
 
-  const stale = preflight({ path: `${toolchain({ cargo: 'echo "cargo-nextest 0.9.100 (fake)"' })}:${ffmpeg}` });
+  const stale = preflight({ path: `${toolchain({ cargo: fakeCargo({ nextest: 'echo "cargo-nextest 0.9.100 (fake)"' }) })}:${ffmpeg}` });
   assert.equal(stale.level("nextest"), "fail");
   assert.match(stale.output, /0\.9\.100, but CI pins 0\.9\.151/);
 });
@@ -120,16 +124,41 @@ test("wrong node, pnpm, or rust versions fail", () => {
   ffmpegInstall(ffmpeg);
   const result = preflight({
     nodeVersion: "22.0.0",
-    path: `${toolchain({ pnpm: 'echo "9.0.0"', rustc: 'echo "rustc 1.85.0 (fake)"' })}:${ffmpeg}`,
+    path: `${toolchain({ pnpm: 'echo "9.0.0"', cargo: fakeCargo({ version: "1.85.0" }) })}:${ffmpeg}`,
   });
   assert.deepEqual(["node", "pnpm", "rust"].map(result.level), ["fail", "fail", "fail"]);
   assert.match(result.output, /22\.0\.0, but CI pins 24\.11\.0/);
 });
 
+test("a non-rustup cargo first on PATH fails the rust check, even if rustc matches", () => {
+  const ffmpeg = join(tempDir(), "ffmpeg");
+  ffmpegInstall(ffmpeg);
+  // Homebrew's cargo rejects `+<toolchain>`; its rustc of the same version ignores it.
+  const homebrew = join(tempDir(), "homebrew", "bin");
+  executable(homebrew, "cargo", 'echo "error: no such command: \\`+1.97.1\\`" >&2; exit 101');
+  executable(homebrew, "rustc", 'echo "rustc 1.97.1 (Homebrew)"');
+  const result = preflight({ path: `${homebrew}:${toolchain()}:${ffmpeg}` });
+  assert.equal(result.level("rust"), "fail");
+  assert.ok(result.output.includes(`${join(homebrew, "cargo")} is not rustup's proxy`), result.output);
+  assert.ok(result.output.includes(`before ${homebrew} on PATH`), result.output);
+  assert.equal(result.level("nextest"), "fail");
+  assert.match(result.output, /nextest: not checked/);
+});
+
+test("a rustc from another install than cargo only warns", () => {
+  const ffmpeg = join(tempDir(), "ffmpeg");
+  ffmpegInstall(ffmpeg);
+  const other = join(tempDir(), "other");
+  executable(other, "rustc", 'echo "rustc 1.97.1 (Homebrew)"');
+  const result = preflight({ path: `${other}:${toolchain()}:${ffmpeg}` });
+  assert.equal(result.ok, true, result.output);
+  assert.equal(result.level("rust"), "warn");
+});
+
 test("missing exiftool only warns; --skip skips a check", () => {
   const ffmpeg = join(tempDir(), "ffmpeg");
   ffmpegInstall(ffmpeg);
-  const result = preflight({ path: `${toolchain({ exiftool: null, cargo: "exit 101" })}:${ffmpeg}`, skip: ["nextest"] });
+  const result = preflight({ path: `${toolchain({ exiftool: null, cargo: fakeCargo({ nextest: "exit 101" }) })}:${ffmpeg}`, skip: ["nextest"] });
   assert.equal(result.ok, true, result.output);
   assert.equal(result.level("exiftool"), "warn");
   assert.equal(result.level("nextest"), "skip");

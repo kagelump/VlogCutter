@@ -45,6 +45,7 @@ function runCli(name, { fail = "", omit = "", args = ["--scope", "pre-pr"], plan
     rustc: '#!/bin/sh\necho "rustc 1.97.1 (fake)"\n',
     cargo: `#!/bin/sh
 case "$2" in
+  --version) echo "cargo 1.97.1 (fake)"; exit 0 ;;
   fmt) if [ "$FAKE_FAIL" = format ]; then echo "forced fmt failure" >&2; exit 11; fi ;;
   clippy) if [ "$FAKE_FAIL" = clippy ]; then echo "forced clippy failure" >&2; exit 12; fi ;;
   nextest)
@@ -151,7 +152,7 @@ test("CLI fails closed when cargo is missing from PATH", () => {
   const result = runCli("missing command fails closed", { omit: "cargo" });
   assert.equal(result.status, 1);
   // The preflight catches it in about a second, before any slow check starts.
-  assert.match(result.stdout, /FAIL nextest: cargo-nextest is not installed/);
+  assert.match(result.stdout, /FAIL rust: cargo not found on PATH/);
   assert.match(result.stdout, /Gate summary \(pre-pr\): stopped by preflight/);
   assert.doesNotMatch(result.stdout, /=== cargo fmt/);
 });
@@ -170,6 +171,7 @@ test("a clean feature commit with trailing whitespace fails the committed-candid
   writeFileSync(join(bin, "rustc"), '#!/bin/sh\necho "rustc 1.97.1 (fake)"\n', { mode: 0o755 });
   writeFileSync(join(bin, "cargo"), `#!/bin/sh
 case "$2" in
+  --version) echo "cargo 1.97.1 (fake)"; exit 0 ;;
   nextest)
     if [ "$3" = --version ]; then echo "cargo-nextest 0.9.151 (fake)"; exit 0; fi
     echo "     Summary [   1.000s] 1 test run: 1 passed, 0 skipped" ;;
