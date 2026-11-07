@@ -70,4 +70,3 @@ Preserve and update both visible hints and the `?` keyboard map when shortcuts c
 - Command+`N` new project; Command+`O` open catalog; Command+`,` global settings; `?` keyboard map.
 
 Global shortcuts return early for text inputs, textareas, and selects (except modal Escape). A shortcut that moves focus must call `preventDefault()` first.
-
