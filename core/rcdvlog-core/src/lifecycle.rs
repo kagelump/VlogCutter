@@ -22,7 +22,7 @@
 //! ## Why deleting cache files needs no bookkeeping
 //!
 //! `proxy_available` and `thumbnail_available` are derived at read time from
-//! whether the file is there (`lib.rs`'s asset row mapper). A deleted proxy is
+//! whether the file is there (`catalog/rows.rs`'s `row_to_asset`). A deleted proxy is
 //! therefore *immediately* and correctly reported as missing, with no row to
 //! update and no window in which the catalog claims something that is gone.
 //! That is also why cleanup never needs the originals mounted: it reads

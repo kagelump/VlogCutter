@@ -13,7 +13,7 @@
 //! the schema-8 tables, so these are genuinely old catalogs, not new catalogs
 //! described as old. The pre-migration review order is captured with the exact
 //! production ordering query (`ORDER BY best_time IS NULL, best_time, filename,
-//! id`, from `Catalog::list_assets` in `src/lib.rs`), and the post-migration
+//! id`, from `Catalog::list_assets` in `src/catalog/assets.rs`), and the post-migration
 //! order is captured through the public `Catalog::list_assets` seam. The
 //! implementer's fixtures and tests are never imported.
 
@@ -37,7 +37,7 @@ const FIXTURE_DIR: &str = "tests/fixtures/chronology-independent";
 const PROJECT: &str = "project_independent";
 
 /// The production review-order query, byte-identical in semantics to
-/// `Catalog::list_assets` (src/lib.rs, `ORDER BY a.best_time IS NULL,
+/// `Catalog::list_assets` (src/catalog/assets.rs, `ORDER BY a.best_time IS NULL,
 /// a.best_time, a.filename, a.id`).
 const REVIEW_ORDER_SQL: &str = "SELECT id FROM assets WHERE project_id = ?1 ORDER BY best_time IS NULL, best_time, filename, id";
 
@@ -712,7 +712,7 @@ fn large_500_assets() -> [AssetSpec; 500] {
 // row insertion, then the old-model projection.
 // ---------------------------------------------------------------------------
 
-/// Replicates `normalize_datetime` (src/lib.rs), the pre-migration production
+/// Replicates `normalize_datetime` (src/media.rs), the pre-migration production
 /// projection used by `recalculate_clock`.
 fn old_model_best_time(captured_at_raw: Option<&str>, offset_seconds: i64) -> Option<String> {
     let value = captured_at_raw?;
@@ -813,7 +813,7 @@ fn build_schema8_catalog(directory: &Path, spec: &CatalogSpec<'_>) -> PathBuf {
             )
             .expect("insert clock event");
     }
-    // Old-model projection, replicating recalculate_clock (src/operations.rs):
+    // Old-model projection, replicating recalculate_clock (src/operations/materialize.rs):
     // per camera, the offset of the last event (ordered by start_filename,
     // then created_at, then insertion order) whose start_filename is
     // <= the asset's filename.

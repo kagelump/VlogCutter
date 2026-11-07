@@ -725,5 +725,4 @@ fn timing_better(
 }
 
 #[cfg(test)]
-#[path = "calibration_tests.rs"]
 mod tests;

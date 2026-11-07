@@ -267,7 +267,7 @@ impl Catalog {
     /// one identity into `ImportPreflight.camera_identity`, and `run_import`
     /// passes that same string here so the asset this creates and the
     /// capture sequence `materialize_asset_add` files it under (keyed on
-    /// `payload.camera`, see `operations.rs`) can never disagree with what
+    /// `payload.camera`, see `operations/materialize_assets.rs`) can never disagree with what
     /// the dialog showed. Has no effect on already-known content: a relink
     /// never re-probes or re-assigns a camera.
     pub(crate) fn ingest_file_with_camera(

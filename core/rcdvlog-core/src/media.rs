@@ -524,8 +524,7 @@ mod timestamp_candidate_tests {
     use super::*;
 
     #[cfg(unix)]
-    pub(crate) fn probe_with_explicit_start_end_tags() -> (tempfile::TempDir, NormalizedMediaProbe)
-    {
+    fn probe_with_explicit_start_end_tags() -> (tempfile::TempDir, NormalizedMediaProbe) {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -564,7 +563,7 @@ mod timestamp_candidate_tests {
     }
 
     #[test]
-    pub(crate) fn probe_candidates_preserve_origin_timezone_and_unparseable_text() {
+    fn probe_candidates_preserve_origin_timezone_and_unparseable_text() {
         let document = serde_json::json!({
             "format": {"tags": {"creation_time": "2030-01-02T03:04:05Z"}},
             "streams": [{"codec_type":"video", "tags":{"creation_time":"broken-camera-time"}}]
@@ -583,7 +582,7 @@ mod timestamp_candidate_tests {
     }
 
     #[test]
-    pub(crate) fn invalid_calendar_text_keeps_its_explicit_timezone_claim() {
+    fn invalid_calendar_text_keeps_its_explicit_timezone_claim() {
         let found = collect_timestamp_candidates(
             Path::new("clip.mp4"),
             &serde_json::json!({"format":{"tags":{"creation_time":"2030-13-40T31:72:99-08:00"}},"streams":[]}),
@@ -594,7 +593,7 @@ mod timestamp_candidate_tests {
     }
 
     #[test]
-    pub(crate) fn absent_timestamp_candidates_are_an_empty_new_probe_result() {
+    fn absent_timestamp_candidates_are_an_empty_new_probe_result() {
         let found = collect_timestamp_candidates(
             Path::new("generic_clip.mp4"),
             &serde_json::json!({"streams":[]}),
@@ -603,7 +602,7 @@ mod timestamp_candidate_tests {
     }
 
     #[test]
-    pub(crate) fn filename_local_convention_changes_do_not_rewrite_embedded_utc() {
+    fn filename_local_convention_changes_do_not_rewrite_embedded_utc() {
         let document = serde_json::json!({
             "format": {"tags": {"creation_time": "2030-01-02T03:04:05Z"}},
             "streams": []
@@ -617,7 +616,7 @@ mod timestamp_candidate_tests {
 
     #[cfg(unix)]
     #[test]
-    pub(crate) fn explicit_start_end_probe_evidence_survives_operation_baseline_and_export() {
+    fn explicit_start_end_probe_evidence_survives_operation_baseline_and_export() {
         let (_media_dir, probe) = probe_with_explicit_start_end_tags();
         let candidates = probe.timestamp_candidates;
         let start = candidates

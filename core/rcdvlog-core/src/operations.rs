@@ -1053,5 +1053,4 @@ fn label_key(label: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "operations_tests.rs"]
 mod tests;
