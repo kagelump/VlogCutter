@@ -84,7 +84,7 @@ if (existsSync(agentsMdPath)) {
     failures.push(
       `AGENTS.md is ${size} bytes, over the ${agentsMdLimitBytes}-byte limit. ` +
         "AGENTS.md is an index: put feature detail (schema numbers, contracts, " +
-        "measurements) in a focused doc under docs/ (e.g. docs/implementation-status.md) " +
+        "measurements) in a focused doc under docs/ " +
         "and keep only one index line plus a link here.",
     );
   }
