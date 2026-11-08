@@ -7,7 +7,7 @@ function asset(id: string, overrides: Partial<ProjectReviewAsset> = {}): Project
   return {
     projectAssetId: id, filename: `${id}.MP4`, camera: "DJI Pocket 3", mediaObjectId: null, mediaVerificationState: "verified",
     removed: false, rotationDegrees: 0, labels: [], activeNote: null, description: null, durationSeconds: 31, bestTime: null,
-    materializedRevision: 4, activeNoteRevisionId: null, noteRevisionCount: 0, proxy: null, thumbnail: null,
+    materializedRevision: 4, activeNoteRevisionId: null, noteRevisionCount: 0, localProxyAvailable: false, proxy: null, thumbnail: null,
     originalAvailability: "accessible_on_another_node", unresolvedConflictCount: 0, ...overrides,
   };
 }
@@ -96,5 +96,25 @@ test("the clip list opens as a sheet on narrow screens", async () => {
 
 test("a clip without a server preview says why", async () => {
   setup([asset("clip_a", { proxy: { representationId: "rep", state: "available", availableOnServer: false } })]);
-  expect(await screen.findByText("Preview is on another Mac")).toBeVisible();
+  expect(await screen.findByText("Preview is on another device")).toBeVisible();
+});
+
+
+test("an attached CLI proxy plays without a server media-library representation", async () => {
+  const { container } = setup([asset("clip_a", { localProxyAvailable: true, rotationDegrees: 90 })]);
+  await screen.findByRole("heading", { name: "clip_a.MP4" });
+  const video = container.querySelector("video")!;
+  expect(video).toHaveAttribute("src", "/api/v1/projects/p1/assets/clip_a/proxy");
+  expect(video).toHaveAttribute("data-rotation", "90");
+  expect(screen.queryByText("No preview")).toBeNull();
+});
+
+test("unknown original availability is not presented as unreachable", async () => {
+  setup([asset("clip_a", { originalAvailability: null })]);
+  expect(await screen.findByText("The original’s availability has not been established.")).toBeVisible();
+});
+
+test("a reachable attached original is reported even when its proxy is missing", async () => {
+  setup([asset("clip_a", { originalAvailability: "accessible_here" })]);
+  expect(await screen.findByText("The original is available on this server.")).toBeVisible();
 });

@@ -229,6 +229,7 @@ pub struct ControlCatalog {
     database_path: PathBuf,
     node_id: NodeId,
     attached_project_roots: Vec<PathBuf>,
+    protected_media_roots: Vec<PathBuf>,
 }
 
 impl ControlCatalog {
@@ -246,6 +247,11 @@ impl ControlCatalog {
             database_path,
             node_id,
             attached_project_roots: config.attached_project_roots.clone(),
+            protected_media_roots: vec![
+                config.data_dir.clone(),
+                config.temp_dir.clone(),
+                config.backup_dir.clone(),
+            ],
         };
 
         // Durable retry rather than a one-shot "migration 8 just applied"
@@ -322,6 +328,7 @@ impl ControlCatalog {
                 .to_path_buf(),
             self.clone(),
             self.attached_project_roots.clone(),
+            self.protected_media_roots.clone(),
         )
     }
 
