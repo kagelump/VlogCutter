@@ -189,7 +189,10 @@ test("Chrome records a fake-microphone voice review with a manual cue and reopen
   await page.getByRole("button", { name: "OpenRouter (cloud)" }).click();
   await page.getByRole("button", { name: "Check" }).click();
   await expect(page.getByText(/may be sent to the provider/)).toBeVisible();
-  await expect(page.getByText(/No OpenRouter key/)).toBeVisible();
+  // A developer may have a key file even when the fixture clears the env key.
+  // Capture must never enable cloud execution without explicit consent.
+  await expect(page.getByRole("checkbox", { name: /Send this recording to OpenRouter/ })).not.toBeChecked();
+  await expect(page.getByRole("button", { name: "Transcribe", exact: true })).toHaveCount(0);
 
   const href = await page.getByRole("link", { name: "Download WAV" }).getAttribute("href");
   // Fetch from the page so the browser's own session cookie is used.
