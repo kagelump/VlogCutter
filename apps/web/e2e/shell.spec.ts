@@ -98,7 +98,7 @@ test("two Chrome tabs converge concurrent notes when one WebSocket is unavailabl
   }, { timeout: 12_000 }).toMatch(/Concurrent note from tab (one|two)/);
 });
 
-test("Chrome imports a verified TV review target through the real server and declares a YouTube link", async ({ page }) => {
+test("Chrome imports a verified TV review target through the real server and shows its shots", async ({ page }) => {
   const baseURL = process.env.RCDVLOG_WEB_E2E_BASE_URL;
   if (!baseURL) throw new Error("web e2e: no RCDVLOG_WEB_E2E_BASE_URL");
   const handoff = readFileSync(reviewTargetHandoffPath(baseURL), "utf8");
@@ -126,22 +126,13 @@ test("Chrome imports a verified TV review target through the real server and dec
   await dialog.getByRole("button", { name: "Import", exact: true }).click();
   await expect(page.getByRole("heading", { name: /^Cut syntheti/ })).toBeVisible();
   await expect(page.getByText("Ready", { exact: true })).toBeVisible();
-  await expect(page.getByLabel("Video link")).toBeVisible();
-  await page.getByText("Details", { exact: true }).click();
-  await expect(page.getByText("Measured from the rendered movie")).toBeVisible();
-  await page.locator("summary", { hasText: "Shots" }).click();
-  await expect(page.getByRole("table").locator("tbody tr")).toHaveCount(3);
-
-  await page.getByLabel("Video link").fill("https://youtu.be/synthetic02?si=share");
-  await page.getByRole("button", { name: "Save link" }).click();
-  await expect(page.getByRole("link", { name: /youtu\.be\/synthetic02/ })).toBeVisible();
-  await expect(page.getByText(/Not verified to be this exact cut/)).toBeVisible();
-  await page.getByText("Details", { exact: true }).click();
-  await expect(page.getByRole("link", { name: "Version without this YouTube link" })).toBeVisible();
+  // The export declared no YouTube video, so the page offers no YouTube link.
+  await expect(page.getByRole("link", { name: "YouTube" })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: /Shots/ }).getByRole("link")).toHaveCount(3);
 
   // Re-importing the identical handoff reuses the original target rather than adding one.
   await page.getByRole("link", { name: "TV reviews" }).first().click();
-  await expect(targets).toHaveCount(3);
+  await expect(targets).toHaveCount(2);
   await page.getByRole("button", { name: "Import cut" }).first().click();
   await dialog.getByLabel("Export JSON").fill(handoff);
   await dialog.getByRole("button", { name: "Check" }).click();
@@ -343,8 +334,6 @@ test("Chrome imports a historical rendered-artifact review only with an acknowle
   await expect(page.getByRole("heading", { name: /^Cut historic/ })).toBeVisible();
   await expect(page.getByText("Historical", { exact: true })).toBeVisible();
   await expect(page.getByRole("note").filter({ hasText: "Historical cut." })).toContainText("nothing here can render, edit, activate or upload it");
-  await page.getByText("What this doesn’t verify").click();
-  await expect(page.getByText("Current plan renderability was not established by this review", { exact: false })).toBeVisible();
   // Recording is still allowed: discussing an already rendered movie is the point.
   await expect(page.getByRole("link", { name: "Record review" })).toBeVisible();
   await page.getByRole("link", { name: "TV reviews" }).first().click();

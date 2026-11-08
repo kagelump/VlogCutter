@@ -14,10 +14,17 @@ function preflight(overrides: Partial<ReviewTargetPreflight>): ReviewTargetPrefl
   return { outcome: "new", importable: true, existingReviewTargetId: null, conflictingReviewTargetIds: [], maxVerificationAgeSeconds: 604800, preview, checks: [], ...overrides };
 }
 
+const clipAsset = {
+  projectAssetId: "asset_repeated", filename: "C0042.MP4", camera: "Sony", mediaObjectId: null, mediaVerificationState: "unlinked",
+  removed: false, rotationDegrees: 0, labels: ["penguin", "ice", "ship"], activeNote: null, durationSeconds: 9, bestTime: null,
+};
+
 const targetsClient = {
   listReviewTargets: vi.fn().mockResolvedValue({ items: [], nextBefore: null }),
   getReviewTarget: vi.fn().mockResolvedValue(target),
   listReviewSessions: vi.fn().mockResolvedValue({ items: [], nextBefore: null }),
+  listProjectAssets: vi.fn().mockResolvedValue({ items: [clipAsset], nextCursor: null }),
+  listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [] }),
 };
 
 async function openImport() {
@@ -79,34 +86,68 @@ test("a historical export needs explicit acknowledgement and uses the historical
   expect(client.preflightHistoricalReviewTarget).toHaveBeenCalledWith("p1", expect.objectContaining({ acknowledgement: "integrityOnlyCurrentRenderabilityNotEstablished" }));
 });
 
-test("a cut page lists recordings and saving a YouTube link opens the new copy", async () => {
-  const linked = { ...target, reviewTargetId: "rtarget_two", youtube: { videoId: "synthetic02", declaredBy: "serverRebind" as const, identityStatus: "declaredUnverified" as const }, provenance: { ...target.provenance, derivedFromReviewTargetId: "rtarget_one" } };
-  const { client, router } = renderApp("/projects/p1/reviews/rtarget_one", {
-    ...targetsClient,
-    getReviewTarget: vi.fn(async (_p: string, id: string) => id === "rtarget_two" ? linked : target),
-    listReviewSessions: vi.fn().mockResolvedValue({ items: [{ ...session, state: "completed" }], nextBefore: null }),
-    listReviewTargets: vi.fn().mockResolvedValue({ items: [target, linked], nextBefore: null }),
-    declareReviewTargetYoutube: vi.fn().mockResolvedValue({ outcome: "created", reviewTarget: linked }),
-  });
-  expect(await screen.findByText("Completed")).toBeVisible();
-  expect(screen.getByRole("link", { name: "Record review" })).toHaveAttribute("href", "/projects/p1/reviews/rtarget_one/record");
-  await userEvent.type(screen.getByLabelText("Video link"), "not a link");
-  await userEvent.click(screen.getByRole("button", { name: "Save link" }));
-  expect(await screen.findByText("That isn’t a YouTube link or video ID.")).toBeVisible();
-  await userEvent.clear(screen.getByLabelText("Video link"));
-  await userEvent.type(screen.getByLabelText("Video link"), "https://youtu.be/synthetic02?si=share");
-  await userEvent.click(screen.getByRole("button", { name: "Save link" }));
-  await waitFor(() => expect(router.state.location.pathname).toBe("/projects/p1/reviews/rtarget_two"));
-  expect(client.declareReviewTargetYoutube).toHaveBeenCalledWith("p1", "rtarget_one", "synthetic02");
-  expect(await screen.findByRole("link", { name: /youtu\.be\/synthetic02/ })).toBeVisible();
+test("a cut page links to YouTube only when the orchestrator provided a video", async () => {
+  renderApp("/projects/p1/reviews/rtarget_one", targetsClient);
+  expect(await screen.findByRole("heading", { name: /Cut syntheti/ })).toBeVisible();
+  expect(screen.queryByRole("link", { name: "YouTube" })).toBeNull();
+  expect(screen.queryByText(/YouTube/)).toBeNull();
 });
 
-test("the shot list renders only when opened", async () => {
-  renderApp("/projects/p1/reviews/rtarget_one", targetsClient);
-  await screen.findByRole("heading", { name: /Cut syntheti/ });
-  expect(screen.queryByRole("table")).toBeNull();
-  await userEvent.click(screen.getByText("Shots"));
-  expect(within(screen.getByRole("table")).getAllByRole("row")).toHaveLength(3);
+test("the YouTube button opens the declared video", async () => {
+  const linked = { ...target, youtube: { videoId: "synthetic02", declaredBy: "export" as const, identityStatus: "declaredUnverified" as const } };
+  renderApp("/projects/p1/reviews/rtarget_one", { ...targetsClient, getReviewTarget: vi.fn().mockResolvedValue(linked) });
+  expect(await screen.findByRole("link", { name: "YouTube" })).toHaveAttribute("href", "https://www.youtube.com/watch?v=synthetic02");
+  expect(screen.queryByRole("button", { name: /Remove/ })).toBeNull();
+});
+
+test("shots show their length and clip labels, filter by label, and open the clip", async () => {
+  const { router } = renderApp("/projects/p1/reviews/rtarget_one", targetsClient);
+  const shots = await screen.findByRole("region", { name: /Shots/ });
+  const cards = within(shots).getAllByRole("link");
+  expect(cards).toHaveLength(2);
+  expect(cards[0]).toHaveTextContent("2.0s");
+  expect(await within(cards[0]).findByText("penguin, ice, ship")).toBeVisible();
+  await userEvent.type(within(shots).getByLabelText("Filter shots"), "walrus");
+  expect(await within(shots).findByText(/No shots match/)).toBeVisible();
+  await userEvent.clear(within(shots).getByLabelText("Filter shots"));
+  await userEvent.type(within(shots).getByLabelText("Filter shots"), "ICE");
+  await waitFor(() => expect(within(shots).getAllByRole("link")).toHaveLength(2));
+  await userEvent.click(within(shots).getAllByRole("link")[1]);
+  await waitFor(() => expect(router.state.location.search).toBe("?clip=asset_repeated"));
+});
+
+test("a recording without a transcript can be transcribed from the cut page", async () => {
+  const completed = { ...session, state: "completed" as const };
+  const listReviewTranscriptions = vi.fn()
+    .mockResolvedValueOnce({ items: [] })
+    .mockResolvedValue({ items: [run({ state: "running", utterances: [] })] });
+  const { client } = renderApp("/projects/p1/reviews/rtarget_one", {
+    ...targetsClient,
+    listReviewSessions: vi.fn().mockResolvedValue({ items: [completed], nextBefore: null }),
+    listReviewTranscriptions,
+    preflightReviewTranscription: vi.fn().mockResolvedValue({ ready: true, blockers: [], warnings: [], backend: "local", provider: "local", model: "m", audioFingerprint: "f", estimate: { receivedAudioSeconds: 4, segmentCount: 1, maxWindows: 1, priceUsdPerSecond: null, maxCostUsd: null, billingNote: null }, existingRunId: null }),
+    startReviewTranscription: vi.fn().mockResolvedValue(run({ state: "queued", utterances: [] })),
+  });
+  const recordings = await screen.findByRole("region", { name: "Recordings" });
+  await userEvent.click(await within(recordings).findByRole("button", { name: "Transcribe" }));
+  const dialog = await screen.findByRole("dialog", { name: "Transcribe recording" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Check" }));
+  await userEvent.click(await within(dialog).findByRole("button", { name: "Transcribe" }));
+  expect(client.startReviewTranscription).toHaveBeenCalledWith("p1", "rsession_1", { backend: "local" });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(await within(recordings).findByText("Transcribing…")).toBeVisible();
+});
+
+test("a transcribed recording goes straight to its review notes", async () => {
+  renderApp("/projects/p1/reviews/rtarget_one", {
+    ...targetsClient,
+    listReviewSessions: vi.fn().mockResolvedValue({ items: [{ ...session, state: "completed" }], nextBefore: null }),
+    listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [run()] }),
+  });
+  const recordings = await screen.findByRole("region", { name: "Recordings" });
+  expect(await within(recordings).findByRole("link", { name: "Review notes" })).toHaveAttribute("href", "/projects/p1/reviews/rtarget_one/sessions/rsession_1/runs/rtrans_local");
+  expect(within(recordings).getByText(/1 transcript line/)).toBeVisible();
+  expect(within(recordings).queryByRole("button", { name: "Transcribe" })).toBeNull();
 });
 
 /* ---------- Recording ---------- */

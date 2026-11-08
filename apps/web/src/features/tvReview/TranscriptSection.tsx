@@ -147,7 +147,8 @@ function UtteranceLine({ utterance, showRaw }: { utterance: ReviewUtterance; sho
   );
 }
 
-function TranscribeForm({ projectId, sessionId, busy }: { projectId: string; sessionId: string; busy: boolean }) {
+/** Choose where to transcribe, check what it will cost or why it can't run, then start. */
+export function TranscribeForm({ projectId, sessionId, busy, onStarted }: { projectId: string; sessionId: string; busy: boolean; onStarted?: () => void }) {
   const client = useClient();
   const queryClient = useQueryClient();
   const [backend, setBackend] = useState<"local" | "openrouter">("local");
@@ -161,7 +162,7 @@ function TranscribeForm({ projectId, sessionId, busy }: { projectId: string; ses
   const check = useMutation({ mutationFn: () => client.preflightReviewTranscription(projectId, sessionId, request()) });
   const start = useMutation({
     mutationFn: () => client.startReviewTranscription(projectId, sessionId, request()),
-    onSuccess: () => { check.reset(); void queryClient.invalidateQueries({ queryKey: keys.transcriptions(projectId, sessionId) }); },
+    onSuccess: () => { check.reset(); void queryClient.invalidateQueries({ queryKey: keys.transcriptions(projectId, sessionId) }); onStarted?.(); },
   });
   useEffect(() => { check.reset(); }, [backend, budget, acknowledged, zdr]);
 

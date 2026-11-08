@@ -80,9 +80,10 @@ function FullScreen({ children }: { children: ReactNode }) {
   return <main className={styles.fullScreen}>{children}</main>;
 }
 
-/** A page body. `full` pages manage their own width (players, workspaces). */
-export function Page({ children, full = false }: { children: ReactNode; full?: boolean }) {
-  return full ? <div className={styles.pageFull} data-full-page="">{children}</div> : <div className={styles.page}>{children}</div>;
+/** A page body. `wide` suits grids; `full` pages manage their own width (players, workspaces). */
+export function Page({ children, full = false, wide = false }: { children: ReactNode; full?: boolean; wide?: boolean }) {
+  if (full) return <div className={styles.pageFull} data-full-page="">{children}</div>;
+  return <div className={wide ? `${styles.page} ${styles.wide}` : styles.page}>{children}</div>;
 }
 
 export function RouteError() {
