@@ -1,0 +1,122 @@
+/* Design tokens and document-level styles. Component styles live in
+   co-located CSS modules; nothing else should be global. */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #0b1016;
+  --surface: #121921;
+  --surface-2: #19222c;
+  --surface-3: #212c38;
+  --border: #263241;
+  --border-strong: #354558;
+
+  --text: #e4ebf1;
+  --text-muted: #93a1af;
+  --text-faint: #6b7987;
+
+  --accent: #5ec8d1;
+  --accent-strong: #8adde3;
+  --accent-ink: #052126;
+  --accent-soft: rgb(94 200 209 / 14%);
+
+  --positive: #5fcf8a;
+  --warning: #e6b85c;
+  --critical: #f07b72;
+  --critical-soft: rgb(240 123 114 / 14%);
+  --warning-soft: rgb(230 184 92 / 14%);
+  --positive-soft: rgb(95 207 138 / 14%);
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-md: 0.9375rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.375rem;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+
+  --header-height: 52px;
+  --tabbar-height: 58px;
+  --page-max: 1180px;
+  --page-pad: clamp(12px, 3vw, 28px);
+
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+  --shadow-pop: 0 18px 50px rgb(0 0 0 / 45%);
+
+  font-family: var(--font-sans);
+  font-size: 100%;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body { margin: 0; }
+body { min-height: 100dvh; font-size: var(--text-md); background: var(--bg); }
+#root { min-height: 100dvh; }
+
+h1, h2, h3, h4, p, ol, ul, dl, dd, figure { margin: 0; }
+h1, h2, h3, h4 { font-weight: 600; line-height: 1.25; letter-spacing: -0.005em; }
+ol, ul { padding: 0; list-style: none; }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+button, input, select, textarea { font: inherit; color: inherit; }
+img, video { display: block; max-width: 100%; }
+code, kbd, samp { font-family: var(--font-mono); font-size: 0.92em; }
+
+:focus { outline: none; }
+:focus-visible { box-shadow: var(--focus-ring); border-radius: var(--radius-sm); }
+
+::selection { background: rgb(94 200 209 / 35%); }
+
+/* Form controls share one look. */
+:where(input:not([type="checkbox"], [type="radio"], [type="file"])),
+:where(select),
+:where(textarea) {
+  width: 100%;
+  min-height: 38px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+}
+:where(textarea) { resize: vertical; line-height: 1.45; }
+::placeholder { color: var(--text-faint); }
+:where(input, select, textarea):focus-visible { border-color: var(--accent); }
+:where(input, select, textarea):disabled { opacity: 0.55; }
+input[type="checkbox"], input[type="radio"] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); flex: none; }
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* Touch devices get comfortable hit targets without inflating the desktop UI. */
+@media (pointer: coarse) {
+  :where(input:not([type="checkbox"], [type="radio"], [type="file"]), select) { min-height: 44px; font-size: 16px; }
+  :where(textarea) { font-size: 16px; }
+}

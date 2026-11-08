@@ -77,15 +77,18 @@ importers:
       '@rcdvlog/project-client':
         specifier: workspace:*
         version: link:../../packages/project-client
-      '@rcdvlog/review-ui':
-        specifier: workspace:*
-        version: link:../../packages/review-ui
+      '@tanstack/react-query':
+        specifier: ^5.107.1
+        version: 5.107.1(@types/react@19.2.17)(react@19.2.7)
       react:
         specifier: ^19.2.4
         version: 19.2.7
       react-dom:
         specifier: ^19.2.4
         version: 19.2.7(react@19.2.7)
+      react-router:
+        specifier: ^8.5.1
+        version: 8.5.1(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
     devDependencies:
       '@playwright/test':
         specifier: ^1.55.0
@@ -486,6 +489,9 @@ packages:
     engines: {node: '>=18'}
     hasBin: true
 
+  '@remix-run/route-pattern@0.22.1':
+    resolution: {integrity: sha512-czdGJWh09Lapvcqt7Vb09KlrU2PhRJ8xQaI+AItTuD9aDJ5MAgxnS38lnys6Ll+6RJEqPiaUqTwIQhVLwFvv+w==}
+
   '@rolldown/pluginutils@1.0.0-rc.3':
     resolution: {integrity: sha512-eybk3TjzzzV97Dlj5c+XrBFW57eTNhzod66y9HrBlzJ6NsCrWCp/2kaPS3K9wJmurBC0Tdw4yPjXKZqlznim3Q==}
 
@@ -613,6 +619,18 @@ packages:
     resolution: {integrity: sha512-BfzEnDJOt9T8M989/lA37EcJgat01wLRnoi5dQf3QzOH7jzpqTAzdDbVfRljVr5r+jzKqpbHeyOfAaXxAd0PAA==}
     cpu: [x64]
     os: [win32]
+
+  '@tanstack/query-core@5.107.1':
+    resolution: {integrity: sha512-PSyAik11oQBEVOiVy5hjZWHmoUqOXqK1WYy4v55mcxozEfKaQgpUMsgnXhWjuESzSht8JfzqMS1m6M/9CpNgvg==}
+
+  '@tanstack/react-query@5.107.1':
+    resolution: {integrity: sha512-udCOOLp3ZAheUrIHLCe+ZZge6nr2ZUrGMSWcCuXsjY1Bf2JeeE09oxst97PILiCY6N8xo/7bIo3Hvz13zh06FA==}
+    peerDependencies:
+      '@types/react': ^18 || ^19
+      react: ^18 || ^19
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
 
   '@tauri-apps/api@2.11.1':
     resolution: {integrity: sha512-M2FPuYND2m+wh5hfW9ZpSdxMPdEJovPBWwoHJmwUpysTYNHaOkVFN419m/K0LIgjb/7KU2vBgsUepJWugQCvAA==}
@@ -891,6 +909,9 @@ packages:
 
   convert-source-map@2.0.0:
     resolution: {integrity: sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==}
+
+  cookie-es@3.1.1:
+    resolution: {integrity: sha512-UaXxwISYJPTr9hwQxMFYZ7kNhSXboMXP+Z3TRX6f1/NyaGPfuNUZOWP1pUEb75B2HjfklIYLVRfWiFZJyC6Npg==}
 
   cross-spawn@7.0.6:
     resolution: {integrity: sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA==}
@@ -1206,6 +1227,22 @@ packages:
   react-refresh@0.18.0:
     resolution: {integrity: sha512-QgT5//D3jfjJb6Gsjxv0Slpj23ip+HtOpnNgnb2S5zU3CB26G/IDPGoy4RJB42wzFE46DRsstbW6tKHoKbhAxw==}
     engines: {node: '>=0.10.0'}
+
+  react-router@8.5.1:
+    resolution: {integrity: sha512-5u1eQ46QjuXjNfEnLwzrnou1Bm5dquO3xjVYkkMYCudtkicD2AQHtx+fvXzPATtPJx8TW6DR1x1TDRqsfHyZBw==}
+    engines: {node: '>=22.22.0'}
+    peerDependencies:
+      '@types/react': '>=19.2.0'
+      '@types/react-dom': '>=19.2.0'
+      react: '>=19.2.7'
+      react-dom: '>=19.2.7'
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
+      '@types/react-dom':
+        optional: true
+      react-dom:
+        optional: true
 
   react@19.2.7:
     resolution: {integrity: sha512-HNe9WslTbXmFK8o8cmwgAeJFSBvt1bPdHCVKtaaV+WlAN36mpT4hcRpwbf3fY56ar2oIXzsBpOAiIRHAdY0OlQ==}
@@ -1769,6 +1806,8 @@ snapshots:
     dependencies:
       playwright: 1.61.1
 
+  '@remix-run/route-pattern@0.22.1': {}
+
   '@rolldown/pluginutils@1.0.0-rc.3': {}
 
   '@rollup/rollup-android-arm-eabi@4.62.2':
@@ -1845,6 +1884,15 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.62.2':
     optional: true
+
+  '@tanstack/query-core@5.107.1': {}
+
+  '@tanstack/react-query@5.107.1(@types/react@19.2.17)(react@19.2.7)':
+    dependencies:
+      '@tanstack/query-core': 5.107.1
+      react: 19.2.7
+    optionalDependencies:
+      '@types/react': 19.2.17
 
   '@tauri-apps/api@2.11.1': {}
 
@@ -2126,6 +2174,8 @@ snapshots:
   color-name@1.1.4: {}
 
   convert-source-map@2.0.0: {}
+
+  cookie-es@3.1.1: {}
 
   cross-spawn@7.0.6:
     dependencies:
@@ -2437,6 +2487,16 @@ snapshots:
   react-is@17.0.2: {}
 
   react-refresh@0.18.0: {}
+
+  react-router@8.5.1(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7):
+    dependencies:
+      '@remix-run/route-pattern': 0.22.1
+      cookie-es: 3.1.1
+      react: 19.2.7
+    optionalDependencies:
+      '@types/react': 19.2.17
+      '@types/react-dom': 19.2.3(@types/react@19.2.17)
+      react-dom: 19.2.7(react@19.2.7)
 
   react@19.2.7: {}
 
