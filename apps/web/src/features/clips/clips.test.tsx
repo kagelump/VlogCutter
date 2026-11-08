@@ -118,3 +118,20 @@ test("a reachable attached original is reported even when its proxy is missing",
   setup([asset("clip_a", { originalAvailability: "accessible_here" })]);
   expect(await screen.findByText("The original is available on this server.")).toBeVisible();
 });
+
+
+test("a shared link opens its clip even beyond the loaded queue page", async () => {
+  const selected = asset("later_clip", { localProxyAvailable: true, rotationDegrees: 180 });
+  const { router, client, container } = renderApp("/projects/p1?clip=later_clip", {
+    listProjectAssets: vi.fn().mockResolvedValue({ items: [asset("first_clip")], nextCursor: "next-page" }),
+    getProjectReviewAsset: vi.fn().mockResolvedValue(selected),
+  });
+  expect(await screen.findByRole("heading", { name: "later_clip.MP4" })).toBeVisible();
+  expect(client.getProjectReviewAsset).toHaveBeenCalledWith("p1", "later_clip");
+  expect(client.getProjectReviewAsset).not.toHaveBeenCalledWith("p1", "first_clip");
+  expect(router.state.location.search).toBe("?clip=later_clip");
+  expect(container.querySelector("video")).toHaveAttribute("src", "/api/v1/projects/p1/assets/later_clip/proxy");
+  expect(container.querySelector("video")).toHaveAttribute("data-rotation", "180");
+  expect(screen.getByText("Selected clip")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Next clip (J)" })).toBeDisabled();
+});
