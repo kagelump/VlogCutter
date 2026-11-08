@@ -348,6 +348,10 @@ enum AuthPrincipal {
     Device {
         credential_id: String,
     },
+    /// Tailnet user identified by Tailscale Serve headers (opt-in).
+    Tailnet {
+        login: String,
+    },
 }
 
 #[derive(Clone)]
@@ -414,6 +418,21 @@ async fn auth_middleware(
             }
             Err(_) => {}
         }
+    }
+
+    // Tailscale Serve injects identity headers on tailnet-only requests.
+    if state.foundation.config().tailscale_trusted_auth
+        && let Some(login) = request
+            .headers()
+            .get("tailscale-user-login")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty() && v.len() < 200)
+    {
+        let login = login.to_string();
+        request
+            .extensions_mut()
+            .insert(AuthPrincipal::Tailnet { login });
+        return next.run(request).await;
     }
 
     // Try session cookie
@@ -1745,7 +1764,9 @@ async fn create_pairing_code(
 ) -> Response {
     let result = match &principal {
         AuthPrincipal::Browser { session_id, .. } => state.auth.create_pairing_code(session_id),
-        AuthPrincipal::Device { .. } => state.auth.create_pairing_code_for_device(),
+        AuthPrincipal::Device { .. } | AuthPrincipal::Tailnet { .. } => {
+            state.auth.create_pairing_code_for_device()
+        }
     };
     match result {
         Ok(pairing) => match audit_admin(
@@ -4002,6 +4023,7 @@ fn audit_admin(
         AuthPrincipal::Device { credential_id } => {
             (AuditActorType::DeviceCredential, credential_id.as_str())
         }
+        AuthPrincipal::Tailnet { login } => (AuditActorType::BrowserSession, login.as_str()),
     };
     state
         .foundation

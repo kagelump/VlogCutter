@@ -15,6 +15,10 @@ fn actor(principal: &AuthPrincipal) -> ReviewActor {
             actor: ReviewTargetActor::new(AuditActorType::BrowserSession, session_id.as_str()),
             may_assert_human: true,
         },
+        AuthPrincipal::Tailnet { login } => ReviewActor {
+            actor: ReviewTargetActor::new(AuditActorType::BrowserSession, login.as_str()),
+            may_assert_human: true,
+        },
         AuthPrincipal::Device { credential_id } => ReviewActor {
             actor: ReviewTargetActor::new(AuditActorType::DeviceCredential, credential_id.as_str()),
             may_assert_human: false,
