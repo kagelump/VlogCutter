@@ -1,0 +1,71 @@
+.filters {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 140px 160px auto;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+.search { position: relative; }
+.search svg { position: absolute; left: 10px; top: 50%; translate: 0 -50%; color: var(--text-faint); pointer-events: none; }
+.search input { padding-left: 32px; }
+
+@media (max-width: 640px) {
+  .filters { grid-template-columns: 1fr 1fr; }
+  .search { grid-column: 1 / -1; }
+  /* Enter in the search box submits; the button only costs a row. */
+  .searchButton { display: none; }
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--space-3);
+}
+@media (max-width: 640px) {
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-2); }
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  min-width: 0;
+}
+.card[data-selected] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+
+.thumb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.thumb img { width: 100%; height: 100%; object-fit: cover; }
+.thumb input { position: absolute; top: 8px; left: 8px; width: 20px; height: 20px; z-index: 1; }
+
+.cardBody { display: grid; gap: 2px; padding: var(--space-2) var(--space-3) var(--space-3); font-size: var(--text-xs); color: var(--text-muted); }
+.cardBody strong { color: var(--text); font-size: var(--text-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cardTags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+
+.more { display: flex; justify-content: center; padding: var(--space-5) 0; }
+
+.selectionBar {
+  position: sticky;
+  bottom: max(var(--space-3), env(safe-area-inset-bottom));
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: fit-content;
+  max-width: 100%;
+  margin: var(--space-4) auto 0;
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  box-shadow: var(--shadow-pop);
+  font-size: var(--text-sm);
+}
+.selectionBar strong { margin-right: var(--space-2); white-space: nowrap; }

@@ -310,10 +310,10 @@ adds a rule that it grants no render, edit, activation, upload, source-trim or
 feedback-apply authority. Recording sessions use the same readiness policy, so
 discussing an already rendered movie remains possible.
 
-The Chrome import panel detects the purpose discriminator itself, shows what
-the review does not establish, and keeps *Check handoff* disabled until the
-importer ticks the acknowledgement. Historical targets carry a *Historical
-artifact · integrity only* badge in lists, detail and the workspace. Historical sessions may retain movie-time discussion of
+The Chrome import dialog detects the purpose discriminator itself, shows what
+the review does not establish, and keeps *Check* disabled until the
+importer ticks the acknowledgement. Historical targets carry a *Historical*
+badge in lists and on the cut page, and a notice on the cut page and in the review workspace. Historical sessions may retain movie-time discussion of
 known editorial defects, but this evidence grants no render, editing, activation,
 upload, source-trim or feedback-apply authority. Those existing gates remain.
 Digest consistency cannot authenticate the issuer or establish YouTube identity.
