@@ -55,6 +55,29 @@ enum AdminCommand {
     Diagnostics(DiagnosticsCommand),
     #[command(subcommand, about = "Perform explicit sequence-recovery decisions")]
     Recovery(RecoveryCommand),
+    #[command(
+        subcommand,
+        about = "Serve projects directly from same-machine CLI catalogs"
+    )]
+    Projects(ProjectsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectsCommand {
+    #[command(
+        about = "Serve a project from a CLI catalog inside RCDVLOG_ATTACHED_PROJECT_ROOTS instead of a replica"
+    )]
+    Attach {
+        #[arg(long, help = "Absolute path of the project's catalog.sqlite3")]
+        catalog: PathBuf,
+        #[arg(long, help = "Project to attach when the catalog holds several")]
+        project_id: Option<String>,
+    },
+    #[command(about = "Return an attached project to its server replica")]
+    Detach {
+        #[arg(long)]
+        project_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -266,6 +289,29 @@ fn run_local_command(command: LocalCommand) -> Result<serde_json::Value> {
                 }
             }))
         }
+        LocalCommand::Admin(AdminCommand::Projects(ProjectsCommand::Attach {
+            catalog,
+            project_id,
+        })) => {
+            let foundation = RuntimeFoundation::initialize(config)
+                .context("initialize offline project foundation")?;
+            let roots = foundation.config().attached_project_roots.clone();
+            let project = foundation.catalog().project_replicas().attach_catalog(
+                &catalog,
+                &roots,
+                project_id.as_deref(),
+            )?;
+            Ok(serde_json::json!({"ok":true,"result":attached_project_json(&project)}))
+        }
+        LocalCommand::Admin(AdminCommand::Projects(ProjectsCommand::Detach { project_id })) => {
+            let foundation = RuntimeFoundation::initialize(config)
+                .context("initialize offline project foundation")?;
+            let project = foundation
+                .catalog()
+                .project_replicas()
+                .detach_catalog(&project_id)?;
+            Ok(serde_json::json!({"ok":true,"result":attached_project_json(&project)}))
+        }
         LocalCommand::Admin(AdminCommand::Recovery(
             RecoveryCommand::AcceptSequenceDivergence {
                 project_id,
@@ -283,6 +329,16 @@ fn run_local_command(command: LocalCommand) -> Result<serde_json::Value> {
             Ok(serde_json::json!({"ok":true,"result":result}))
         }
     }
+}
+
+/// Local admin output may show the node-local catalog path; API DTOs never do.
+fn attached_project_json(project: &rcdvlog_server_core::ProjectReplica) -> serde_json::Value {
+    serde_json::json!({
+        "projectId": project.project_id,
+        "state": project.state,
+        "attached": project.is_attached(),
+        "catalogPath": project.attached_catalog_path,
+    })
 }
 
 fn write_new_private_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
@@ -317,6 +373,11 @@ fn local_error_metadata(error: &anyhow::Error) -> LocalErrorMetadata {
         LocalErrorMetadata {
             code: error.code(),
             retryable: error.retryable(),
+        }
+    } else if let Some(error) = error.downcast_ref::<rcdvlog_server_core::ProjectReplicaError>() {
+        LocalErrorMetadata {
+            code: error.code(),
+            retryable: false,
         }
     } else if let Some(error) = error.downcast_ref::<rcdvlog_server_core::AuthError>() {
         LocalErrorMetadata {

@@ -77,6 +77,7 @@ export const ClipInspector = forwardRef<InspectorHandle, { projectId: string; as
       <header className={styles.clipHeader}>
         <h2 className={styles.clipName}>{asset.filename}</h2>
         <p className={styles.clipFacts}>{facts.join(" · ")}</p>
+        {asset.description ? <p className={styles.clipDescription}>{asset.description}</p> : null}
         <div className={styles.clipBadges}>
           {asset.removed ? <Badge tone="critical">Removed</Badge> : null}
           {asset.mediaVerificationState === "mismatch" ? <Badge tone="critical">Identity mismatch</Badge> : null}

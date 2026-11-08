@@ -133,6 +133,7 @@ dialog .queueSearch { position: sticky; top: calc(var(--space-4) * -1); z-index:
 .clipHeader { display: grid; gap: 4px; }
 .clipName { font-size: var(--text-md); overflow-wrap: anywhere; }
 .clipFacts { color: var(--text-muted); font-size: var(--text-sm); }
+.clipDescription { font-size: var(--text-sm); line-height: 1.5; margin-top: var(--space-1); }
 .clipBadges { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); min-height: 22px; }
 .saveState { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; color: var(--text-muted); font-size: var(--text-xs); }
 

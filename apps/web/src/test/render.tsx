@@ -2,6 +2,7 @@ import { render } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import type { BrowserProjectClient, ServerStatus } from "@rcdvlog/project-client";
+import { HttpProjectClient } from "@rcdvlog/project-client/http";
 import { ClientProvider } from "../app/client";
 import { routes } from "../app/routes";
 import { MemoryOutbox } from "../features/tvReview/recording/outbox";
@@ -16,9 +17,10 @@ export function memoryVoice(overrides: Partial<VoiceDeps> = {}): VoiceDeps {
   return { outbox: new MemoryOutbox(), getUserMedia: vi.fn(), listMicrophones: vi.fn(), startRecording: vi.fn(), ...overrides };
 }
 
-/** Mount the real route table at `path` against a mocked client. Unlisted client methods are absent. */
+/** Mount the real route table at `path` against a mocked client. Unlisted client I/O methods are absent; thumbnail URLs use the real builder. */
 export function renderApp(path: string, overrides: Partial<BrowserProjectClient> = {}, voice: VoiceDeps = memoryVoice()) {
   const client = {
+    projectAssetThumbnailUrl: (projectId: string, assetId: string) => new HttpProjectClient().projectAssetThumbnailUrl(projectId, assetId),
     getServerStatus: vi.fn().mockResolvedValue(readyStatus),
     getSession: vi.fn().mockResolvedValue({ authenticated: true, sessions: [] }),
     ...overrides,

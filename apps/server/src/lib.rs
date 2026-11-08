@@ -767,6 +767,10 @@ pub fn router(state: HttpState) -> Router {
             get(get_project_review_asset),
         )
         .route(
+            "/api/v1/projects/{project_id}/assets/{asset_id}/thumbnail",
+            get(project_asset_thumbnail).head(project_asset_thumbnail),
+        )
+        .route(
             "/api/v1/projects/{project_id}/assets/{asset_id}/notes",
             post(create_review_note),
         )
@@ -1096,6 +1100,23 @@ fn base_openapi_document() -> serde_json::Value {
                     "responses": { "200": { "$ref": "#/components/responses/ProjectReviewAsset" }, "401": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" } }
                 }
             },
+            "/api/v1/projects/{projectId}/assets/{assetId}/thumbnail": {
+                "get": {
+                    "operationId": "getProjectAssetThumbnail",
+                    "description": "The JPEG thumbnail the project's catalog records for the asset, served only when it is a same-machine file inside RCDVLOG_ATTACHED_PROJECT_ROOTS.",
+                    "parameters": [
+                        { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "JPEG thumbnail", "content": { "image/jpeg": { "schema": { "type": "string", "format": "binary" } } } },
+                        "304": { "description": "Not modified" },
+                        "401": { "$ref": "#/components/responses/Error" },
+                        "404": { "$ref": "#/components/responses/Error" },
+                        "503": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
             "/api/v1/projects/{projectId}/assets/{assetId}/notes": {
                 "post": { "operationId": "createReviewNote", "parameters": [
                     { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
@@ -1388,7 +1409,7 @@ fn base_openapi_document() -> serde_json::Value {
                 },
                 "ProjectAssetItem": {
                     "type": "object",
-                    "required": ["projectAssetId", "filename", "camera", "mediaObjectId", "mediaVerificationState", "removed", "rotationDegrees", "labels", "activeNote", "durationSeconds", "bestTime"],
+                    "required": ["projectAssetId", "filename", "camera", "mediaObjectId", "mediaVerificationState", "removed", "rotationDegrees", "labels", "activeNote", "description", "durationSeconds", "bestTime"],
                     "properties": {
                         "projectAssetId": { "type": "string" },
                         "filename": { "type": "string" },
@@ -1399,6 +1420,7 @@ fn base_openapi_document() -> serde_json::Value {
                         "rotationDegrees": { "type": "integer" },
                         "labels": { "type": "array", "items": { "type": "string" } },
                         "activeNote": { "type": ["string", "null"] },
+                        "description": { "type": ["string", "null"], "description": "What the clip shows, from clip analysis." },
                         "durationSeconds": { "type": "number" },
                         "bestTime": { "type": ["string", "null"], "format": "date-time" }
                     }
@@ -2047,7 +2069,9 @@ fn project_replica_error(request_id: String, error: ProjectReplicaError) -> Resp
         ProjectReplicaError::InvalidBaseline(_)
         | ProjectReplicaError::UnsafeReplicaPath
         | ProjectReplicaError::Sync(_) => StatusCode::BAD_REQUEST,
-        ProjectReplicaError::DifferentBaseline { .. } => StatusCode::CONFLICT,
+        ProjectReplicaError::DifferentBaseline { .. }
+        | ProjectReplicaError::Attached { .. }
+        | ProjectReplicaError::AttachRefused(_) => StatusCode::CONFLICT,
         ProjectReplicaError::NotFound { .. } => StatusCode::NOT_FOUND,
         ProjectReplicaError::Storage(_)
         | ProjectReplicaError::Infrastructure(_)
@@ -2754,6 +2778,15 @@ fn project_command_error_response(request_id: &RequestId, error: ProjectReplicaE
         ProjectReplicaError::InvalidBaseline(_) => {
             query_error_response(request_id, "invalid_input", StatusCode::BAD_REQUEST)
         }
+        ProjectReplicaError::Attached { .. } => {
+            query_error_response(request_id, "project_attached", StatusCode::CONFLICT)
+        }
+        // An attached catalog at a different schema than this build is unusable until they match.
+        ProjectReplicaError::AttachRefused(_) => query_error_response(
+            request_id,
+            "attached_catalog_refused",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
         _ => query_error_response(
             request_id,
             "internal_error",
@@ -2804,6 +2837,102 @@ async fn get_project_review_asset(
         Ok(asset) => (StatusCode::OK, Json(asset)).into_response(),
         Err(error) => project_command_error_response(&request_id, error),
     }
+}
+
+/// Largest project-local thumbnail served; real ones are a few hundred KiB.
+const MAX_THUMBNAIL_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Serves the thumbnail a project's catalog records for an asset, typically a
+/// same-machine CLI catalog's cache. Only a JPEG that resolves inside
+/// `RCDVLOG_ATTACHED_PROJECT_ROOTS`, and outside the server's own data, temp and
+/// backup directories, is ever read; anything else is reported as not found.
+async fn project_asset_thumbnail(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath((project_id, asset_id)): AxumPath<(String, String)>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let recorded = match state
+        .foundation
+        .catalog()
+        .project_replicas()
+        .asset_thumbnail_path(&project_id, &asset_id)
+    {
+        Ok(Some(path)) => path,
+        Ok(None) => return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND),
+        Err(error) => return project_command_error_response(&request_id, error),
+    };
+    let config = state.foundation.config();
+    let protected = [&config.data_dir, &config.temp_dir, &config.backup_dir];
+    let Some((path, length, modified)) =
+        servable_thumbnail(&recorded, &config.attached_project_roots, &protected)
+    else {
+        return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND);
+    };
+    let etag = format!("\"{length:x}-{modified:x}\"");
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == etag)
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .body(Body::empty())
+            .expect("valid not-modified response");
+    }
+    let builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CONTENT_LENGTH, length.to_string())
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "private, max-age=300");
+    if method == Method::HEAD {
+        return builder
+            .body(Body::empty())
+            .expect("valid thumbnail headers");
+    }
+    match tokio::fs::read(&path).await {
+        Ok(bytes) if bytes.len() as u64 == length => builder
+            .body(Body::from(bytes))
+            .expect("valid thumbnail response"),
+        _ => query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND),
+    }
+}
+
+/// The canonical path, byte length and modification time (seconds) of a
+/// recorded thumbnail this node may serve, or `None`.
+fn servable_thumbnail(
+    recorded: &std::path::Path,
+    allowed_roots: &[std::path::PathBuf],
+    protected: &[&std::path::PathBuf],
+) -> Option<(std::path::PathBuf, u64, u64)> {
+    let path = recorded.canonicalize().ok()?;
+    let is_jpeg = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "jpg" | "jpeg"));
+    if !is_jpeg || !rcdvlog_server_core::inside_any_root(&path, allowed_roots) {
+        return None;
+    }
+    if protected
+        .iter()
+        .filter_map(|directory| directory.canonicalize().ok())
+        .any(|directory| path.starts_with(directory))
+    {
+        return None;
+    }
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_THUMBNAIL_BYTES {
+        return None;
+    }
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_secs());
+    Some((path, metadata.len(), modified))
 }
 
 async fn create_review_note(
@@ -4220,6 +4349,8 @@ mod tests {
             let derived = root.path().join("derived");
             let backup = root.path().join("backup");
             let originals = root.path().join("originals");
+            let attached = root.path().join("projects");
+            std::fs::create_dir_all(&attached).unwrap();
             std::fs::create_dir_all(&derived).unwrap();
             std::fs::create_dir_all(&backup).unwrap();
             std::fs::create_dir_all(&originals).unwrap();
@@ -4241,6 +4372,10 @@ mod tests {
                 (
                     "RCDVLOG_ALLOWED_ORIGINAL_MOUNTS".to_string(),
                     originals.display().to_string(),
+                ),
+                (
+                    "RCDVLOG_ATTACHED_PROJECT_ROOTS".to_string(),
+                    attached.display().to_string(),
                 ),
                 ("RCDVLOG_FFMPEG".to_string(), tool.to_string()),
                 ("RCDVLOG_FFPROBE".to_string(), tool.to_string()),
@@ -4492,7 +4627,13 @@ mod tests {
     }
 
     fn baseline_envelope(root: &TempDir) -> BaselineEnvelope {
-        let catalog = Catalog::open(root.path().join("desktop.sqlite3")).unwrap();
+        let (catalog, project_id) = cli_catalog(&root.path().join("desktop.sqlite3"));
+        BaselineEnvelope::export(&catalog, &project_id, vec![], vec![]).unwrap()
+    }
+
+    /// A CLI project catalog at `path` with one asset, `asset_http`.
+    fn cli_catalog(path: &std::path::Path) -> (Catalog, String) {
+        let catalog = Catalog::open(path).unwrap();
         catalog.set_local_node_id("node_mac").unwrap();
         let project = catalog.create_project("HTTP Trip").unwrap();
         catalog
@@ -4518,7 +4659,189 @@ mod tests {
                 },
             )
             .unwrap();
-        BaselineEnvelope::export(&catalog, &project.id, vec![], vec![]).unwrap()
+        (catalog, project.id)
+    }
+
+    #[tokio::test]
+    async fn attached_projects_serve_the_cli_catalog_and_its_thumbnails_only_from_allowed_roots() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let root = fixture._root.path().to_path_buf();
+        let work = root.join("projects/work");
+        std::fs::create_dir_all(work.join("cache/thumbnails/asset_http")).unwrap();
+        let catalog_path = work.join("catalog.sqlite3");
+        let (catalog, project_id) = cli_catalog(&catalog_path);
+        let thumbnail = work.join("cache/thumbnails/asset_http/q1.v2.jpg");
+        std::fs::write(&thumbnail, b"\xff\xd8jpeg-bytes").unwrap();
+        let record_thumbnail = |path: &std::path::Path| {
+            let connection = rusqlite::Connection::open(&catalog_path).unwrap();
+            connection
+                .execute(
+                    "DELETE FROM asset_thumbnails WHERE asset_id='asset_http'",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO asset_thumbnails(asset_id, quality, path, created_at) VALUES ('asset_http', 1, ?1, '2026-11-08T00:00:00Z')",
+                    [path.display().to_string()],
+                )
+                .unwrap();
+        };
+        record_thumbnail(&thumbnail);
+        rusqlite::Connection::open(&catalog_path)
+            .unwrap()
+            .execute(
+                "UPDATE assets SET description='Penguins on blue ice' WHERE id='asset_http'",
+                [],
+            )
+            .unwrap();
+        fixture
+            .foundation
+            .catalog()
+            .project_replicas()
+            .attach_catalog(
+                &catalog_path,
+                &fixture.foundation.config().attached_project_roots,
+                None,
+            )
+            .unwrap();
+
+        let request = |method: Method, uri: String, etag: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"));
+            if let Some(etag) = etag {
+                builder = builder.header(header::IF_NONE_MATCH, etag);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        let thumbnail_uri = format!("/api/v1/projects/{project_id}/assets/asset_http/thumbnail");
+
+        let anonymous = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(&thumbnail_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let wrong_project = fixture
+            .app()
+            .oneshot(request(
+                Method::GET,
+                "/api/v1/projects/not_this_project/assets/asset_http/thumbnail".into(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong_project.status(), StatusCode::NOT_FOUND);
+
+        let served = fixture
+            .app()
+            .oneshot(request(Method::GET, thumbnail_uri.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(served.headers()[header::CONTENT_TYPE], "image/jpeg");
+        let etag = served.headers()[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(
+            to_bytes(served.into_body(), 64).await.unwrap(),
+            &b"\xff\xd8jpeg-bytes"[..]
+        );
+        let unchanged = fixture
+            .app()
+            .oneshot(request(Method::GET, thumbnail_uri.clone(), Some(&etag)))
+            .await
+            .unwrap();
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+        let head = fixture
+            .app()
+            .oneshot(request(Method::HEAD, thumbnail_uri.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert!(to_bytes(head.into_body(), 64).await.unwrap().is_empty());
+
+        // Recorded paths outside the allowed roots, into the server's own data, or
+        // not JPEG are never read, however the catalog records them.
+        let outside = root.join("outside.jpg");
+        std::fs::write(&outside, b"secret").unwrap();
+        let escape = work.join("cache/thumbnails/asset_http/escape.jpg");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &escape).unwrap();
+        let control = fixture.foundation.config().data_dir.join("control.sqlite3");
+        let not_jpeg = work.join("cache/thumbnails/asset_http/q1.png");
+        std::fs::write(&not_jpeg, b"png").unwrap();
+        for refused in [
+            outside.as_path(),
+            escape.as_path(),
+            control.as_path(),
+            not_jpeg.as_path(),
+        ] {
+            record_thumbnail(refused);
+            let response = fixture
+                .app()
+                .oneshot(request(Method::GET, thumbnail_uri.clone(), None))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{}",
+                refused.display()
+            );
+        }
+
+        let assets = fixture
+            .app()
+            .oneshot(request(
+                Method::GET,
+                format!("/api/v1/projects/{project_id}/assets"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(assets.status(), StatusCode::OK);
+        assert_eq!(
+            json(assets).await["items"][0]["description"],
+            "Penguins on blue ice"
+        );
+
+        // Sync never writes into an attached catalog.
+        let envelope = BaselineEnvelope::export(&catalog, &project_id, vec![], vec![]).unwrap();
+        let import = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/internal/projects/baseline/import")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(import.status(), StatusCode::CONFLICT);
+        assert_eq!(json(import).await["code"], "project_attached");
+        let reconcile = fixture.app().oneshot(
+            Request::builder().method(Method::POST)
+                .uri(format!("/api/v1/internal/projects/{project_id}/reconcile"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "protocolVersion": {"minimumMajor": 1, "minimumMinor": 0, "maximumMajor": 1, "maximumMinor": 0},
+                    "projectSchemaVersion": rcdvlog_server_core::PROJECT_CATALOG_SCHEMA_VERSION,
+                    "projectId": project_id, "serverNodeId": fixture.foundation.catalog().node_id().as_str(),
+                    "operationCursors": {}, "operations": [], "observations": [], "representationManifests": [], "maximumResponseOperations": 10
+                })).unwrap())).unwrap()).await.unwrap();
+        assert_eq!(reconcile.status(), StatusCode::CONFLICT);
+        assert_eq!(json(reconcile).await["code"], "project_attached");
     }
 
     #[tokio::test]

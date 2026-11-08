@@ -30,8 +30,10 @@ function useAssetIndex(projectId: string) {
   });
 }
 
+/** The clip's analysis description when it has one, else its labels, else its filename. */
 function describe(asset: ProjectAssetItem | undefined) {
   if (!asset) return "";
+  if (asset.description) return asset.description;
   return asset.labels.length ? asset.labels.slice(0, DESCRIPTION_LABELS).join(", ") : asset.filename;
 }
 
@@ -40,17 +42,19 @@ function formatLength(seconds: number) {
 }
 
 export function ShotGrid({ projectId, cuts }: { projectId: string; cuts: ReviewTargetCut[] }) {
+  const client = useClient();
   const assets = useAssetIndex(projectId);
   const [filter, setFilter] = useState("");
   const query = useDeferredValue(filter.trim().toLowerCase());
 
   const shots = useMemo(() => cuts.map((cut) => {
     const asset = assets.data?.get(cut.assetId);
-    return { cut, description: describe(asset), filename: asset?.filename ?? "" };
+    const searchable = [describe(asset), asset?.labels.join(" ") ?? "", asset?.filename ?? ""].join(" ").toLowerCase();
+    return { cut, description: describe(asset), filename: asset?.filename ?? "", searchable };
   }), [assets.data, cuts]);
 
   const visible = query
-    ? shots.filter((shot) => shot.description.toLowerCase().includes(query) || shot.filename.toLowerCase().includes(query))
+    ? shots.filter((shot) => shot.searchable.includes(query))
     : shots;
 
   return (
@@ -59,7 +63,7 @@ export function ShotGrid({ projectId, cuts }: { projectId: string; cuts: ReviewT
         <h2 id="shots-title">Shots <span>{query ? `${visible.length} of ${cuts.length}` : cuts.length.toLocaleString()}</span></h2>
         <div className={styles.filter}>
           <Icon name="search" size={16} />
-          <input type="search" value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter by label or file" aria-label="Filter shots" />
+          <input type="search" value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter by what’s in the shot" aria-label="Filter shots" />
         </div>
       </header>
       {visible.length ? (
@@ -69,6 +73,8 @@ export function ShotGrid({ projectId, cuts }: { projectId: string; cuts: ReviewT
               <Link to={paths.clip(projectId, cut.assetId)} className={styles.link} title={filename || undefined}>
                 <span className={styles.thumb} aria-hidden="true">
                   <span className={styles.number}>{cut.position + 1}</span>
+                  <Thumbnail key={client.projectAssetThumbnailUrl(projectId, cut.assetId)} src={client.projectAssetThumbnailUrl(projectId, cut.assetId)} />
+                  <span className={styles.index}>{cut.position + 1}</span>
                   <span className={styles.at}>{formatClock(cut.movieInSeconds)}</span>
                 </span>
                 <span className={styles.meta}>
@@ -83,4 +89,11 @@ export function ShotGrid({ projectId, cuts }: { projectId: string; cuts: ReviewT
       ) : <p className={styles.none}>No shots match “{filter}”.</p>}
     </section>
   );
+}
+
+/** The clip thumbnail, or nothing (leaving the shot number) when the server has none. */
+function Thumbnail({ src }: { src: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return null;
+  return <img src={src} alt="" loading="lazy" decoding="async" onError={() => setFailed(true)} />;
 }

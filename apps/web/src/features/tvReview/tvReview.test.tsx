@@ -16,7 +16,7 @@ function preflight(overrides: Partial<ReviewTargetPreflight>): ReviewTargetPrefl
 
 const clipAsset = {
   projectAssetId: "asset_repeated", filename: "C0042.MP4", camera: "Sony", mediaObjectId: null, mediaVerificationState: "unlinked",
-  removed: false, rotationDegrees: 0, labels: ["penguin", "ice", "ship"], activeNote: null, durationSeconds: 9, bestTime: null,
+  removed: false, rotationDegrees: 0, labels: ["penguin", "ice", "ship"], activeNote: null, description: "Penguins on blue ice", durationSeconds: 9, bestTime: null,
 };
 
 const targetsClient = {
@@ -100,13 +100,14 @@ test("the YouTube button opens the declared video", async () => {
   expect(screen.queryByRole("button", { name: /Remove/ })).toBeNull();
 });
 
-test("shots show their length and clip labels, filter by label, and open the clip", async () => {
+test("shots show analysis descriptions and thumbnails, filter by label, and open the clip", async () => {
   const { router } = renderApp("/projects/p1/reviews/rtarget_one", targetsClient);
   const shots = await screen.findByRole("region", { name: /Shots/ });
   const cards = within(shots).getAllByRole("link");
   expect(cards).toHaveLength(2);
   expect(cards[0]).toHaveTextContent("2.0s");
-  expect(await within(cards[0]).findByText("penguin, ice, ship")).toBeVisible();
+  expect(await within(cards[0]).findByText("Penguins on blue ice")).toBeVisible();
+  expect(cards[0].querySelector("img")).toHaveAttribute("src", "/api/v1/projects/p1/assets/asset_repeated/thumbnail");
   await userEvent.type(within(shots).getByLabelText("Filter shots"), "walrus");
   expect(await within(shots).findByText(/No shots match/)).toBeVisible();
   await userEvent.clear(within(shots).getByLabelText("Filter shots"));

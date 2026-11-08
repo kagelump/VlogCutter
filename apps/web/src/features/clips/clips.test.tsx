@@ -6,7 +6,7 @@ import { renderApp } from "../../test/render";
 function asset(id: string, overrides: Partial<ProjectReviewAsset> = {}): ProjectReviewAsset {
   return {
     projectAssetId: id, filename: `${id}.MP4`, camera: "DJI Pocket 3", mediaObjectId: null, mediaVerificationState: "verified",
-    removed: false, rotationDegrees: 0, labels: [], activeNote: null, durationSeconds: 31, bestTime: null,
+    removed: false, rotationDegrees: 0, labels: [], activeNote: null, description: null, durationSeconds: 31, bestTime: null,
     materializedRevision: 4, activeNoteRevisionId: null, noteRevisionCount: 0, proxy: null, thumbnail: null,
     originalAvailability: "accessible_on_another_node", unresolvedConflictCount: 0, ...overrides,
   };

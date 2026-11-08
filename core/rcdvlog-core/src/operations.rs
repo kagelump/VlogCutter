@@ -276,6 +276,8 @@ pub struct ProjectAssetItem {
     pub rotation_degrees: i32,
     pub labels: Vec<String>,
     pub active_note: Option<String>,
+    /// What the clip shows, from clip analysis; `None` when not described.
+    pub description: Option<String>,
     pub duration_seconds: f64,
     pub best_time: Option<String>,
 }
@@ -1567,7 +1569,7 @@ impl Catalog {
 
     /// Pages one project's assets by the stable `project_asset_id` order.
     /// Search is a case-folded substring match over this project's own
-    /// filename, camera, active note, and labels. A replica is per-project and
+    /// filename, camera, active note, labels, and analysis description. A replica is per-project and
     /// bounded, so a substring match is acceptable here in a way it is not for
     /// the global library.
     pub fn list_project_asset_page(
@@ -1582,7 +1584,8 @@ impl Catalog {
         let mut statement = connection.prepare(
             r#"
             SELECT id, filename, camera, media_object_id, media_verification_state,
-                   removed, rotation_degrees, labels_json, notes, duration_seconds, best_time
+                   removed, rotation_degrees, labels_json, notes, duration_seconds, best_time,
+                   description
             FROM assets
             WHERE project_id = ?1
               AND (?2 IS NULL OR id > ?2)
@@ -1590,7 +1593,8 @@ impl Catalog {
                    OR LOWER(filename) LIKE ?3
                    OR LOWER(camera) LIKE ?3
                    OR LOWER(notes) LIKE ?3
-                   OR LOWER(labels_json) LIKE ?3)
+                   OR LOWER(labels_json) LIKE ?3
+                   OR LOWER(description) LIKE ?3)
             ORDER BY id ASC
             LIMIT ?4
             "#,
@@ -1613,6 +1617,9 @@ impl Catalog {
                         active_note: (!notes.is_empty()).then_some(notes),
                         duration_seconds: row.get(9)?,
                         best_time: row.get(10)?,
+                        description: row
+                            .get::<_, Option<String>>(11)?
+                            .filter(|text| !text.trim().is_empty()),
                     })
                 },
             )?

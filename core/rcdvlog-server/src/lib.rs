@@ -90,7 +90,7 @@ pub use replicas::{
     AddToProjectDisposition, AddToProjectItem, AddToProjectPreview, AddToProjectRequest,
     AddToProjectResult, MAX_ADD_TO_PROJECT_ITEMS, ProjectPage, ProjectReplica, ProjectReplicaError,
     ProjectReplicaManager, ProjectReviewAsset, ProjectSummary, ProjectSyncOverview,
-    ReviewMutationResult, ReviewRepresentation,
+    ReviewMutationResult, ReviewRepresentation, inside_any_root,
 };
 pub use representations::{
     PROXY_RECIPE_KEY, Representation, RepresentationError, RepresentationJobHandler,

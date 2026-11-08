@@ -139,7 +139,7 @@ export function ClipsPage() {
         ) : (
           <>
             <section className={styles.stageColumn} aria-label="Player">
-              <ClipPlayer ref={player} asset={review.data ?? null} loading={review.isPending} />
+              <ClipPlayer ref={player} projectId={projectId} asset={review.data ?? null} loading={review.isPending} />
               <div className={styles.transport}>
                 <Button icon="chevronLeft" iconOnly label="Previous clip (K)" disabled={index <= 0} onClick={() => void move(-1)} />
                 <span className={styles.counter} aria-live="polite">{counter}</span>
