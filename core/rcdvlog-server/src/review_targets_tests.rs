@@ -18,6 +18,7 @@ pub(crate) fn catalog(root: &TempDir) -> ControlCatalog {
             derived_dir: data.join("derived"),
             backup_dir: data.join("backup"),
             allowed_original_mounts: vec![],
+            attached_project_roots: vec![],
             listen_addr: "127.0.0.1:0".into(),
             shutdown_timeout_seconds: 1,
             trusted_proxy_cidr_count: 0,

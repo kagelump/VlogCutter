@@ -152,6 +152,10 @@ export class HttpProjectClient implements BrowserProjectClient {
     return this.request<ProjectReviewAsset>(reviewPath(API_PATHS.projectReviewAsset, projectId, assetId));
   }
 
+  projectAssetThumbnailUrl(projectId: string, assetId: string): string {
+    return `${this.baseUrl}${reviewPath(API_PATHS.projectAssetThumbnail, projectId, assetId)}`;
+  }
+
   async createReviewNote(projectId: string, assetId: string, text: string, baseRevision: number): Promise<ReviewMutationResult> {
     return this.request<ReviewMutationResult>(reviewPath(API_PATHS.createReviewNote, projectId, assetId), jsonPost({ text, baseRevision }));
   }

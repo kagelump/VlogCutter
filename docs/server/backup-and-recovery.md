@@ -40,3 +40,5 @@ rcdvlog-server admin recovery accept-sequence-divergence \
 That decision can acknowledge lost server-origin edits, so preserve the old data root and inspect both replicas first. Missing or size-mismatched representation blobs become unavailable/regenerable rather than falsely ready.
 
 Task 19 automated a pre-operation backup, backward restore, exact retained-operation replay, and a new server operation at sequence 2. The restore was not repeated in Docker Compose on the target Ubuntu/NAS topology.
+
+For [attached CLI catalogs](attached-projects.md), backup captures the active attached database with the same online backup API. Restore creates independent replicas under the new state root and clears every attachment, so it cannot mutate the original working project.

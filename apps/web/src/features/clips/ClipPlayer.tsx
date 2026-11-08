@@ -9,11 +9,12 @@ export interface PlayerHandle { toggle(): void }
 
 const mediaUrl = (representationId: string) => `/api/v1/media/${encodeURIComponent(representationId)}/content`;
 
-export const ClipPlayer = forwardRef<PlayerHandle, { asset: ProjectReviewAsset | null; loading: boolean }>(function ClipPlayer({ asset, loading }, ref) {
+export const ClipPlayer = forwardRef<PlayerHandle, { projectId: string; asset: ProjectReviewAsset | null; loading: boolean }>(function ClipPlayer({ projectId, asset, loading }, ref) {
   const client = useClient();
   const queryClient = useQueryClient();
   const video = useRef<HTMLVideoElement>(null);
   const [failed, setFailed] = useState<string | null>(null);
+  const [posterFailed, setPosterFailed] = useState<string | null>(null);
 
   useImperativeHandle(ref, () => ({
     toggle() {
@@ -35,7 +36,10 @@ export const ClipPlayer = forwardRef<PlayerHandle, { asset: ProjectReviewAsset |
   if (!asset) return <div className={styles.stage}>{loading ? <Loading center /> : null}</div>;
 
   const proxyReady = asset.proxy?.state === "available" && asset.proxy.availableOnServer;
-  const poster = asset.thumbnail?.state === "available" && asset.thumbnail.availableOnServer ? mediaUrl(asset.thumbnail.representationId) : undefined;
+  // A server-made thumbnail when there is one, else the project's own (e.g. an attached CLI catalog's).
+  const poster = asset.thumbnail?.state === "available" && asset.thumbnail.availableOnServer
+    ? mediaUrl(asset.thumbnail.representationId)
+    : posterFailed === asset.projectAssetId ? undefined : client.projectAssetThumbnailUrl(projectId, asset.projectAssetId);
   const rotation = asset.rotationDegrees % 360;
 
   return (
@@ -53,7 +57,9 @@ export const ClipPlayer = forwardRef<PlayerHandle, { asset: ProjectReviewAsset |
           preload="metadata"
           onError={() => void diagnose(asset.projectAssetId)}
         />
-      ) : poster ? <img className={styles.video} data-rotation={rotation || undefined} src={poster} alt="" /> : null}
+      ) : poster ? (
+        <img key={poster} className={styles.video} data-rotation={rotation || undefined} src={poster} alt="" onError={() => setPosterFailed(asset.projectAssetId)} />
+      ) : null}
 
       {!proxyReady ? (
         <div className={styles.stageMessage}>

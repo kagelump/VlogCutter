@@ -23,3 +23,5 @@ A server restore can roll its operation allocator behind a Mac. The restored rep
 The protocol v1 schemas in `docs/contracts/sync-*-v1.schema.json` ([contracts](../contracts/)) are frozen compatibility artifacts. They are not generated-current files and must not be edited when implementation evolves; introduce a new version and compatibility path.
 
 Use `rcdvlog server ... sync status|diagnose|now` for machine-readable state. The local `project diagnose` and `desktop last-opened` commands connect a screenshot breadcrumb to paired node, project, and conflict state.
+
+[Same-machine attached projects](attached-projects.md) use the CLI catalog directly and refuse baseline import and reconcile with `project_attached`. Use operation sync for separate machines; never share SQLite/WAL files across them.

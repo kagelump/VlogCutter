@@ -25,6 +25,7 @@ const TEMP_DIR_FIELD: &str = "tempDir";
 const DERIVED_DIR_FIELD: &str = "derivedDir";
 const BACKUP_DIR_FIELD: &str = "backupDir";
 const ORIGINAL_MOUNTS_FIELD: &str = "allowedOriginalMounts";
+const ATTACHED_PROJECT_ROOTS_FIELD: &str = "attachedProjectRoots";
 const LISTEN_ADDR_FIELD: &str = "listenAddr";
 const SHUTDOWN_TIMEOUT_FIELD: &str = "shutdownTimeoutSeconds";
 const TRUSTED_PROXY_CIDRS_FIELD: &str = "trustedProxyCidrs";
@@ -139,6 +140,9 @@ pub struct ServerConfig {
     pub derived_dir: PathBuf,
     pub backup_dir: PathBuf,
     pub allowed_original_mounts: Vec<PathBuf>,
+    /// Same-machine directories whose project catalogs, and the thumbnails they
+    /// record, the server may open directly as attached projects.
+    pub attached_project_roots: Vec<PathBuf>,
     pub listen_addr: SocketAddr,
     pub shutdown_timeout: Duration,
     pub trusted_proxy_cidrs: Vec<String>,
@@ -172,6 +176,7 @@ pub struct ConfigDiagnostics {
     pub derived_dir: PathBuf,
     pub backup_dir: PathBuf,
     pub allowed_original_mounts: Vec<PathBuf>,
+    pub attached_project_roots: Vec<PathBuf>,
     pub listen_addr: String,
     pub shutdown_timeout_seconds: u64,
     pub trusted_proxy_cidr_count: usize,
@@ -198,6 +203,10 @@ impl ServerConfig {
             ("RCDVLOG_DERIVED_DIR", DERIVED_DIR_FIELD),
             ("RCDVLOG_BACKUP_DIR", BACKUP_DIR_FIELD),
             ("RCDVLOG_ALLOWED_ORIGINAL_MOUNTS", ORIGINAL_MOUNTS_FIELD),
+            (
+                "RCDVLOG_ATTACHED_PROJECT_ROOTS",
+                ATTACHED_PROJECT_ROOTS_FIELD,
+            ),
             ("RCDVLOG_LISTEN_ADDR", LISTEN_ADDR_FIELD),
             ("RCDVLOG_SHUTDOWN_TIMEOUT_SECONDS", SHUTDOWN_TIMEOUT_FIELD),
             ("RCDVLOG_TRUSTED_PROXY_CIDRS", TRUSTED_PROXY_CIDRS_FIELD),
@@ -244,6 +253,16 @@ impl ServerConfig {
         let backup_dir = configured_optional_path(&values, "RCDVLOG_BACKUP_DIR", backup_default);
         let allowed_original_mounts = values
             .get("RCDVLOG_ALLOWED_ORIGINAL_MOUNTS")
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter(|part| !part.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let attached_project_roots = values
+            .get("RCDVLOG_ATTACHED_PROJECT_ROOTS")
             .map(|value| {
                 value
                     .split(',')
@@ -333,6 +352,7 @@ impl ServerConfig {
             derived_dir,
             backup_dir,
             allowed_original_mounts,
+            attached_project_roots,
             listen_addr,
             shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
             trusted_proxy_cidrs,
@@ -367,6 +387,16 @@ impl ServerConfig {
         validate_path(BACKUP_DIR_FIELD, &self.backup_dir)?;
         for mount in &self.allowed_original_mounts {
             validate_path(ORIGINAL_MOUNTS_FIELD, mount)?;
+        }
+        let mut unique_roots = BTreeSet::new();
+        for root in &self.attached_project_roots {
+            validate_path(ATTACHED_PROJECT_ROOTS_FIELD, root)?;
+            if !unique_roots.insert(root) {
+                return Err(ConfigError::new(
+                    ATTACHED_PROJECT_ROOTS_FIELD,
+                    ConfigErrorReason::DuplicatePath,
+                ));
+            }
         }
 
         if !self.temp_dir.starts_with(&self.data_dir) {
@@ -503,6 +533,7 @@ impl ServerConfig {
             derived_dir: self.derived_dir.clone(),
             backup_dir: self.backup_dir.clone(),
             allowed_original_mounts: self.allowed_original_mounts.clone(),
+            attached_project_roots: self.attached_project_roots.clone(),
             listen_addr: self.listen_addr.to_string(),
             shutdown_timeout_seconds: self.shutdown_timeout.as_secs(),
             trusted_proxy_cidr_count: self.trusted_proxy_cidrs.len(),
@@ -684,5 +715,30 @@ mod tests {
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
         assert_eq!(serde_json::to_value(&secret).unwrap(), json!("[REDACTED]"));
         assert_eq!(secret.expose(), "do-not-leak");
+    }
+    #[test]
+    fn attached_roots_are_opt_in_absolute_and_unique() {
+        assert!(
+            ServerConfig::from_values(values())
+                .unwrap()
+                .attached_project_roots
+                .is_empty()
+        );
+        let mut configured = values();
+        configured.insert(
+            "RCDVLOG_ATTACHED_PROJECT_ROOTS".into(),
+            "/work/a,/work/b".into(),
+        );
+        assert_eq!(
+            ServerConfig::from_values(configured.clone())
+                .unwrap()
+                .attached_project_roots,
+            vec![PathBuf::from("/work/a"), PathBuf::from("/work/b")]
+        );
+        for invalid in ["relative", "/work/a,/work/a"] {
+            configured.insert("RCDVLOG_ATTACHED_PROJECT_ROOTS".into(), invalid.into());
+            let error = ServerConfig::from_values(configured.clone()).unwrap_err();
+            assert_eq!(error.field, ATTACHED_PROJECT_ROOTS_FIELD);
+        }
     }
 }

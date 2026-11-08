@@ -99,7 +99,10 @@ export interface ProjectPage { items: ProjectSummary[]; nextCursor: string | nul
 export interface ProjectAssetItem {
   projectAssetId: string; filename: string; camera: string; mediaObjectId: string | null;
   mediaVerificationState: string; removed: boolean; rotationDegrees: number; labels: string[];
-  activeNote: string | null; durationSeconds: number; bestTime: string | null;
+  activeNote: string | null;
+  /** What the clip shows, from clip analysis. */
+  description: string | null;
+  durationSeconds: number; bestTime: string | null;
 }
 export interface ProjectAssetPage { items: ProjectAssetItem[]; nextCursor: string | null }
 
@@ -664,6 +667,8 @@ export interface BrowserProjectClient extends ProjectClient {
   listProjects(limit?: number, after?: string): Promise<ProjectPage>;
   listProjectAssets(projectId: string, limit?: number, after?: string, search?: string): Promise<ProjectAssetPage>;
   getProjectReviewAsset(projectId: string, assetId: string): Promise<ProjectReviewAsset>;
+  /** Same-origin URL of the clip's project-local thumbnail; 404 when this server can't serve one. */
+  projectAssetThumbnailUrl(projectId: string, assetId: string): string;
   createReviewNote(projectId: string, assetId: string, text: string, baseRevision: number): Promise<ReviewMutationResult>;
   addReviewLabel(projectId: string, assetId: string, label: string, baseRevision: number): Promise<ReviewMutationResult>;
   removeReviewLabel(projectId: string, assetId: string, label: string, baseRevision: number): Promise<ReviewMutationResult>;

@@ -71,6 +71,6 @@ export function useAssetEdit(projectId: string) {
 }
 
 function pickListFields(asset: ProjectReviewAsset): ProjectAssetItem {
-  const { projectAssetId, filename, camera, mediaObjectId, mediaVerificationState, removed, rotationDegrees, labels, activeNote, durationSeconds, bestTime } = asset;
-  return { projectAssetId, filename, camera, mediaObjectId, mediaVerificationState, removed, rotationDegrees, labels, activeNote, durationSeconds, bestTime };
+  const { projectAssetId, filename, camera, mediaObjectId, mediaVerificationState, removed, rotationDegrees, labels, activeNote, description, durationSeconds, bestTime } = asset;
+  return { projectAssetId, filename, camera, mediaObjectId, mediaVerificationState, removed, rotationDegrees, labels, activeNote, description, durationSeconds, bestTime };
 }
