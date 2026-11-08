@@ -339,3 +339,103 @@ test("Chrome imports a historical rendered-artifact review only with an acknowle
   await page.getByRole("link", { name: "TV reviews" }).first().click();
   await expect(page.getByRole("main").getByRole("listitem").filter({ hasText: "Cut historic" })).toContainText("Historical");
 });
+
+test("Chrome's editorial export survives interruptions, retries and contradictions without crossing privacy boundaries", async ({ page, playwright }) => {
+  // Continues the seeded run after the discussion test above: one human-accepted
+  // edit on editop_split_a, a retracted suggestion and a second candidate.
+  const baseURL = process.env.RCDVLOG_WEB_E2E_BASE_URL;
+  if (!baseURL) throw new Error("web e2e: no RCDVLOG_WEB_E2E_BASE_URL");
+  const reviewPath = readFileSync(reviewRunPath(baseURL), "utf8").trim();
+  const [, , projectId, , , , , runId] = reviewPath.split("/").map(decodeURIComponent);
+  await page.goto("/");
+  await page.getByLabel("Bootstrap code").fill(bootstrapCode(9));
+  const exchange = page.waitForResponse((r) => r.url().includes("/auth/bootstrap/exchange"));
+  await page.getByRole("button", { name: "Open review desk" }).click();
+  const csrf = (await exchange).headers()["x-csrf-token"];
+  expect(csrf).toBeTruthy();
+  await expect(page.getByRole("heading", { name: "Review desk ready" })).toBeVisible();
+  await page.goto(reviewPath);
+  await expect(page.getByRole("heading", { name: "Editorial review" })).toBeVisible();
+  const card = page.locator(".tv-discussion").first();
+  await expect(card.locator(".tv-item-accepted")).toHaveCount(1);
+
+  // Interruption: a correction whose request is lost is not applied, and the
+  // retry applies exactly once.
+  const ids = await page.locator("select[aria-label^='Speaker for']").evaluateAll((nodes) => nodes.map((n) => n.getAttribute("aria-label")!));
+  const third = page.getByLabel(ids[2]);
+  await page.route("**/utterances/*/corrections", (route) => route.abort("failed"));
+  await third.selectOption("B");
+  await expect(page.getByRole("alert")).toBeVisible();
+  await page.unroute("**/utterances/*/corrections");
+  await page.reload();
+  await expect(page.getByLabel(ids[2])).toHaveValue("unknown");
+  await page.getByLabel(ids[2]).selectOption("B");
+  await expect(page.getByLabel(ids[2])).toHaveValue("B");
+  await page.reload();
+  await expect(page.getByLabel(ids[2])).toHaveValue("B");
+  await expect(page.locator(".tv-utterance").nth(2)).toContainText("1 correction");
+
+  // Contradiction: a second accepted edit in one discussion is refused, and
+  // the existing acceptance stands.
+  await card.getByLabel("Item kind").selectOption("candidateEdit");
+  await card.getByLabel("Said by").selectOption("A");
+  await card.getByLabel("Item text").fill("Actually, cut this shot entirely.");
+  await card.getByRole("button", { name: "Add" }).click();
+  await expect(card.getByText("Speaker A: Actually, cut this shot entirely.")).toBeVisible();
+  await card.getByLabel("Item kind").selectOption("decision");
+  await card.getByLabel("Said by").selectOption("unknown");
+  await card.getByLabel("Refers to").selectOption({ label: "Candidate edit: Actually, cut this shot entirely." });
+  await card.getByLabel("Decision").selectOption("accepted");
+  await card.getByLabel("Item text").fill("accept the cut too");
+  await card.getByRole("button", { name: "Add" }).click();
+  await expect(page.getByText(/Another edit in this discussion is already accepted/)).toBeVisible();
+  await expect(card.locator(".tv-item-accepted")).toHaveCount(1);
+
+  // Export: deterministic across reads, carrying stable record-once import IDs
+  // and shared-sync movie time. Requests go through the page, as the app's own do.
+  const call = (method: string, url: string, body?: unknown, token?: string) => page.evaluate(async ({ method, url, body, token }) => {
+    const response = await fetch(url, {
+      method, credentials: "same-origin",
+      headers: { "content-type": "application/json", ...(token ? { "x-csrf-token": token } : {}) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, json: await response.json().catch(() => null) };
+  }, { method, url, body, token });
+  const reportUrl = `/api/v1/projects/${encodeURIComponent(projectId)}/review-transcriptions/${encodeURIComponent(runId)}/report`;
+  const first = (await call("GET", reportUrl)).json;
+  const second = (await call("GET", reportUrl)).json;
+  expect(first.schema).toBe("review-report.v1");
+  expect(second).toEqual(first);
+  const accepted = first.feedback.filter((f: { humanAccepted: boolean }) => f.humanAccepted);
+  expect(accepted).toHaveLength(1);
+  expect(accepted[0].importId).toMatch(/^rcdvlog-server\/review\//);
+  expect(accepted[0].recordOnce.importId).toBe(accepted[0].importId);
+  expect(first.sync.status).toBe("mapped");
+  expect(first.feedback.some((f: { record: { observation: string }; humanAccepted: boolean }) => f.record.observation === "Actually, cut this shot entirely." && f.humanAccepted)).toBe(false);
+  // Privacy: no storage paths, raw audio or credentials in the agent report.
+  const text = JSON.stringify(first);
+  for (const forbidden of ["review-evidence", "/tmp/", ".pcm", "rcdvlog_session", csrf]) expect(text).not.toContain(forbidden);
+
+  // Retry-safe reconciliation: the same receipt is idempotent, a different
+  // note for the same item is refused, and a write without CSRF is rejected.
+  const reconcileUrl = `/api/v1/projects/${encodeURIComponent(projectId)}/review-discussion-items/${encodeURIComponent(accepted[0].itemId)}/reconciliation`;
+  expect((await call("POST", reconcileUrl, { canonicalNoteId: "note_e2e_1" }, csrf)).status).toBe(200);
+  expect((await call("POST", reconcileUrl, { canonicalNoteId: "note_e2e_1" }, csrf)).status).toBe(200);
+  const conflict = await call("POST", reconcileUrl, { canonicalNoteId: "note_e2e_2" }, csrf);
+  expect(conflict.status).toBe(409);
+  expect(conflict.json.code).toBe("review_reconciliation_conflict");
+  expect((await call("POST", reconcileUrl, { canonicalNoteId: "note_forged" })).status).toBe(403);
+  await page.reload();
+  await expect(card.getByText("canonical note note_e2e_1")).toBeVisible();
+  const reconciled = (await call("GET", reportUrl)).json;
+  expect(reconciled.feedback.find((f: { itemId: string }) => f.itemId === accepted[0].itemId).next).toBe("reconciled");
+
+  // Privacy boundaries: nothing review-related is readable without a session.
+  const anonymous = await playwright.request.newContext({ baseURL });
+  for (const path of [reportUrl, `/api/v1/projects/${encodeURIComponent(projectId)}/review-transcriptions/${encodeURIComponent(runId)}/review`, `/api/v1/projects/${encodeURIComponent(projectId)}/review-sessions`]) {
+    expect((await anonymous.get(path)).status(), path).toBe(401);
+  }
+  await anonymous.dispose();
+  // Another project's identifier never reaches this run.
+  expect((await call("GET", `/api/v1/projects/project_absent/review-transcriptions/${encodeURIComponent(runId)}/report`)).status).toBe(404);
+});
