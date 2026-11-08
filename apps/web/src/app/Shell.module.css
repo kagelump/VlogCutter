@@ -88,6 +88,8 @@
   padding: var(--space-5) var(--page-pad) var(--space-6);
 }
 
+.page.wide { max-width: calc(1680px + 2 * var(--page-pad)); }
+
 .pageFull { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
 /* Workspaces fill exactly one screen on larger displays and scroll inside their columns. */
