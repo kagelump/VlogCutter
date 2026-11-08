@@ -14,16 +14,16 @@ declaration and not as measured sync.
 
 ## User flow
 
-*TV review → project → target → Start voice review*:
+*Projects → TV reviews → cut → Record review*:
 
 1. Open the target's YouTube video on the TV.
 2. Press **Allow microphone**. The browser asks for permission and nothing is
    captured yet. Then pick the input device.
 3. Confirm that everyone present knows they are being recorded (required). If a
    second speaker will be recorded, tick the separate opt-in disclosure.
-4. Press **Record**. The heading shows `● Recording <elapsed>`. The level meter
+4. Press **Record**. The recorder shows `Recording <elapsed>`. The level meter
    and upload counters update while you record.
-5. Optionally press **Mark video start** (or `M`) when the first frame appears.
+5. Optionally press **Mark start** (or `M`) when the first frame appears.
 6. Press **Stop**. The page flushes and uploads the tail and finalizes the
    session, then opens the session page.
 
@@ -127,8 +127,8 @@ in sequence order:
 If the outbox or the browser quota is full, that chunk's frames are reported as
 a `localBufferOverflow` event and become a gap. They are never dropped silently.
 
-After a reload, tab close or lost network, the target and record pages show
-**Resume upload and finalize**. Recovery uploads buffered chunks and durable events, then finalizes as
+After a reload, tab close or lost network, the TV reviews, cut and record pages show
+**Finish upload**. Recovery uploads buffered chunks and durable events, then finalizes as
 `interrupted`. It records an unknown-tail event because the restarted page
 cannot know the worklet's last frame. The last stored prefix does not become
 an acknowledged complete recording. Unflushed samples may be absent; their
@@ -229,7 +229,7 @@ a real TV:
    `deviceLost`, with the audio captured so far kept.
 4. Disable the network for 30 s mid-recording. Expect buffered chunks to upload
    after reconnection.
-5. Close the tab mid-recording, reopen it, and use **Resume upload and finalize**.
+5. Close the tab mid-recording, reopen it, and use **Finish upload**.
 6. Fill the server disk to `RCDVLOG_MIN_FREE_BYTES`. Expect 507 retries with
    the audio kept in the browser.
 7. Download the WAV and confirm it plays. Delete the session, and confirm that
