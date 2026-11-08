@@ -191,7 +191,9 @@ pub(super) async fn create_pairing_code(
 ) -> Response {
     let result = match &principal {
         AuthPrincipal::Browser { session_id, .. } => state.auth.create_pairing_code(session_id),
-        AuthPrincipal::Device { .. } => state.auth.create_pairing_code_for_device(),
+        AuthPrincipal::Device { .. } | AuthPrincipal::Tailnet { .. } => {
+            state.auth.create_pairing_code_for_device()
+        }
     };
     match result {
         Ok(pairing) => match audit_admin(

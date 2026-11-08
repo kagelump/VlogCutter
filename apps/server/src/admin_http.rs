@@ -91,6 +91,7 @@ pub(super) fn audit_admin(
         AuthPrincipal::Device { credential_id } => {
             (AuditActorType::DeviceCredential, credential_id.as_str())
         }
+        AuthPrincipal::Tailnet { login } => (AuditActorType::BrowserSession, login.as_str()),
     };
     state
         .foundation

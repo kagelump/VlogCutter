@@ -39,6 +39,9 @@ fn actor(principal: &AuthPrincipal) -> ReviewTargetActor {
         AuthPrincipal::Device { credential_id } => {
             ReviewTargetActor::new(AuditActorType::DeviceCredential, credential_id.as_str())
         }
+        AuthPrincipal::Tailnet { login } => {
+            ReviewTargetActor::new(AuditActorType::BrowserSession, login.as_str())
+        }
     }
 }
 

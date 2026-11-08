@@ -143,6 +143,8 @@ pub struct ServerConfig {
     pub shutdown_timeout: Duration,
     pub trusted_proxy_cidrs: Vec<String>,
     pub lan_hostname: String,
+    /// Trust Tailscale Serve identity headers as authentication (tailnet-only access).
+    pub tailscale_trusted_auth: bool,
     pub session_max_age: Duration,
     pub bootstrap_code_ttl: Duration,
     pub pairing_code_ttl: Duration,
@@ -200,6 +202,7 @@ impl ServerConfig {
             ("RCDVLOG_SHUTDOWN_TIMEOUT_SECONDS", SHUTDOWN_TIMEOUT_FIELD),
             ("RCDVLOG_TRUSTED_PROXY_CIDRS", TRUSTED_PROXY_CIDRS_FIELD),
             ("RCDVLOG_LAN_HOSTNAME", LAN_HOSTNAME_FIELD),
+            ("RCDVLOG_TAILSCALE_TRUSTED_AUTH", LAN_HOSTNAME_FIELD),
             ("RCDVLOG_SESSION_MAX_AGE_SECONDS", SESSION_MAX_AGE_FIELD),
             ("RCDVLOG_BOOTSTRAP_CODE_TTL_SECONDS", BOOTSTRAP_TTL_FIELD),
             ("RCDVLOG_PAIRING_CODE_TTL_SECONDS", PAIRING_TTL_FIELD),
@@ -334,6 +337,9 @@ impl ServerConfig {
             shutdown_timeout: Duration::from_secs(shutdown_timeout_seconds),
             trusted_proxy_cidrs,
             lan_hostname,
+            tailscale_trusted_auth: values
+                .get("RCDVLOG_TAILSCALE_TRUSTED_AUTH")
+                .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")),
             session_max_age: Duration::from_secs(session_max_age_seconds),
             bootstrap_code_ttl: Duration::from_secs(bootstrap_code_ttl_seconds),
             pairing_code_ttl: Duration::from_secs(pairing_code_ttl_seconds),

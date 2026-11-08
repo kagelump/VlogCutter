@@ -12,6 +12,10 @@ pub(super) enum AuthPrincipal {
     Device {
         credential_id: String,
     },
+    /// Tailnet user identified by Tailscale Serve headers (opt-in).
+    Tailnet {
+        login: String,
+    },
 }
 
 pub(super) async fn auth_middleware(
@@ -45,6 +49,21 @@ pub(super) async fn auth_middleware(
             }
             Err(_) => {}
         }
+    }
+
+    // Tailscale Serve injects identity headers on tailnet-only requests.
+    if state.foundation.config().tailscale_trusted_auth
+        && let Some(login) = request
+            .headers()
+            .get("tailscale-user-login")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty() && v.len() < 200)
+    {
+        let login = login.to_string();
+        request
+            .extensions_mut()
+            .insert(AuthPrincipal::Tailnet { login });
+        return next.run(request).await;
     }
 
     // Try session cookie
