@@ -36,6 +36,7 @@ export function TargetPage() {
           {videoId ? (
             <ButtonAnchor icon="external" href={`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`} target="_blank" rel="noreferrer noopener">YouTube</ButtonAnchor>
           ) : null}
+          {videoId && detail.readiness.ready ? <ButtonLink icon="mic" to={`${paths.record(projectId, detail.reviewTargetId)}?mode=play`}>Play + record review</ButtonLink> : null}
           {detail.readiness.ready
             ? <ButtonLink variant="primary" icon="mic" to={paths.record(projectId, detail.reviewTargetId)}>Record review</ButtonLink>
             : <Button variant="primary" icon="mic" disabled>Record review</Button>}

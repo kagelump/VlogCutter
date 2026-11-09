@@ -13,7 +13,7 @@ export interface VoiceDeps {
   outbox: ChunkOutbox;
   getUserMedia(constraints: MediaStreamConstraints): Promise<MediaStream>;
   listMicrophones(): Promise<MediaDeviceInfo[]>;
-  startRecording(options: Parameters<typeof VoiceRecording.start>[0]): Promise<Pick<VoiceRecording, "session" | "cue" | "stop" | "pageHidden">>;
+  startRecording(options: Parameters<typeof VoiceRecording.start>[0]): Promise<Pick<VoiceRecording, "session" | "cue" | "stop" | "pageHidden" | "observePlayback">>;
 }
 
 let browserDeps: VoiceDeps | null = null;
