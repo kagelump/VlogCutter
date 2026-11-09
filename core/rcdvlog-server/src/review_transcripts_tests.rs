@@ -5,7 +5,8 @@ use crate::{
     RecordingAudioFormat, RecordingCaptureSettings, RecordingConsent, RecordingEndReason,
 };
 use rcdvlog_core::review_speech::{
-    NativeSttCallResult, NativeSttReceipt, NativeSttSegment, NativeSttTranscript, NativeSttUsage,
+    NativeSttAudioWindow, NativeSttCallResult, NativeSttReceipt, NativeSttSegment,
+    NativeSttTranscript, NativeSttUsage,
 };
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,7 +123,11 @@ impl NativeSttTransport for FakeTransport {
                 .unwrap_or_else(|| {
                     NativeSttOutcome::Usable(NativeSttTranscript {
                         text: "這裡太長".into(),
-                        language: "zh".into(),
+                        language: if request.model() == "openai/whisper-large-v3-turbo" {
+                            "English".into()
+                        } else {
+                            "zh".into()
+                        },
                         confidence: None,
                         duration_ms: audio.duration_ms(),
                         segments: vec![NativeSttSegment {
@@ -188,6 +193,10 @@ impl ReviewSpeechRuntime for FakeRuntime {
     }
     fn cloud_models(&self) -> anyhow::Result<Vec<NativeSttModelChoice>> {
         Ok(vec![
+            NativeSttModelChoice {
+                id: "openai/whisper-large-v3-turbo".into(),
+                name: "Whisper Turbo".into(),
+            },
             NativeSttModelChoice {
                 id: "openai/whisper-1".into(),
                 name: "Whisper".into(),
@@ -781,4 +790,106 @@ fn unusable_cloud_output_keeps_reason_receipt_and_allows_explicit_retry() {
         assert_eq!(after.segments[0].error_code, first.segments[0].error_code);
         assert_eq!(after.spend.reserved_usd, first.spend.reserved_usd);
     }
+}
+
+#[test]
+fn padded_whisper_endpoints_map_to_real_speech_and_padding_only_lines_are_not_invented() {
+    let window = pack_windows(&[SpeechRegion {
+        start_ms: 2000,
+        end_ms: 16150,
+    }])
+    .remove(0);
+    let segment = |start, end| DecodedSegment {
+        start_ms: start,
+        end_ms: end,
+        language: "en".into(),
+        text: "review words".into(),
+        mean_token_probability: None,
+    };
+    let lines = to_utterances(
+        &window,
+        &[segment(0, 14160), segment(14150, 14160)],
+        0,
+        0,
+        0,
+        RATE,
+        &[],
+    );
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].start_frame, 2 * RATE as u64);
+    assert_eq!(lines[0].end_frame, 16150 * RATE as u64 / 1000);
+    assert!(!lines[0].flags.contains(&"unexpectedLanguage".into()));
+}
+
+#[test]
+fn padded_cloud_windows_keep_the_padding_receipt_and_resume_cached_segments() {
+    let f = fixture(false, true);
+    let runtime = FakeRuntime::new();
+    let run = f
+        .catalog
+        .review_transcripts()
+        .start(
+            PROJECT,
+            &f.session_id,
+            &cloud(1.0),
+            &runtime,
+            &f.catalog.jobs(),
+            &actor(),
+        )
+        .unwrap();
+    let ledger = WindowLedger {
+        database_path: f.catalog.database_path().to_owned(),
+        run_id: run.run_id.clone(),
+        cloud: true,
+    };
+    let decoded = vec![DecodedSegment {
+        start_ms: 0,
+        end_ms: 14160,
+        language: "en".into(),
+        text: "review words".into(),
+        mean_token_probability: None,
+    }];
+    ledger
+        .settle(
+            0,
+            0,
+            "padded",
+            Some(157),
+            Some("gen-padded"),
+            None,
+            None,
+            Some(10),
+            &decoded,
+            10,
+        )
+        .unwrap();
+    let cached = ledger.cached(0, 0, "padded").unwrap().unwrap();
+    assert_eq!(cached[0].end_ms, 14160);
+    let connection = open_read_only_connection(f.catalog.database_path()).unwrap();
+    let raw: String = connection
+        .query_row(
+            "SELECT result_json FROM review_transcription_windows WHERE run_id=?1",
+            [&run.run_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(receipt["input_padding_ms"], 10);
+    assert_eq!(receipt["segments"][0]["end_ms"], 14160);
+}
+
+#[test]
+fn review_uses_canonical_language_while_shared_native_provenance_keeps_provider_value() {
+    let f = fixture(false, true);
+    let runtime = FakeRuntime::new();
+    let mut request = cloud(1.0);
+    request.model = Some("openai/whisper-large-v3-turbo".into());
+    let result = run(&f, &request, &runtime);
+    assert_eq!(result.state, ReviewTranscriptionState::Completed);
+    assert!(
+        result
+            .utterances
+            .iter()
+            .all(|u| u.language == "en" && !u.flags.contains(&"unexpectedLanguage".into()))
+    );
 }

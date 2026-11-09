@@ -156,3 +156,36 @@ acceptance stage.
 Older failures that discarded their provider response/receipt cannot be
 reconstructed. They remain visible in history. A new explicit cloud attempt
 can now execute without being blocked by an earlier unknown outcome or cost.
+
+
+## Provider response compatibility
+
+Recognized returned language codes and full names are matched without case
+sensitivity. The shared native transcript preserves the exact provider value;
+review utterances use canonical codes (`English` → `en`). Unknown,
+missing or malformed language values are still rejected.
+
+For review requests using the three Whisper models, the sent derivative WAV
+is rounded up to Whisper's 20 ms timestamp grid by appending at most 19 ms of
+zero-valued samples. This handles a 14.150 s input whose last timestamp token
+ends at 14.160 s. Response validation still uses the exact duration of the
+actual sent WAV; no provider timestamps or source recording samples are
+rewritten. Recording-clock projection uses the original speech-window map,
+and padding-only spans are omitted. Successful window caches retain
+`input_padding_ms` alongside the original decoded endpoints. Registered
+source-analysis requests and other review models keep their original WAVs.
+
+The explicit `review_stt_repro` Rust example accepts a PCM16 WAV, model ID and
+new output directory. It uses the same resampler, VAD, packing and audio
+preparation as review capture, sends one native request and saves private
+response/audio files plus a body-free receipt in an owner-only directory:
+
+```sh
+RCDVLOG_SPEECH_MODEL_DIR=/absolute/model/directory \
+  cargo run -p rcdvlog-server-core --example review_stt_repro -- \
+  INPUT.wav openai/whisper-large-v3-turbo NEW_OUTPUT_DIRECTORY
+```
+
+It does not mutate a project catalog or retry the provider request. The checked-in
+regression fixtures preserve the reproduced provider's shape and numeric times,
+with private text and identifiers removed.

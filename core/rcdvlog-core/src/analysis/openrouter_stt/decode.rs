@@ -104,6 +104,7 @@ pub enum NativeSttOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeSttTranscript {
     pub text: String,
+    /// Exact recognized language value returned by the provider; retained as provenance.
     pub language: String,
     /// Optional full-transcript confidence reported by the provider.
     pub confidence: Option<f64>,
@@ -373,23 +374,26 @@ fn required_language(value: Option<&Value>) -> std::result::Result<String, Nativ
     let language = value
         .as_str()
         .ok_or(NativeSttProtocolError::InvalidLanguage)?;
-    if !valid_language_tag(language) {
-        return Err(NativeSttProtocolError::InvalidLanguage);
-    }
+    canonical_native_stt_language(language)?;
     Ok(language.to_string())
 }
 
-fn valid_language_tag(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    (2..=MAX_LANGUAGE_BYTES).contains(&bytes.len())
-        && bytes[0].is_ascii_alphabetic()
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        && (0..=whisper_rs::get_lang_max_id()).any(|id| {
-            whisper_rs::get_lang_str(id) == Some(value)
-                || whisper_rs::get_lang_str_full(id) == Some(value)
+/// Convert a recognized provider code/name to the canonical language used by a
+/// consumer, without replacing the raw language retained in native provenance.
+pub fn canonical_native_stt_language(
+    language: &str,
+) -> std::result::Result<String, NativeSttProtocolError> {
+    if language.len() > MAX_LANGUAGE_BYTES {
+        return Err(NativeSttProtocolError::InvalidLanguage);
+    }
+    let normalized = language.trim().to_ascii_lowercase();
+    (0..=whisper_rs::get_lang_max_id())
+        .find_map(|id| {
+            let code = whisper_rs::get_lang_str(id)?;
+            (normalized == code || whisper_rs::get_lang_str_full(id) == Some(normalized.as_str()))
+                .then(|| code.to_string())
         })
+        .ok_or(NativeSttProtocolError::InvalidLanguage)
 }
 
 fn required_timestamp(

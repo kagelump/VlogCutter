@@ -397,6 +397,29 @@ impl NativeSttRequest {
         Ok(spec)
     }
 
+    /// Review Whisper uses 20 ms timestamp tokens. Append only real zero-valued
+    /// samples up to that grid so quantized endpoints stay inside the sent WAV.
+    /// Registered analysis requests retain their exact original audio contract.
+    pub fn prepare_audio(
+        &self,
+        pcm: &[f32],
+        window: &PackedWindow,
+    ) -> Result<NativeSttAudioWindow> {
+        let grid_ms = if self.discovered
+            && [
+                "openai/whisper-1",
+                "openai/whisper-large-v3",
+                "openai/whisper-large-v3-turbo",
+            ]
+            .contains(&self.model.as_str())
+        {
+            20
+        } else {
+            1
+        };
+        NativeSttAudioWindow::from_pcm_on_grid(pcm, window, grid_ms)
+    }
+
     pub fn provider(&self) -> &str {
         &self.provider
     }
@@ -440,6 +463,7 @@ pub struct NativeSttAudioWindow {
     wav_bytes: Vec<u8>,
     duration_ms: u32,
     sample_count: usize,
+    padding_ms: u32,
 }
 
 impl std::fmt::Debug for NativeSttAudioWindow {
@@ -456,10 +480,21 @@ impl NativeSttAudioWindow {
     /// Concatenates only the window's selected speech regions from supplied PCM,
     /// then encodes a genuine bounded 16 kHz mono PCM WAV.
     pub fn from_pcm(pcm: &[f32], window: &PackedWindow) -> Result<Self> {
-        let samples = concatenate_regions_bounded(pcm, window)?;
-        let duration_ms = window.speech_ms();
-        ensure!(duration_ms > 0, "speech window is empty");
+        Self::from_pcm_on_grid(pcm, window, 1)
+    }
+
+    fn from_pcm_on_grid(pcm: &[f32], window: &PackedWindow, grid_ms: u32) -> Result<Self> {
+        ensure!(
+            matches!(grid_ms, 1 | 20),
+            "unsupported speech timestamp grid"
+        );
+        let mut samples = concatenate_regions_bounded(pcm, window)?;
+        let speech_ms = window.speech_ms();
+        let duration_ms = speech_ms.div_ceil(grid_ms) * grid_ms;
+        let padding_ms = duration_ms - speech_ms;
+        ensure!(speech_ms > 0, "speech window is empty");
         ensure!(duration_ms <= WINDOW_MS, "speech window exceeds 30 seconds");
+        samples.resize(samples.len() + padding_ms as usize * 16, 0.0);
         let wav_bytes = encode_pcm16_wav(&samples)?;
         let sample_count = validate_wav_16k_mono(&wav_bytes)?;
         ensure!(
@@ -471,6 +506,7 @@ impl NativeSttAudioWindow {
             wav_bytes,
             duration_ms,
             sample_count,
+            padding_ms,
         })
     }
 
@@ -490,6 +526,10 @@ impl NativeSttAudioWindow {
         self.sample_count
     }
 
+    pub fn padding_ms(&self) -> u32 {
+        self.padding_ms
+    }
+
     fn validate_for(&self, spec: &NativeSttModelSpec) -> Result<()> {
         ensure!(self.duration_ms > 0, "speech window is empty");
         ensure!(
@@ -506,8 +546,10 @@ impl NativeSttAudioWindow {
             "speech WAV sample count does not match the bounded window"
         );
         ensure!(
-            self.window.speech_ms() == self.duration_ms,
-            "speech WAV duration does not match its packed window"
+            self.window.speech_ms().checked_add(self.padding_ms) == Some(self.duration_ms)
+                && self.padding_ms < 20
+                && self.sample_count == self.duration_ms as usize * 16,
+            "speech WAV duration does not match its packed window and explicit padding"
         );
         Ok(())
     }

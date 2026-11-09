@@ -30,11 +30,12 @@ use chrono::{SecondsFormat, Utc};
 use rcdvlog_core::NativeSttProtocolError;
 use rcdvlog_core::review_speech::{DecodedSegment, RejectReason, reject_reason};
 use rcdvlog_core::review_speech::{
-    NativeSttAudioWindow, NativeSttCost, NativeSttOutcome, NativeSttRequest, NativeSttTransport,
-    OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL, OpenRouterSttClient,
+    NativeSttCost, NativeSttOutcome, NativeSttRequest, NativeSttTransport, OPENROUTER_STT_PROVIDER,
+    OPENROUTER_WHISPER_MODEL, OpenRouterSttClient,
 };
 use rcdvlog_core::review_speech::{
-    NativeSttModelChoice, NativeSttProviderError, discover_native_stt_models,
+    NativeSttModelChoice, NativeSttProviderError, canonical_native_stt_language,
+    discover_native_stt_models,
 };
 use rcdvlog_core::review_speech::{PackedWindow, SpeechRegion, pack_windows, translate_span};
 use rcdvlog_core::review_speech::{SttEngine, VAD_MODEL, WHISPER_MODEL};
@@ -455,7 +456,7 @@ fn settings_fingerprint(
     request: &ReviewTranscriptionRequest,
     resolved: &ResolvedRequest,
 ) -> String {
-    let document = serde_json::json!({
+    let mut document = serde_json::json!({
         "recipe": REVIEW_TRANSCRIBE_RECIPE,
         "backend": request.backend,
         "provider": resolved.provider,
@@ -464,6 +465,10 @@ fn settings_fingerprint(
         "zeroDataRetention": false,
         "contract": "review-transcription-post-execution-cost-v2",
     });
+    if request.backend == ReviewTranscriptionBackend::Openrouter {
+        document["responseCompatibility"] =
+            serde_json::json!("known-language-code.whisper-input-grid20ms.v1");
+    }
     blake3::hash(document.to_string().as_bytes())
         .to_hex()
         .to_string()
@@ -1421,7 +1426,8 @@ impl WindowLedger {
         match row {
             Some((stored, Some(json))) if stored == fingerprint => {
                 match serde_json::from_str::<CachedWindow>(&json)? {
-                    CachedWindow::Segments(rows) => {
+                    CachedWindow::Segments(rows)
+                    | CachedWindow::Completed { segments: rows, .. } => {
                         Ok(Some(rows.into_iter().map(Into::into).collect()))
                     }
                     CachedWindow::Unusable { unusable, .. } => {
@@ -1465,10 +1471,18 @@ impl WindowLedger {
         actual_model: Option<&str>,
         latency_ms: Option<u64>,
         decoded: &[DecodedSegment],
+        input_padding_ms: u32,
     ) -> anyhow::Result<()> {
         let connection = open_writable_connection(&self.database_path)?;
-        let json =
-            serde_json::to_string(&decoded.iter().map(CachedSegment::from).collect::<Vec<_>>())?;
+        let segments = decoded.iter().map(CachedSegment::from).collect::<Vec<_>>();
+        let json = if input_padding_ms > 0 {
+            serde_json::to_string(&CachedWindow::Completed {
+                segments,
+                input_padding_ms,
+            })?
+        } else {
+            serde_json::to_string(&segments)?
+        };
         connection.execute(
             "INSERT INTO review_transcription_windows(run_id, segment_index, window_index, window_fingerprint, state, reserved_micro_usd,
                 cost_known, cost_micro_usd, generation_id, actual_provider, actual_model, latency_ms, result_json, created_at, updated_at)
@@ -1503,7 +1517,7 @@ impl WindowLedger {
         receipt: Option<CloudReceipt>,
     ) -> anyhow::Result<()> {
         let (cost, generation, provider, model, latency, provider_error) = receipt
-            .map(|(c, g, p, m, l, e)| (c, g, p, m, Some(l as i64), e))
+            .map(|(c, g, p, m, l, e, _)| (c, g, p, m, Some(l as i64), e))
             .unwrap_or((None, None, None, None, None, None));
         let connection = open_writable_connection(&self.database_path)?;
         connection.execute(
@@ -1530,6 +1544,10 @@ impl WindowLedger {
 #[serde(untagged)]
 enum CachedWindow {
     Segments(Vec<CachedSegment>),
+    Completed {
+        segments: Vec<CachedSegment>,
+        input_padding_ms: u32,
+    },
     Unusable {
         unusable: NativeSttProtocolError,
         #[serde(default)]
@@ -1586,6 +1604,7 @@ type CloudReceipt = (
     Option<String>,
     u64,
     Option<NativeSttProviderError>,
+    u32,
 );
 
 thread_local! {
@@ -1601,7 +1620,7 @@ impl SttEngine for CloudEngine<'_> {
         pcm: &[f32],
         window: &PackedWindow,
     ) -> anyhow::Result<Vec<DecodedSegment>> {
-        let audio = NativeSttAudioWindow::from_pcm(pcm, window)?;
+        let audio = self.request.prepare_audio(pcm, window)?;
         self.transport.prepare()?;
         let result = self
             .transport
@@ -1619,20 +1638,25 @@ impl SttEngine for CloudEngine<'_> {
                 result.receipt.actual_model.clone(),
                 result.latency_ms,
                 result.provider_error.clone(),
+                audio.padding_ms(),
             ));
         });
         match result.outcome {
-            NativeSttOutcome::Usable(transcript) => Ok(transcript
-                .segments
-                .into_iter()
-                .map(|s| DecodedSegment {
-                    start_ms: s.start_ms,
-                    end_ms: s.end_ms,
-                    language: transcript.language.clone(),
-                    text: s.text,
-                    mean_token_probability: None,
-                })
-                .collect()),
+            NativeSttOutcome::Usable(transcript) => {
+                let language = canonical_native_stt_language(&transcript.language)
+                    .map_err(DispatchError::Unusable)?;
+                Ok(transcript
+                    .segments
+                    .into_iter()
+                    .map(|s| DecodedSegment {
+                        start_ms: s.start_ms,
+                        end_ms: s.end_ms,
+                        language: language.clone(),
+                        text: s.text,
+                        mean_token_probability: None,
+                    })
+                    .collect())
+            }
             NativeSttOutcome::Unusable(reason) => Err(DispatchError::Unusable(reason).into()),
         }
     }
@@ -1692,10 +1716,11 @@ fn transcribe_segment(
                 match engine.decode_window(pcm, &window) {
                     Ok(decoded) => {
                         let receipt = LAST_CLOUD_RECEIPT.with(|slot| slot.borrow_mut().take());
-                        let (cost, generation, provider, model, latency) = match receipt {
-                            Some((c, g, p, m, l, _)) => (c, g, p, m, Some(l)),
-                            None => (None, None, None, None, None),
-                        };
+                        let (cost, generation, provider, model, latency, input_padding_ms) =
+                            match receipt {
+                                Some((c, g, p, m, l, _, padding)) => (c, g, p, m, Some(l), padding),
+                                None => (None, None, None, None, None, 0),
+                            };
                         ledger
                             .settle(
                                 segment_index,
@@ -1707,6 +1732,7 @@ fn transcribe_segment(
                                 model.as_deref(),
                                 latency,
                                 &decoded,
+                                input_padding_ms,
                             )
                             .map_err(|_| {
                                 SegmentFailure::Failed("review_transcription_store_failed")
@@ -1788,6 +1814,9 @@ fn to_utterances(
         .enumerate()
         .filter_map(|(i, segment)| {
             let (start_ms, end_ms) = translate_span(window, segment.start_ms, segment.end_ms)?;
+            if start_ms >= end_ms {
+                return None;
+            }
             let start_frame =
                 segment_start_frame + (u64::from(start_ms) * u64::from(sample_rate)) / 1000;
             let end_frame =

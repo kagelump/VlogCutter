@@ -119,8 +119,8 @@ pub mod review_speech {
         NativeSttModelChoice, NativeSttOutcome, NativeSttProviderError, NativeSttProviderPolicy,
         NativeSttReceipt, NativeSttRequest, NativeSttSegment, NativeSttTranscript,
         NativeSttTransport, NativeSttUsage, OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL,
-        OpenRouterSttClient, SttDataCollection, discover_native_stt_models,
-        resolve_native_stt_model, validate_iso639_1,
+        OpenRouterSttClient, SttDataCollection, canonical_native_stt_language,
+        discover_native_stt_models, resolve_native_stt_model, validate_iso639_1,
     };
     pub use crate::analysis::quality::{DecodedSegment, RejectReason, reject_reason};
     pub use crate::analysis::silero_vad::detect_silero_speech;

@@ -843,3 +843,130 @@ fn invalid_timestamps_explain_input_and_provider_durations_without_accepting_the
     assert!(message.contains("latest segment end: 2.060s"));
     assert_eq!(result.receipt.usage.cost, NativeSttCost::Known(0.0001));
 }
+
+#[test]
+fn provider_language_names_are_case_insensitive_and_canonical_without_guessing_unknown_values() {
+    for (reported, expected) in [
+        ("English", "en"),
+        ("EN", "en"),
+        (" english ", "en"),
+        ("Chinese", "zh"),
+        ("Haitian Creole", "ht"),
+    ] {
+        let mut payload = valid_response();
+        payload["language"] = json!(reported);
+        let decoded = decode_native_stt_value(&payload, 1000).unwrap();
+        assert_eq!(decoded.language, reported);
+        assert_eq!(
+            canonical_native_stt_language(&decoded.language).unwrap(),
+            expected
+        );
+    }
+    for reported in [
+        "unknown",
+        "auto",
+        "PRIVATE_LANGUAGE_CANARY",
+        "",
+        "en-something-unknown",
+    ] {
+        let mut payload = valid_response();
+        payload["language"] = json!(reported);
+        assert_eq!(
+            decode_native_stt_value(&payload, 1000).unwrap_err(),
+            NativeSttProtocolError::InvalidLanguage
+        );
+    }
+}
+
+#[test]
+fn whisper_review_padding_matches_20ms_tokens_without_changing_source_or_analysis_audio() {
+    let pcm = vec![0.25; 16000 * 15];
+    let window = pack_windows(&[SpeechRegion {
+        start_ms: 0,
+        end_ms: 14150,
+    }])
+    .remove(0);
+    let exact = NativeSttAudioWindow::from_pcm(&pcm, &window).unwrap();
+    for model in [
+        "openai/whisper-1",
+        "openai/whisper-large-v3",
+        "openai/whisper-large-v3-turbo",
+    ] {
+        let req = NativeSttRequest::for_discovered_model(model.into(), None).unwrap();
+        let padded = req.prepare_audio(&pcm, &window).unwrap();
+        assert_eq!(padded.duration_ms(), 14160);
+        assert_eq!(padded.padding_ms(), 10);
+        assert_eq!(padded.window().speech_ms(), 14150);
+        let source_samples = hound::WavReader::new(std::io::Cursor::new(exact.wav_bytes()))
+            .unwrap()
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let padded_samples = hound::WavReader::new(std::io::Cursor::new(padded.wav_bytes()))
+            .unwrap()
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(&padded_samples[..source_samples.len()], source_samples);
+        assert!(
+            padded_samples[source_samples.len()..]
+                .iter()
+                .all(|s| *s == 0)
+        );
+        build_native_stt_request_body(&req, &padded).unwrap();
+        let mut response = valid_response();
+        response["language"] = json!("English");
+        response["duration"] = json!(14.159999847);
+        response["segments"][0]["end"] = json!(14.16);
+        assert!(decode_native_stt_value(&response, padded.duration_ms()).is_ok());
+        assert_eq!(
+            decode_native_stt_value(&response, exact.duration_ms()).unwrap_err(),
+            NativeSttProtocolError::InvalidTimestamp
+        );
+        response["segments"][0]["end"] = json!(14.18);
+        assert_eq!(
+            decode_native_stt_value(&response, padded.duration_ms()).unwrap_err(),
+            NativeSttProtocolError::InvalidTimestamp
+        );
+    }
+    assert_eq!(request().prepare_audio(&pcm, &window).unwrap(), exact);
+    let other = NativeSttRequest::for_discovered_model("google/gemini-3.5-transcribe".into(), None)
+        .unwrap();
+    assert_eq!(other.prepare_audio(&pcm, &window).unwrap(), exact);
+    for duration in [1, 29981, 29999, 30000] {
+        let window = pack_windows(&[SpeechRegion {
+            start_ms: 0,
+            end_ms: duration,
+        }])
+        .remove(0);
+        let req =
+            NativeSttRequest::for_discovered_model("openai/whisper-large-v3-turbo".into(), None)
+                .unwrap();
+        let audio = req.prepare_audio(&vec![0.1; 480000], &window).unwrap();
+        assert!(audio.padding_ms() < 20 && audio.duration_ms() <= 30000);
+        assert_eq!(audio.duration_ms() % 20, 0);
+    }
+}
+
+#[test]
+fn captured_whisper_turbo_reproduction_decodes_after_language_and_input_grid_fix() {
+    // Actual provider shapes/times; private text and identifiers have been replaced.
+    let before: Value =
+        serde_json::from_str(include_str!("fixtures/whisper-turbo-before.json")).unwrap();
+    let after: Value =
+        serde_json::from_str(include_str!("fixtures/whisper-turbo-after.json")).unwrap();
+    assert_eq!(before["language"], "English");
+    // Recognizing the language does not silently accept the original out-of-range end.
+    assert_eq!(
+        decode_native_stt_value(&before, 14150).unwrap_err(),
+        NativeSttProtocolError::InvalidTimestamp
+    );
+    let decoded = decode_native_stt_value(&after, 14160).unwrap();
+    assert_eq!(decoded.language, "English");
+    assert_eq!(
+        canonical_native_stt_language(&decoded.language).unwrap(),
+        "en"
+    );
+    assert_eq!(decoded.duration_ms, 14160);
+    assert_eq!(decoded.segments[0].end_ms, 14160);
+}
