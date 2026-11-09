@@ -49,8 +49,10 @@ Every utterance keeps its **recording clock** time.
   into recording and movie seconds on their original clocks. Adjacent spans
   coalesce only when both endpoints meet; unknown/conflicting gaps, seeks and
   clock changes stay separate. A long ASR line may have known timing only in
-  its middle: the transcript shows those video ranges with their corresponding
-  audio ranges and labels the line start unknown. These spans never replace
+  its middle: the transcript shows a shot thumbnail from the first known span,
+  linked to that video position, with a hover hint that it is the first observed
+  playback in the line. Timing diagnostics remain in the workspace data rather
+  than visible text below each line. These spans never replace
   the utterance-start locator used for exports or imply word-level timing.
   An explicit human locator correction/clear takes precedence and hides these
   automatic display ranges in the workspace.

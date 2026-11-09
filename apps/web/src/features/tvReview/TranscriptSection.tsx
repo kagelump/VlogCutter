@@ -146,7 +146,7 @@ function RunBody({ run }: { run: ReviewTranscriptionRun }) {
             {run.utterances.map((utterance) => {
               const timing = timedLines.get(utterance.utteranceId);
               const movieTime = timing?.movieTime;
-              const seconds = movieTime?.movieSeconds;
+              const seconds = movieTime?.movieSeconds ?? timing?.movieTimeRanges?.[0]?.movieStartSeconds;
               const cut = seconds !== undefined && Number.isFinite(seconds) && seconds >= 0
                 ? context?.cuts.find((shot) => shot.movieInSeconds <= seconds && seconds < shot.movieOutSeconds) : undefined;
               return <UtteranceLine key={utterance.utteranceId} utterance={utterance} showRaw={showRaw}
@@ -154,7 +154,7 @@ function RunBody({ run }: { run: ReviewTranscriptionRun }) {
                 movieTimeRanges={timing?.movieTimeRanges}
                 thumbnail={cut ? client.projectAssetThumbnailUrl(run.projectId, cut.assetId) : undefined}
                 shotNumber={cut ? cut.position + 1 : undefined}
-                videoId={target.data?.youtube.videoId ?? undefined} timingLoading={workspace.isPending} />;
+                videoId={target.data?.youtube.videoId ?? undefined} />;
             })}
           </ol>
         </>

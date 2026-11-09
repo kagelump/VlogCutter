@@ -303,14 +303,14 @@ test("transcript lines show mapped video time and their shot thumbnail", async (
     getReviewWorkspace: vi.fn().mockResolvedValue(mapped),
     getReviewTarget: vi.fn().mockResolvedValue({ ...target, youtube: { ...target.youtube, videoId: "dQw4w9WgXcQ" } }),
   });
-  const link = await screen.findByRole("link", { name: "Video ≈ 0:01.5" });
+  const link = await screen.findByRole("link", { name: "Shot 1 thumbnail" });
   expect(link).toHaveAttribute("href", "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1s");
   expect(screen.getByText("Audio")).toBeVisible();
   const image = screen.getByRole("img", { name: "Shot 1 thumbnail" });
   expect(image).toHaveAttribute("src", "/api/v1/projects/p1/assets/asset_repeated/thumbnail");
   fireEvent.error(image);
-  expect(await screen.findByText("Thumbnail unavailable")).toBeVisible();
-  expect(link).toBeVisible();
+  expect(screen.queryByRole("img")).toBeNull();
+  expect(link).not.toBeInTheDocument();
 });
 
 test("an unmapped transcript line does not borrow a nearby video time or thumbnail", async () => {
@@ -321,14 +321,15 @@ test("an unmapped transcript line does not borrow a nearby video time or thumbna
     listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [run()] }),
     getReviewWorkspace: vi.fn().mockResolvedValue(workspace()),
   });
-  expect(await screen.findByText("Video time unavailable")).toBeVisible();
-  expect(screen.getByText("I think I like the frame")).toBeVisible();
+  expect(await screen.findByText("I think I like the frame")).toBeVisible();
+  expect(screen.queryByText("Video time unavailable")).toBeNull();
   expect(screen.queryByRole("img")).toBeNull();
   expect(screen.queryByRole("link", { name: /^Video/ })).toBeNull();
 });
 
-test("a long transcript line shows known video ranges when its beginning is unobserved", async () => {
+test("a long transcript line shows only a linked thumbnail from its first known video range", async () => {
   const mapped = workspace();
+  mapped.cuts.push({ operationId: "editop_c", position: 2, assetId: "asset_later", movieInSeconds: 6, movieOutSeconds: 40 });
   mapped.utterances[0].movieTimeRanges = [{ recordingStartSeconds: 4.032, recordingEndSeconds: 29.034,
     movieStartSeconds: 7.032, movieEndSeconds: 32.031, uncertaintySeconds: 0.385, evidenceIds: ["pa", "pb"] }];
   renderApp("/projects/p1/reviews/rtarget_one/sessions/rsession_1", {
@@ -338,11 +339,11 @@ test("a long transcript line shows known video ranges when its beginning is unob
     getReviewWorkspace: vi.fn().mockResolvedValue(mapped),
     getReviewTarget: vi.fn().mockResolvedValue({ ...target, youtube: { ...target.youtube, videoId: "dQw4w9WgXcQ" } }),
   });
-  expect(await screen.findByText("Partial video timing · line start unknown")).toBeVisible();
-  expect(screen.getByRole("link", { name: "Video ≈ 0:07.0–0:32.0" })).toHaveAttribute("href", "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=7s");
-  expect(screen.getByText(/audio 0:04.0–0:29.0 only/)).toBeVisible();
+  const image = await screen.findByRole("img", { name: "Shot 3 thumbnail" });
+  expect(image).toHaveAttribute("src", "/api/v1/projects/p1/assets/asset_later/thumbnail");
+  expect(screen.getByRole("link", { name: "Shot 3 thumbnail" })).toHaveAttribute("href", "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=7s");
+  expect(screen.queryByText(/Partial video timing|audio 0:04.0–0:29.0 only/)).toBeNull();
   expect(screen.queryByText("Video time unavailable")).toBeNull();
-  expect(screen.queryByRole("img")).toBeNull();
 });
 
 test("named cuts appear in the review list with revision identity as secondary text", async () => {

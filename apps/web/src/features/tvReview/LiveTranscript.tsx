@@ -45,7 +45,7 @@ export function LiveTranscriptPanel({ data, projectId, videoId, recording = fals
     }}>
       {data.lines.map((line) => <UtteranceLine key={line.utterance.utteranceId} utterance={line.utterance} showRaw={false}
         movieTime={line.movieTime ?? undefined} movieTimeRanges={line.movieTimeRanges} thumbnail={line.assetId ? client.projectAssetThumbnailUrl(projectId, line.assetId) : undefined}
-        shotNumber={line.shotNumber ?? undefined} videoId={videoId} timingLoading={false} />)}
+        shotNumber={line.shotNumber ?? undefined} videoId={videoId} />)}
     </ol> : <p className={styles.muted}>{refining ? "Waiting for the full transcript…" : "Waiting for live text…"}</p>}
   </Panel>;
 }

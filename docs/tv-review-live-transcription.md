@@ -74,10 +74,11 @@ same immutable review target, calibrated capture clocks, playback observations
 and discontinuity boundaries as the final transcript. New timing evidence can
 therefore update thumbnails even without new text. The matching shot is selected
 at the mapped utterance start, never at the time the ASR response arrived.
-When that start is unknown but later playback spans are mapped, the draft and
-final transcript show `movieTimeRanges` with the corresponding audio ranges,
-explicitly marked as partial timing. They do not borrow a later timestamp or
-thumbnail for the line's beginning.
+The transcript displays shot thumbnails without timing captions. For a final
+line with an unknown start, the first safe `movieTimeRanges` span can supply a
+thumbnail linked to that observed video position; its hover hint identifies it
+as later observed playback rather than the line's beginning. The start locator
+and full timing diagnostics remain unchanged in the workspace data.
 
 No movie time or thumbnail is invented when timing is pending, conflicting or
 outside supported evidence. In particular, the current shared policy does not
