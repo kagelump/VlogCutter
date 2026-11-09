@@ -173,10 +173,9 @@ async function openSeededTarget(page: import("@playwright/test").Page, code: str
 async function startRecording(page: import("@playwright/test").Page) {
   await page.getByRole("link", { name: "Record review" }).click();
   await expect(page.getByRole("heading", { name: "Record review" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Record", exact: true })).toBeDisabled();
-  await page.getByRole("button", { name: "Allow microphone" }).click();
-  await expect(page.getByLabel("Input", { exact: true })).toBeVisible();
-  await page.getByLabel(/Everyone here knows/).check();
+
+  await expect(page.getByLabel("Microphone", { exact: true })).toBeVisible();
+
   await page.getByRole("button", { name: "Record", exact: true }).click();
   await expect(page.getByRole("status").filter({ hasText: /^Recording/ })).toBeVisible();
 }

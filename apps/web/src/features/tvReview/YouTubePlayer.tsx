@@ -49,14 +49,17 @@ export function YouTubePlayer({ videoId, recording, onObservation }: {
   callback.current = onObservation;
   useEffect(() => {
     let cancelled = false;
+    setError(null);
+    setReady(false);
     function sample() {
       const p = player.current;
-      if (!active.current || !p) return;
+      if (!p || cancelled) return;
       try {
         const position = p.getCurrentTime();
         const state = p.getPlayerState();
         const rate = p.getPlaybackRate();
-        callback.current(position, state, rate, performance.now());
+        if ([1, 2, 3, 5].includes(state)) { setReady(true); setError(null); }
+        if (active.current) callback.current(position, state, rate, performance.now());
       } catch { /* A player that is not ready cannot supply an observation. */ }
     }
     void loadApi().then((api) => {
@@ -65,8 +68,11 @@ export function YouTubePlayer({ videoId, recording, onObservation }: {
       container.current.appendChild(mount);
       player.current = new api.Player(mount, {
         videoId, width: "100%", height: "360", playerVars: { playsinline: 1, origin: window.location.origin },
-        events: { onReady: () => setReady(true), onStateChange: sample, onPlaybackRateChange: sample,
-          onError: () => setError("This video cannot be played in the embedded player. Use Record review with the video on another screen instead.") },
+        events: { onReady: () => { if (!cancelled) { setReady(true); setError(null); } }, onStateChange: sample, onPlaybackRateChange: sample,
+          // The iframe shows the actual error (including account/private-video
+          // prompts). API error codes alone cannot tell whether this viewer can
+          // play it, and may fire transiently before successful playback.
+          onError: () => { if (!cancelled) setReady(true); } },
       });
     }).catch(() => { if (!cancelled) setError("The YouTube player could not load. Check your connection or use Record review instead."); });
     const timer = window.setInterval(sample, 5000);

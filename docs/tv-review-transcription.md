@@ -194,3 +194,15 @@ The public two-speaker code-switching fixture the issue asks for is not in the
 repository. It needs a licensed recording, and should be chosen together with
 the diarization decision. Real-audio evaluation belongs to the local
 acceptance stage.
+
+
+## Unusable cloud responses
+
+A response can arrive successfully while its timestamps or required fields
+are unusable. The review adapter preserves the safe protocol reason, generation
+ID, returned provider/model, latency and any reported cost independently of
+transcript validity. Segment errors distinguish invalid timestamps, missing
+fields, authentication, routing and rate limits. The provider body is not
+stored or displayed. Unknown costs retain their full reservation, and retries
+reuse the saved failure without resending it. Old failures that discarded their
+receipts cannot be reconstructed or reconciled from the generic error alone.

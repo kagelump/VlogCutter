@@ -14,21 +14,20 @@ declaration and not as measured sync.
 
 ## Play + record review
 
-For a target with a YouTube ID, choose **Play + record review**, allow the microphone, acknowledge consent, and press Record. Press play in the embedded player after recording starts. Player position, state and playback rate are sampled every five seconds and on player state/rate changes; each observation retains its browser monotonic time, a contemporaneous microphone-clock pairing and clock epoch. Observations are durable session events and can be lost if local event storage fails (the recorder reports unsaved events). Pauses, buffering and seeks can make the mapping discontinuous. The observations are approximate and do not measure TV output latency or verify that the YouTube video matches the target. The existing synchronization pipeline does not yet consume these observations for automatic comment placement. An independent TV player is not observed.
+For a target with a YouTube ID, choose **Play + record review**, allow the browser’s microphone request, and press Record above the video. Press play in the embedded player after recording starts. Player position, state and playback rate are sampled every five seconds and on player state/rate changes; each observation retains its browser monotonic time, a contemporaneous microphone-clock pairing and clock epoch. Observations are durable session events and can be lost if local event storage fails (the recorder reports unsaved events). Pauses, buffering and seeks can make the mapping discontinuous. The observations are approximate and do not measure TV output latency or verify that the YouTube video matches the target. The shared synchronization pipeline uses valid playback observations to estimate comment positions and shot thumbnails; uncertainty and interruptions remain explicit. An independent TV player is not observed.
 
 ## User flow
 
 *Projects → TV reviews → cut → Record review*:
 
 1. Open the target's YouTube video on the TV.
-2. Press **Allow microphone**. The browser asks for permission and nothing is
-   captured yet. Then pick the input device.
-3. Confirm that everyone present knows they are being recorded (required). If a
-   second speaker will be recorded, tick the separate opt-in disclosure.
-4. Press **Record**. The recorder shows `Recording <elapsed>`. The level meter
+2. The page requests microphone permission on load. Allow it in the browser,
+   then pick the input device. Recording begins only when you press Record;
+   blocked permission offers a retry button.
+3. Press **Record** above the player. There are no consent checkboxes. The recorder shows `Recording <elapsed>`. The level meter
    and upload counters update while you record.
-5. Optionally press **Mark start** (or `M`) when the first frame appears.
-6. Press **Stop**. The page flushes and uploads the tail and finalizes the
+4. Optionally press **Mark start** (or `M`) when the first frame appears.
+5. Press **Stop**. The page flushes and uploads the tail and finalizes the
    session, then opens the session page.
 
 Recording keeps running while the tab is in the background, as long as Chrome
@@ -212,7 +211,7 @@ never touched.
   - outbox bound
   - uploader backoff and permanent stop
   - recovery finalization and the refusal to finalize while audio is buffered
-  - consent and permission gating, refusal and retry, cue keyboard shortcut,
+  - microphone permission on load, refusal and retry, cue keyboard shortcut,
     queued stop
   - incomplete session view and deletion
 - **Playwright with headless Chromium** against a real disposable server, using

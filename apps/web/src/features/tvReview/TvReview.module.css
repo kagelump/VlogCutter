@@ -264,3 +264,8 @@
   .recordLayout:has(.recordTranscript) { grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr); }
   .recordMain { position: sticky; top: var(--space-4); }
 }
+
+.recordMain { display: grid; gap: var(--space-4); }
+.recordMain > header { margin-bottom: 0; }
+.recordToolbar { display: flex; gap: var(--space-4); align-items: end; flex-wrap: wrap; }
+.recordToolbar > :last-child { flex: 1 1 220px; }

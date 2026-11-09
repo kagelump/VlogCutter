@@ -3,7 +3,7 @@
 Play + record review combines the embedded video, microphone controls and a
 read-only live transcript. The regular Record review page can also show live
 words, with video matches only where its synchronization evidence supports them.
-The **Show live transcription and refine it automatically after recording**
+The **Live transcription**
 checkbox defaults on. Turning it off keeps the explicit post-recording workflow.
 
 ## Model choice and setup

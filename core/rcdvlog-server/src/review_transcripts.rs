@@ -28,6 +28,7 @@ use crate::{
 };
 use anyhow::{Context, anyhow};
 use chrono::{SecondsFormat, Utc};
+use rcdvlog_core::NativeSttProtocolError;
 use rcdvlog_core::review_speech::{DecodedSegment, RejectReason, reject_reason};
 use rcdvlog_core::review_speech::{
     NATIVE_STT_MODELS, NativeSttAudioWindow, NativeSttCost, NativeSttOutcome,
@@ -1360,7 +1361,25 @@ enum DispatchError {
     #[error("dispatch outcome unknown")]
     Unknown,
     #[error("provider returned unusable output")]
-    Unusable,
+    Unusable(NativeSttProtocolError),
+}
+
+/// Stable, body-free reasons suitable for a transcript segment and UI.
+fn provider_failure_code(reason: NativeSttProtocolError) -> &'static str {
+    use NativeSttProtocolError::*;
+    match reason {
+        InvalidTimestamp | MissingTimestamp | OutOfOrderTimestamp => {
+            "review_transcription_provider_invalid_timestamp"
+        }
+        MissingText | MissingLanguage | MissingDuration | MissingSegments => {
+            "review_transcription_provider_incomplete_response"
+        }
+        HttpStatus(401 | 403) => "review_transcription_provider_auth_failed",
+        HttpStatus(404) => "review_transcription_provider_no_route",
+        HttpStatus(429) => "review_transcription_provider_rate_limited",
+        HttpStatus(_) => "review_transcription_provider_http_error",
+        _ => "review_transcription_provider_unusable",
+    }
 }
 
 /// Durable per-window cache and, for cloud, the reservation ledger.
@@ -1398,8 +1417,14 @@ impl WindowLedger {
             .optional()?;
         match row {
             Some((stored, Some(json))) if stored == fingerprint => {
-                let rows: Vec<CachedSegment> = serde_json::from_str(&json)?;
-                Ok(Some(rows.into_iter().map(Into::into).collect()))
+                match serde_json::from_str::<CachedWindow>(&json)? {
+                    CachedWindow::Segments(rows) => {
+                        Ok(Some(rows.into_iter().map(Into::into).collect()))
+                    }
+                    CachedWindow::Unusable { unusable } => {
+                        Err(DispatchError::Unusable(unusable).into())
+                    }
+                }
             }
             _ => Ok(None),
         }
@@ -1498,6 +1523,27 @@ impl WindowLedger {
         Ok(())
     }
 
+    fn settle_unusable(
+        &self,
+        segment: u32,
+        index: u32,
+        reason: NativeSttProtocolError,
+        receipt: Option<CloudReceipt>,
+    ) -> anyhow::Result<()> {
+        let (cost, generation, provider, model, latency) = receipt
+            .map(|(c, g, p, m, l)| (c, g, p, m, Some(l as i64)))
+            .unwrap_or((None, None, None, None, None));
+        let connection = open_writable_connection(&self.database_path)?;
+        connection.execute(
+            "UPDATE review_transcription_windows SET state='settled', cost_known=?4, cost_micro_usd=?5,
+             generation_id=?6, actual_provider=?7, actual_model=?8, latency_ms=?9, result_json=?10, updated_at=?11
+             WHERE run_id=?1 AND segment_index=?2 AND window_index=?3",
+            params![self.run_id, segment, index, cost.is_some(), cost, generation, provider, model, latency,
+                serde_json::to_string(&CachedWindow::Unusable { unusable: reason })?, now_text()],
+        )?;
+        Ok(())
+    }
+
     fn mark_unknown(&self, segment: u32, index: u32) {
         if let Ok(connection) = open_writable_connection(&self.database_path) {
             let _ = connection.execute(
@@ -1506,6 +1552,13 @@ impl WindowLedger {
             );
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum CachedWindow {
+    Segments(Vec<CachedSegment>),
+    Unusable { unusable: NativeSttProtocolError },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1602,7 +1655,7 @@ impl SttEngine for CloudEngine<'_> {
                     mean_token_probability: None,
                 })
                 .collect()),
-            NativeSttOutcome::Unusable(_) => Err(DispatchError::Unusable.into()),
+            NativeSttOutcome::Unusable(reason) => Err(DispatchError::Unusable(reason).into()),
         }
     }
 }
@@ -1642,7 +1695,15 @@ fn transcribe_segment(
         let fingerprint = window_fingerprint(segment_index, &window);
         let decoded = match ledger.cached(segment_index, index, &fingerprint) {
             Ok(Some(decoded)) => decoded,
-            _ => {
+            Err(error) => {
+                return Err(match error.downcast_ref::<DispatchError>() {
+                    Some(DispatchError::Unusable(reason)) => {
+                        SegmentFailure::Failed(provider_failure_code(*reason))
+                    }
+                    _ => SegmentFailure::Failed("review_transcription_store_failed"),
+                });
+            }
+            Ok(None) => {
                 if ledger.cloud {
                     match ledger.reserve_and_mark_dispatched(segment_index, index, &fingerprint) {
                         Ok(()) => {}
@@ -1677,14 +1738,23 @@ fn transcribe_segment(
                     }
                     Err(error) => {
                         if ledger.cloud {
-                            // Sent or possibly sent: never resend, keep the reservation.
+                            if let Some(DispatchError::Unusable(reason)) =
+                                error.downcast_ref::<DispatchError>()
+                            {
+                                // The response arrived: preserve its receipt even when the
+                                // timed transcript is invalid. Never cache it as decoded text.
+                                let receipt =
+                                    LAST_CLOUD_RECEIPT.with(|slot| slot.borrow_mut().take());
+                                ledger
+                                    .settle_unusable(segment_index, index, *reason, receipt)
+                                    .map_err(|_| {
+                                        SegmentFailure::Failed("review_transcription_store_failed")
+                                    })?;
+                                return Err(SegmentFailure::Failed(provider_failure_code(*reason)));
+                            }
+                            // Sent or possibly sent with no response: keep the reservation.
                             ledger.mark_unknown(segment_index, index);
-                            return Err(match error.downcast_ref::<DispatchError>() {
-                                Some(DispatchError::Unusable) => {
-                                    SegmentFailure::Failed("review_transcription_provider_unusable")
-                                }
-                                _ => SegmentFailure::DispatchUnknown,
-                            });
+                            return Err(SegmentFailure::DispatchUnknown);
                         }
                         return Err(SegmentFailure::Failed("review_transcription_decode_failed"));
                     }
@@ -1857,7 +1927,7 @@ fn load_run(
         });
     }
     let spend = connection.query_row(
-        "SELECT COALESCE(SUM(CASE WHEN state IN ('dispatched','unknown','reserved') THEN reserved_micro_usd ELSE 0 END),0),
+        "SELECT COALESCE(SUM(CASE WHEN (state IN ('dispatched','unknown','reserved') OR (state='settled' AND cost_known=0)) THEN reserved_micro_usd ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN state='settled' AND cost_known=1 THEN cost_micro_usd ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN state='unknown' OR (state='settled' AND cost_known=0) THEN 1 ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN state IN ('settled','unknown','dispatched') AND reserved_micro_usd>0 THEN 1 ELSE 0 END),0),

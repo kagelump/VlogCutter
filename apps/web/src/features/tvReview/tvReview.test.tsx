@@ -167,23 +167,20 @@ function micDeps(recorder: object, overrides = {}) {
   });
 }
 
-test("recording needs microphone permission and consent, raw capture, and lands on the session", async () => {
+test("recording opens the microphone on load, captures raw audio, and lands on the session", async () => {
   const recorder = { session: { sessionId: "rsession_1" }, cue: vi.fn(), stop: vi.fn().mockResolvedValue({ sessionId: "rsession_1" }), pageHidden: vi.fn() };
   const voice = micDeps(recorder);
   const { router } = renderApp("/projects/p1/reviews/rtarget_one/record", { ...targetsClient, getReviewSession: vi.fn().mockResolvedValue({ ...session, state: "recording" }), listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [] }) }, voice);
   expect(await screen.findByRole("heading", { name: "Record review" })).toBeVisible();
-  expect(voice.getUserMedia).not.toHaveBeenCalled();
-  expect(screen.getByRole("button", { name: "Record" })).toBeDisabled();
-  await userEvent.click(screen.getByRole("button", { name: "Allow microphone" }));
+  await waitFor(() => expect(voice.getUserMedia).toHaveBeenCalledTimes(1));
+  expect(screen.queryByText("Consent")).toBeNull();
   expect(await screen.findByRole("option", { name: "Desk microphone" })).toBeInTheDocument();
   const constraints = vi.mocked(voice.getUserMedia).mock.calls[0][0] as { audio: MediaTrackConstraints };
   expect(constraints.audio).toMatchObject({ echoCancellation: false, noiseSuppression: false, autoGainControl: false });
-  expect(screen.getByRole("button", { name: "Record" })).toBeDisabled();
-  await userEvent.click(screen.getByLabelText(/Everyone here knows/));
-  await userEvent.click(screen.getByLabelText(/Someone else will talk/));
+  expect(screen.getByRole("button", { name: "Record" })).toBeEnabled();
   await userEvent.click(screen.getByRole("button", { name: "Record" }));
   expect(await screen.findByText(/^Recording/)).toBeVisible();
-  expect(vi.mocked(voice.startRecording).mock.calls[0][0]).toMatchObject({ projectId: "p1", additionalSpeakersDisclosed: true });
+  expect(vi.mocked(voice.startRecording).mock.calls[0][0]).toMatchObject({ projectId: "p1", additionalSpeakersDisclosed: false });
   await userEvent.keyboard("m");
   expect(recorder.cue).toHaveBeenCalledWith(0);
   await userEvent.click(screen.getByRole("button", { name: "Mark start" }));
@@ -195,17 +192,15 @@ test("recording needs microphone permission and consent, raw capture, and lands 
 test("a refused microphone explains how to retry", async () => {
   const voice = micDeps({}, { getUserMedia: vi.fn().mockRejectedValueOnce(new DOMException("denied", "NotAllowedError")).mockResolvedValue(fakeStream()) });
   renderApp("/projects/p1/reviews/rtarget_one/record", targetsClient, voice);
-  await userEvent.click(await screen.findByRole("button", { name: "Allow microphone" }));
   expect(await screen.findByText(/Microphone access is blocked/)).toBeVisible();
   await userEvent.click(screen.getByRole("button", { name: "Try again" }));
-  expect(await screen.findByLabelText("Input")).toBeVisible();
+  expect(await screen.findByLabelText("Microphone")).toBeVisible();
 });
 
 test("a stopped recording whose upload can't finish stays on the page with recovery guidance", async () => {
   const recorder = { session: { sessionId: "rsession_q" }, cue: vi.fn(), stop: vi.fn().mockResolvedValue(null), pageHidden: vi.fn() };
   const { router } = renderApp("/projects/p1/reviews/rtarget_one/record", targetsClient, micDeps(recorder));
-  await userEvent.click(await screen.findByRole("button", { name: "Allow microphone" }));
-  await userEvent.click(await screen.findByLabelText(/Everyone here knows/));
+  await screen.findByLabelText("Microphone");
   await userEvent.click(screen.getByRole("button", { name: "Record" }));
   await userEvent.click(await screen.findByRole("button", { name: "Stop" }));
   expect(await screen.findByText("Recording stopped, upload unfinished.")).toBeVisible();
@@ -402,8 +397,7 @@ test("live transcription startup failure leaves microphone capture running and c
   const recorder = { session: { sessionId: "rsession_1" }, cue: vi.fn(), stop: vi.fn(), pageHidden: vi.fn() };
   const enable = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(liveDraft);
   renderApp("/projects/p1/reviews/rtarget_one/record", { ...targetsClient, enableLiveReviewTranscript: enable }, micDeps(recorder));
-  await userEvent.click(await screen.findByRole("button", { name: "Allow microphone" }));
-  await userEvent.click(screen.getByLabelText(/Everyone here knows/));
+  await screen.findByLabelText("Microphone");
   await userEvent.click(screen.getByRole("button", { name: "Record" }));
   expect(await screen.findByText(/Live transcription couldn’t start/)).toBeVisible();
   expect(recorder.stop).not.toHaveBeenCalled();
@@ -416,11 +410,32 @@ test("turning live transcription off records without enabling either automatic p
   const recorder = { session: { sessionId: "rsession_1" }, cue: vi.fn(), stop: vi.fn(), pageHidden: vi.fn() };
   const enable = vi.fn();
   renderApp("/projects/p1/reviews/rtarget_one/record", { ...targetsClient, enableLiveReviewTranscript: enable }, micDeps(recorder));
-  await userEvent.click(await screen.findByRole("button", { name: "Allow microphone" }));
-  await userEvent.click(screen.getByLabelText(/Everyone here knows/));
-  await userEvent.click(screen.getByLabelText(/Show live transcription/));
+  await screen.findByLabelText("Microphone");
+  await userEvent.click(screen.getByLabelText("Live transcription"));
   await userEvent.click(screen.getByRole("button", { name: "Record" }));
   expect(await screen.findByText(/^Recording/)).toBeVisible();
   expect(enable).not.toHaveBeenCalled();
   expect(screen.queryByLabelText("Recording transcript")).toBeNull();
+});
+
+
+test("microphone permission arriving after leaving the page releases the stream", async () => {
+  let allow!: (stream: MediaStream) => void;
+  const voice = micDeps({}, { getUserMedia: vi.fn().mockImplementation(() => new Promise<MediaStream>((resolve) => { allow = resolve; })) });
+  const view = renderApp("/projects/p1/reviews/rtarget_one/record", targetsClient, voice);
+  await waitFor(() => expect(voice.getUserMedia).toHaveBeenCalledOnce());
+  view.unmount();
+  const stream = fakeStream();
+  allow(stream);
+  await waitFor(() => expect(stream.getTracks()[0].stop).toHaveBeenCalledOnce());
+});
+
+test("recording renders live words beside the controls as soon as the server responds", async () => {
+  const recorder = { session: { sessionId: "rsession_1" }, cue: vi.fn(), stop: vi.fn(), pageHidden: vi.fn() };
+  renderApp("/projects/p1/reviews/rtarget_one/record", { ...targetsClient, enableLiveReviewTranscript: vi.fn().mockResolvedValue(liveDraft) }, micDeps(recorder));
+  expect(await screen.findByText("Live transcript will appear here when you record.")).toBeVisible();
+  await screen.findByLabelText("Microphone");
+  await userEvent.click(screen.getByRole("button", { name: "Record" }));
+  expect(await screen.findByText("Live provisional words")).toBeVisible();
+  expect(screen.getByRole("img", { name: "Shot 1 thumbnail" })).toBeVisible();
 });

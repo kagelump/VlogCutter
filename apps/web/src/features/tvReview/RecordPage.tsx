@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useBlocker, useNavigate, useParams, useSearchParams } from "react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ProjectClientError, type RecordingEndReason } from "@rcdvlog/project-client";
@@ -31,17 +31,17 @@ export function RecordPage() {
   const target = useQuery({ queryKey: keys.target(projectId, targetId), queryFn: () => client.getReviewTarget(projectId, targetId) });
   const [liveEnabled, setLiveEnabled] = useState(true);
   const [liveError, setLiveError] = useState(false);
-  const [consent, setConsent] = useState(false);
-  const [secondSpeaker, setSecondSpeaker] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [microphones, setMicrophones] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState("");
-  const [micState, setMicState] = useState<"idle" | "denied" | "granted">("idle");
+  const [micState, setMicState] = useState<"idle" | "requesting" | "denied" | "granted">("idle");
   const [phase, setPhase] = useState<Phase>("setup");
   const [status, setStatus] = useState<CaptureStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const recording = useRef<Recording | null>(null);
+  const microphone = useRef<MediaStream | null>(null);
+  const micRequest = useRef(0);
   const liveTranscript = useLiveTranscript(projectId, activeSessionId ?? "");
   useDocumentTitle(phase === "recording" ? `● ${formatClock(status?.elapsedSeconds ?? 0)}` : "Record review");
 
@@ -50,7 +50,10 @@ export function RecordPage() {
   const leaving = useRef(false);
   const blocker = useBlocker(() => live && !leaving.current);
 
-  useEffect(() => () => { stream?.getTracks().forEach((track) => track.stop()); }, [stream]);
+  useEffect(() => () => {
+    micRequest.current += 1;
+    microphone.current?.getTracks().forEach((track) => track.stop());
+  }, []);
   useEffect(() => {
     const hidden = () => recording.current?.pageHidden();
     window.addEventListener("pagehide", hidden);
@@ -66,17 +69,26 @@ export function RecordPage() {
   const cue = () => void recording.current?.cue(0);
   useHotkeys({ m: cue }, phase === "recording");
 
-  async function openMicrophone(nextDevice = deviceId) {
+  const openMicrophone = useCallback(async (nextDevice = "") => {
+    const request = ++micRequest.current;
     setError(null);
+    setMicState("requesting");
+    setStream(null);
+    microphone.current?.getTracks().forEach((track) => track.stop());
+    microphone.current = null;
     try {
-      stream?.getTracks().forEach((track) => track.stop());
       const next = await deps.getUserMedia(microphoneConstraints(nextDevice || null));
+      if (request !== micRequest.current) { next.getTracks().forEach((track) => track.stop()); return; }
+      microphone.current = next;
       setStream(next);
       setMicState("granted");
-      setMicrophones(await deps.listMicrophones());
       const active = next.getAudioTracks()[0]?.getSettings().deviceId;
       if (active) setDeviceId(active);
+      // Enumeration failure shouldn't disable a microphone that opened successfully.
+      const devices = await deps.listMicrophones().catch(() => []);
+      if (request === micRequest.current) setMicrophones(devices);
     } catch (reason) {
+      if (request !== micRequest.current) return;
       const name = reason instanceof DOMException ? reason.name : "";
       setMicState(name === "NotAllowedError" || name === "SecurityError" ? "denied" : "idle");
       setError(name === "NotAllowedError"
@@ -84,16 +96,21 @@ export function RecordPage() {
         : name === "NotFoundError" ? "No microphone found. Connect one and try again."
         : "The microphone couldn’t be opened. Check that no other app is using it.");
     }
-  }
+  }, [deps]);
+
+  useEffect(() => {
+    if (target.data?.readiness.ready) void openMicrophone();
+  }, [openMicrophone, target.data?.readiness.ready]);
 
   async function start() {
-    if (!stream || !target.data || !consent) return;
+    if (!stream || !target.data || phase !== "setup") return;
+    setLiveError(false);
     setPhase("starting");
     setError(null);
     try {
       const started = await deps.startRecording({
         client, outbox: deps.outbox, projectId, target: target.data, stream,
-        additionalSpeakersDisclosed: secondSpeaker,
+        additionalSpeakersDisclosed: false,
         onStatus: setStatus,
         onEnded: (reason: RecordingEndReason) => {
           if (reason === "deviceLost") setError("The microphone disconnected. Recording stopped; everything captured so far is kept.");
@@ -139,13 +156,9 @@ export function RecordPage() {
         <PageHeader
           back={live ? undefined : { to: paths.target(projectId, targetId), label: targetTitle(detail) }}
           title={playMode ? "Play + record review" : "Record review"}
-          subtitle={playMode ? "Play the video here while you record your review." : detail.youtube.videoId ? <>Play <a href={`https://www.youtube.com/watch?v=${encodeURIComponent(detail.youtube.videoId)}`} target="_blank" rel="noreferrer noopener">youtu.be/{detail.youtube.videoId}</a> on the TV.</> : "Play this cut on the TV."}
+          subtitle={playMode ? targetTitle(detail) : detail.youtube.videoId ? <>Play <a href={`https://www.youtube.com/watch?v=${encodeURIComponent(detail.youtube.videoId)}`} target="_blank" rel="noreferrer noopener">youtu.be/{detail.youtube.videoId}</a> on the TV.</> : "Play this cut on the TV."}
         />
 
-        {playMode && detail.youtube.videoId ? <>
-          <YouTubePlayer videoId={detail.youtube.videoId} recording={phase === "recording"} onObservation={(position, state, rate, time) => recording.current?.observePlayback(position, state, rate, time)} />
-          <p className={styles.muted}>Start recording, then press play in the video. Transcript lines match the video position when you spoke. Video times are estimates; a thumbnail represents the matching shot.</p>
-        </> : playMode ? <Notice tone="warning">This review has no YouTube video. Return to the cut and use Record review.</Notice> : null}
         <PendingRecoveries projectId={projectId} exclude={activeSessionId} />
         {blocked ? <Notice tone="critical" title="Recording is blocked.">{detail.readiness.blockers.map(describeCode).join(" ")}</Notice> : null}
         {error ? <Notice tone="critical">{error}</Notice> : null}
@@ -177,45 +190,26 @@ export function RecordPage() {
           <Notice tone="warning" title="Recording stopped, upload unfinished.">Some audio is still in this browser. Use <strong>Finish upload</strong> above when the server is reachable.</Notice>
         ) : (
           <section className={styles.recorder} aria-label="Recorder setup">
-            <ol className={styles.steps}>
-              <li>
-                <h2>Microphone</h2>
-                {micState !== "granted" ? (
-                  <>
-                    <p className={styles.muted}>The browser will ask for access. Nothing is recorded until you press Record.</p>
-                    <Button onClick={() => void openMicrophone()}>{micState === "denied" ? "Try again" : "Allow microphone"}</Button>
-                  </>
-                ) : (
-                  <Field label="Input" hint="Pick the one closest to where you’re talking.">
-                    {(id) => (
-                      <select id={id} value={deviceId} onChange={(event) => { setDeviceId(event.target.value); void openMicrophone(event.target.value); }}>
-                        {microphones.map((mic, index) => <option key={mic.deviceId || index} value={mic.deviceId}>{mic.label || `Microphone ${index + 1}`}</option>)}
-                      </select>
-                    )}
-                  </Field>
-                )}
-              </li>
-              <li>
-                <h2>Consent</h2>
-                <Checkbox checked={consent} onChange={setConsent}>Everyone here knows this conversation is being recorded.</Checkbox>
-                <Checkbox checked={secondSpeaker} onChange={setSecondSpeaker}>Someone else will talk too, and has agreed.</Checkbox>
-              </li>
-              <li>
-                <h2>Record</h2>
-                <Checkbox checked={liveEnabled} onChange={setLiveEnabled}>Show live transcription and refine it automatically after recording.</Checkbox>
-                <p className={styles.muted}>{playMode ? "Start recording, then use the player controls above. Talk normally while it plays." : "Start the video on the TV yourself; this page doesn’t control it. Talk normally while it plays."}</p>
-                <Button size="lg" variant="primary" icon="mic" busy={phase === "starting"} disabled={!stream || !consent || blocked || (playMode && !detail.youtube.videoId)} onClick={() => void start()}>Record</Button>
-              </li>
-            </ol>
+            <div className={styles.recordToolbar}>
+              <Button size="lg" variant="primary" icon="mic" busy={phase === "starting"} disabled={!stream || blocked || (playMode && !detail.youtube.videoId)} onClick={() => void start()}>Record</Button>
+              {micState === "granted" ? (
+                <Field label="Microphone">
+                  {(id) => <select id={id} value={deviceId} onChange={(event) => { setDeviceId(event.target.value); void openMicrophone(event.target.value); }}>
+                    {microphones.length ? microphones.map((mic, index) => <option key={mic.deviceId || index} value={mic.deviceId}>{mic.label || `Microphone ${index + 1}`}</option>) : <option value={deviceId}>Default microphone</option>}
+                  </select>}
+                </Field>
+              ) : <Button busy={micState === "requesting"} onClick={() => void openMicrophone(deviceId)}>{micState === "denied" ? "Try again" : "Allow microphone"}</Button>}
+            </div>
+            <Checkbox checked={liveEnabled} onChange={setLiveEnabled}>Live transcription</Checkbox>
           </section>
         )}
 
-        <p className={styles.hintSmall}>
-          Audio stays on this server, isn’t included in backups, and is kept until you delete it. Echo cancellation, noise suppression and auto-gain are off so the room sound is preserved.
-        </p>
+        {playMode && detail.youtube.videoId ? <>
+          <YouTubePlayer videoId={detail.youtube.videoId} recording={phase === "recording"} onObservation={(position, state, rate, time) => recording.current?.observePlayback(position, state, rate, time)} />
+        </> : playMode ? <Notice tone="warning">This review has no YouTube video. Return to the cut and use Record review.</Notice> : null}
       </div>
-      {activeSessionId && liveEnabled ? <aside className={styles.recordTranscript} aria-label="Recording transcript">
-        {liveError ? <Notice tone="warning">Live transcription couldn’t start. Recording continues. <Button onClick={() => {
+      {liveEnabled ? <aside className={styles.recordTranscript} aria-label="Recording transcript">
+        {!activeSessionId ? <Notice>Live transcript will appear here when you record.</Notice> : liveError ? <Notice tone="warning">Live transcription couldn’t start. Recording continues. <Button onClick={() => {
           void client.enableLiveReviewTranscript(projectId, activeSessionId).then((data) => {
             setLiveError(false); queryClient.setQueryData(keys.liveTranscript(projectId, activeSessionId), data);
           }).catch(() => setLiveError(true));

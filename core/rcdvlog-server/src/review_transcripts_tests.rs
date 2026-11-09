@@ -71,6 +71,8 @@ impl SttEngine for ScriptedEngine {
 struct FakeTransport {
     calls: Arc<AtomicUsize>,
     fail_on_call: Option<usize>,
+    unusable: Option<NativeSttProtocolError>,
+    unknown_cost: bool,
 }
 
 impl NativeSttTransport for FakeTransport {
@@ -92,27 +94,36 @@ impl NativeSttTransport for FakeTransport {
                 actual_model: Some("openai/whisper-1".into()),
                 actual_provider: Some("OpenAI".into()),
                 usage: NativeSttUsage {
-                    cost: NativeSttCost::Known(0.001),
+                    cost: if self.unknown_cost {
+                        NativeSttCost::Unknown
+                    } else {
+                        NativeSttCost::Known(0.001)
+                    },
                     seconds: None,
                     input_tokens: None,
                     output_tokens: None,
                 },
             },
             latency_ms: 5,
-            outcome: NativeSttOutcome::Usable(NativeSttTranscript {
-                text: "這裡太長".into(),
-                language: "zh".into(),
-                confidence: None,
-                duration_ms: audio.duration_ms(),
-                segments: vec![NativeSttSegment {
-                    start_ms: 0,
-                    end_ms: audio.duration_ms(),
-                    text: "這裡太長".into(),
-                    confidence: None,
-                    avg_logprob: None,
-                    words: vec![],
-                }],
-            }),
+            outcome: self
+                .unusable
+                .map(NativeSttOutcome::Unusable)
+                .unwrap_or_else(|| {
+                    NativeSttOutcome::Usable(NativeSttTranscript {
+                        text: "這裡太長".into(),
+                        language: "zh".into(),
+                        confidence: None,
+                        duration_ms: audio.duration_ms(),
+                        segments: vec![NativeSttSegment {
+                            start_ms: 0,
+                            end_ms: audio.duration_ms(),
+                            text: "這裡太長".into(),
+                            confidence: None,
+                            avg_logprob: None,
+                            words: vec![],
+                        }],
+                    })
+                }),
         })
     }
 }
@@ -122,6 +133,8 @@ pub(crate) struct FakeRuntime {
     credentials: bool,
     calls: Arc<AtomicUsize>,
     fail_on_call: Option<usize>,
+    unusable: Option<NativeSttProtocolError>,
+    unknown_cost: bool,
 }
 
 impl FakeRuntime {
@@ -131,6 +144,8 @@ impl FakeRuntime {
             credentials: true,
             calls: Arc::new(AtomicUsize::new(0)),
             fail_on_call: None,
+            unusable: None,
+            unknown_cost: false,
         }
     }
 }
@@ -167,6 +182,8 @@ impl ReviewSpeechRuntime for FakeRuntime {
         Ok(Box::new(FakeTransport {
             calls: self.calls.clone(),
             fail_on_call: self.fail_on_call,
+            unusable: self.unusable,
+            unknown_cost: self.unknown_cost,
         }))
     }
 }
@@ -688,4 +705,54 @@ fn traditional_display_is_a_projection_that_never_rewrites_raw_text() {
     assert_eq!(display, "這個鏡頭");
     assert_eq!(projection.as_deref(), Some("openccS2tw"));
     assert_eq!(script_and_display("cut 这里").0, "mixed");
+}
+
+#[test]
+fn unusable_cloud_output_keeps_its_reason_receipt_and_never_resends() {
+    for unknown_cost in [false, true] {
+        let f = fixture(false, true);
+        let mut runtime = FakeRuntime::new();
+        runtime.unusable = Some(NativeSttProtocolError::InvalidTimestamp);
+        runtime.unknown_cost = unknown_cost;
+        let first = run(&f, &cloud(1.0), &runtime);
+        assert_eq!(first.state, ReviewTranscriptionState::Failed);
+        assert_eq!(
+            first.segments[0].error_code.as_deref(),
+            Some("review_transcription_provider_invalid_timestamp")
+        );
+        assert!(first.utterances.is_empty());
+        assert_eq!(
+            first.spend.known_cost_usd,
+            if unknown_cost { 0.0 } else { 0.001 }
+        );
+        assert_eq!(first.spend.unknown_cost_windows, u32::from(unknown_cost));
+        assert_eq!(
+            first.spend.reserved_usd,
+            if unknown_cost { 0.003 } else { 0.0 }
+        );
+        let connection = open_read_only_connection(f.catalog.database_path()).unwrap();
+        let (generation, diagnostic): (String, String) = connection.query_row(
+            "SELECT generation_id, result_json FROM review_transcription_windows WHERE run_id=?1",
+            [&first.run_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(generation, "gen-1");
+        assert_eq!(diagnostic, r#"{"unusable":"invalid_timestamp"}"#);
+        let transcripts = f.catalog.review_transcripts();
+        let retried = transcripts
+            .start(
+                PROJECT,
+                &f.session_id,
+                &cloud(1.0),
+                &runtime,
+                &f.catalog.jobs(),
+                &actor(),
+            )
+            .unwrap();
+        transcripts
+            .execute(&retried.run_id, &runtime, &|| false)
+            .unwrap();
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        let after = transcripts.get(PROJECT, &first.run_id).unwrap();
+        assert_eq!(after.segments[0].error_code, first.segments[0].error_code);
+        assert_eq!(after.spend.reserved_usd, first.spend.reserved_usd);
+    }
 }
