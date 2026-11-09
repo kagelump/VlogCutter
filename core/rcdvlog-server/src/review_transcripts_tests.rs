@@ -81,17 +81,28 @@ impl NativeSttTransport for FakeTransport {
     }
     fn transcribe(
         &self,
-        _request: &NativeSttRequest,
+        request: &NativeSttRequest,
         audio: &NativeSttAudioWindow,
     ) -> anyhow::Result<NativeSttCallResult> {
+        assert!(
+            !request
+                .provider_policy()
+                .zero_data_retention
+                .unwrap_or(true)
+        );
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if self.fail_on_call == Some(call) {
             anyhow::bail!("connection reset after send");
         }
         Ok(NativeSttCallResult {
+            provider_error: self.unusable.map(|_| NativeSttProviderError {
+                http_status: 400,
+                code: Some("unsupported_parameter".into()),
+                message: "The selected provider rejected timestamp_granularities".into(),
+            }),
             receipt: NativeSttReceipt {
                 generation_id: Some(format!("gen-{call}")),
-                actual_model: Some("openai/whisper-1".into()),
+                actual_model: Some(request.model().into()),
                 actual_provider: Some("OpenAI".into()),
                 usage: NativeSttUsage {
                     cost: if self.unknown_cost {
@@ -174,6 +185,18 @@ impl ReviewSpeechRuntime for FakeRuntime {
     }
     fn detect_speech(&self, pcm: &[f32]) -> anyhow::Result<Vec<SpeechRegion>> {
         Ok(energy_regions(pcm))
+    }
+    fn cloud_models(&self) -> anyhow::Result<Vec<NativeSttModelChoice>> {
+        Ok(vec![
+            NativeSttModelChoice {
+                id: "openai/whisper-1".into(),
+                name: "Whisper".into(),
+            },
+            NativeSttModelChoice {
+                id: "google/gemini-3.5-transcribe".into(),
+                name: "Gemini".into(),
+            },
+        ])
     }
     fn cloud_credentials_present(&self) -> bool {
         self.credentials
@@ -428,7 +451,7 @@ fn gaps_are_never_transcribed_and_adjacent_speech_is_flagged() {
 }
 
 #[test]
-fn unavailable_models_unfinalized_sessions_and_unauthorized_cloud_are_blocked() {
+fn unavailable_models_unfinalized_sessions_and_missing_credentials_are_blocked() {
     let f = fixture(false, false);
     let mut runtime = FakeRuntime::new();
     let transcripts = f.catalog.review_transcripts();
@@ -464,12 +487,9 @@ fn unavailable_models_unfinalized_sessions_and_unauthorized_cloud_are_blocked() 
         .unwrap();
     assert_eq!(
         preflight.blockers,
-        vec![
-            "review_transcription_cloud_not_authorized",
-            "review_transcription_budget_required",
-            "review_transcription_provider_unavailable"
-        ]
+        vec!["review_transcription_provider_unavailable"]
     );
+    runtime.credentials = true;
     let mut unregistered = cloud(1.0);
     unregistered.model = Some("openai/gpt-4o".into());
     assert!(matches!(
@@ -494,60 +514,63 @@ fn unavailable_models_unfinalized_sessions_and_unauthorized_cloud_are_blocked() 
 }
 
 #[test]
-fn cloud_runs_enforce_the_authorized_ceiling_and_never_rebill_cached_windows() {
+fn cloud_transcription_has_no_spending_or_checkbox_gate_and_reports_actual_cost() {
     let f = fixture(false, true);
     let runtime = FakeRuntime::new();
-    let preflight = f
+    let mut request = cloud(0.000001);
+    request.authorized_max_cost_usd = None;
+    request.cloud_upload_acknowledged = false;
+    request.zero_data_retention = true; // Legacy input is ignored; default retention is used.
+    request.model = Some("google/gemini-3.5-transcribe".into());
+    let report = f
         .catalog
         .review_transcripts()
-        .preflight(PROJECT, &f.session_id, &cloud(0.004), &runtime)
+        .preflight(PROJECT, &f.session_id, &request, &runtime)
         .unwrap();
-    assert!(preflight.ready);
-    assert!(!preflight.warnings.contains(&"budget_below_worst_case"));
-    assert_eq!(
-        preflight.estimate.as_ref().unwrap().max_cost_usd,
-        Some(0.003)
-    );
-
-    // One 30 s window reserves $0.003; a $0.004 ceiling admits exactly one.
-    // All three speech regions pack into one window here, so it completes.
-    let result = run(&f, &cloud(0.004), &runtime);
-    assert_eq!(
-        result.state,
-        ReviewTranscriptionState::Completed,
-        "{:?}",
-        result.error_code
-    );
+    assert!(report.ready);
+    assert_eq!(report.estimate.unwrap().max_cost_usd, None);
+    let transcripts = f.catalog.review_transcripts();
+    let active = transcripts
+        .start(
+            PROJECT,
+            &f.session_id,
+            &request,
+            &runtime,
+            &f.catalog.jobs(),
+            &actor(),
+        )
+        .unwrap();
+    let duplicate = transcripts
+        .start(
+            PROJECT,
+            &f.session_id,
+            &request,
+            &runtime,
+            &f.catalog.jobs(),
+            &actor(),
+        )
+        .unwrap();
+    assert_eq!(active.run_id, duplicate.run_id);
+    let result = run(&f, &request, &runtime);
+    assert_eq!(result.state, ReviewTranscriptionState::Completed);
     assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.model, "google/gemini-3.5-transcribe");
     assert_eq!(result.spend.known_cost_usd, 0.001);
+    assert_eq!(result.spend.authorized_max_usd, None);
+    assert_eq!(result.spend.reserved_usd, 0.0);
+    assert_eq!(result.spend.dispatched_windows, 1);
     assert_eq!(result.utterances[0].language, "zh");
-    assert!(
-        result.utterances[0]
-            .flags
-            .contains(&"probabilityEvidenceUnavailable".to_string())
-    );
-    assert_eq!(result.utterances[0].script, "hanTraditional");
-
-    // A ceiling below one window never dispatches.
+    // Even a legacy low ceiling cannot prevent an explicitly requested run.
     let g = fixture(false, true);
     let runtime = FakeRuntime::new();
-    let low = g
-        .catalog
-        .review_transcripts()
-        .preflight(PROJECT, &g.session_id, &cloud(0.002), &runtime)
-        .unwrap();
-    assert!(low.warnings.contains(&"budget_below_worst_case"));
-    let blocked = run(&g, &cloud(0.002), &runtime);
-    assert_eq!(blocked.state, ReviewTranscriptionState::Partial);
     assert_eq!(
-        blocked.error_code.as_deref(),
-        Some("review_transcription_budget_exhausted")
+        run(&g, &cloud(0.000001), &runtime).state,
+        ReviewTranscriptionState::Completed
     );
-    assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn a_lost_cloud_response_is_unknown_spend_and_is_never_resent() {
+fn explicit_retry_of_a_lost_cloud_response_creates_a_fresh_attempt() {
     let f = fixture(false, true);
     let mut runtime = FakeRuntime::new();
     runtime.fail_on_call = Some(1);
@@ -558,10 +581,10 @@ fn a_lost_cloud_response_is_unknown_spend_and_is_never_resent() {
         Some("review_transcription_dispatch_outcome_unknown")
     );
     assert_eq!(first.spend.unknown_cost_windows, 1);
-    assert_eq!(first.spend.reserved_usd, 0.003);
+    assert_eq!(first.spend.reserved_usd, 0.0);
     assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
 
-    // Retrying the identical request re-queues the same run but does not resend.
+    // Worker recovery stays idempotent; an explicit button click creates a new run.
     let transcripts = f.catalog.review_transcripts();
     let retried = transcripts
         .start(
@@ -573,12 +596,12 @@ fn a_lost_cloud_response_is_unknown_spend_and_is_never_resent() {
             &actor(),
         )
         .unwrap();
-    assert_eq!(retried.run_id, first.run_id);
-    assert_eq!(retried.attempt_count, 2);
+    assert_ne!(retried.run_id, first.run_id);
+    assert_eq!(retried.attempt_count, 1);
     transcripts
         .execute(&retried.run_id, &runtime, &|| false)
         .unwrap();
-    assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         transcripts.get(PROJECT, &first.run_id).unwrap().state,
         ReviewTranscriptionState::Failed
@@ -708,7 +731,7 @@ fn traditional_display_is_a_projection_that_never_rewrites_raw_text() {
 }
 
 #[test]
-fn unusable_cloud_output_keeps_its_reason_receipt_and_never_resends() {
+fn unusable_cloud_output_keeps_reason_receipt_and_allows_explicit_retry() {
     for unknown_cost in [false, true] {
         let f = fixture(false, true);
         let mut runtime = FakeRuntime::new();
@@ -726,16 +749,19 @@ fn unusable_cloud_output_keeps_its_reason_receipt_and_never_resends() {
             if unknown_cost { 0.0 } else { 0.001 }
         );
         assert_eq!(first.spend.unknown_cost_windows, u32::from(unknown_cost));
-        assert_eq!(
-            first.spend.reserved_usd,
-            if unknown_cost { 0.003 } else { 0.0 }
-        );
+        assert_eq!(first.spend.reserved_usd, 0.0);
         let connection = open_read_only_connection(f.catalog.database_path()).unwrap();
         let (generation, diagnostic): (String, String) = connection.query_row(
             "SELECT generation_id, result_json FROM review_transcription_windows WHERE run_id=?1",
             [&first.run_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!(generation, "gen-1");
-        assert_eq!(diagnostic, r#"{"unusable":"invalid_timestamp"}"#);
+        let diagnostic: serde_json::Value = serde_json::from_str(&diagnostic).unwrap();
+        assert_eq!(diagnostic["unusable"], "invalid_timestamp");
+        assert_eq!(
+            first.provider_errors[0].message,
+            "The selected provider rejected timestamp_granularities"
+        );
+        assert_eq!(first.provider_errors[0].http_status, Some(400));
         let transcripts = f.catalog.review_transcripts();
         let retried = transcripts
             .start(
@@ -750,7 +776,7 @@ fn unusable_cloud_output_keeps_its_reason_receipt_and_never_resends() {
         transcripts
             .execute(&retried.run_id, &runtime, &|| false)
             .unwrap();
-        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
         let after = transcripts.get(PROJECT, &first.run_id).unwrap();
         assert_eq!(after.segments[0].error_code, first.segments[0].error_code);
         assert_eq!(after.spend.reserved_usd, first.spend.reserved_usd);

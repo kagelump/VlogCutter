@@ -134,6 +134,7 @@ impl OpenRouterSttClient {
                     generation_id: generation_id.as_deref().and_then(bounded_generation_id),
                     ..NativeSttReceipt::default()
                 },
+                provider_error: None,
                 latency_ms: elapsed_ms(started),
                 outcome: NativeSttOutcome::Unusable(NativeSttProtocolError::BodyReadFailed),
             });
@@ -144,6 +145,7 @@ impl OpenRouterSttClient {
                     generation_id: generation_id.as_deref().and_then(bounded_generation_id),
                     ..NativeSttReceipt::default()
                 },
+                provider_error: None,
                 latency_ms: elapsed_ms(started),
                 outcome: NativeSttOutcome::Unusable(NativeSttProtocolError::ResponseTooLarge),
             });
@@ -155,8 +157,39 @@ impl OpenRouterSttClient {
             elapsed_ms(started),
         );
         if !status.is_success() {
+            result.provider_error =
+                parse_provider_error(&body_bytes, status.as_u16(), &self.api_key);
             result.outcome =
                 NativeSttOutcome::Unusable(NativeSttProtocolError::HttpStatus(status.as_u16()));
+        } else if let NativeSttOutcome::Unusable(reason) = result.outcome {
+            let value: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+            let provider_duration = value
+                .get("duration")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite())
+                .map(|v| format!("{v:.3}s"))
+                .unwrap_or_else(|| "missing".into());
+            let latest_end = value
+                .get("segments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|segment| segment.get("end").and_then(Value::as_f64))
+                .filter(|v| v.is_finite())
+                .reduce(f64::max)
+                .map(|v| format!("{v:.3}s"))
+                .unwrap_or_else(|| "missing".into());
+            result.provider_error = Some(NativeSttProviderError {
+                http_status: status.as_u16(),
+                code: Some(reason.code().into()),
+                message: format!(
+                    "Response validation failed ({}). Audio sent: {:.3}s; provider duration: {}; latest segment end: {}.",
+                    reason.code(),
+                    audio.duration_ms() as f64 / 1000.0,
+                    provider_duration,
+                    latest_end
+                ),
+            });
         }
         Ok(result)
     }
@@ -181,4 +214,53 @@ impl NativeSttTransport for OpenRouterSttClient {
     ) -> Result<NativeSttCallResult> {
         OpenRouterSttClient::transcribe(self, request, audio)
     }
+}
+
+fn parse_provider_error(body: &[u8], status: u16, api_key: &str) -> Option<NativeSttProviderError> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    let mut message = error.get("message").and_then(Value::as_str)?.to_owned();
+    // OpenRouter sometimes wraps the upstream message in metadata.raw JSON.
+    if let Some(raw) = error.pointer("/metadata/raw").and_then(Value::as_str)
+        && let Ok(raw) = serde_json::from_str::<Value>(raw)
+        && let Some(detail) = raw
+            .pointer("/error/message")
+            .or_else(|| raw.get("message"))
+            .and_then(Value::as_str)
+    {
+        message.push_str(": ");
+        message.push_str(detail);
+    }
+    if !api_key.is_empty() {
+        message = message.replace(api_key, "[redacted]");
+    }
+    let message = redact_error_tokens(&message);
+    let code = error.get("code").and_then(|code| match code {
+        Value::String(code) => Some(redact_error_tokens(code).chars().take(128).collect()),
+        Value::Number(code) => Some(code.to_string()),
+        _ => None,
+    });
+    Some(NativeSttProviderError {
+        http_status: status,
+        code,
+        message,
+    })
+}
+
+fn redact_error_tokens(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|word| {
+            if word.to_ascii_lowercase().starts_with("sk-") || word.len() > 256 {
+                "[redacted]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(2048)
+        .collect()
 }

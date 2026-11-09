@@ -7058,7 +7058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_transcription_routes_refuse_unauthorized_cloud_dispatch() {
+    async fn review_transcription_routes_preserve_authentication_without_billing_or_upload_gates() {
         let fixture = Fixture::new(false);
         let source = TempDir::new().unwrap();
         let envelope = baseline_envelope(&source);
@@ -7213,13 +7213,14 @@ mod tests {
         let preflight = json(preflight).await;
         assert_eq!(preflight["ready"], false);
         assert!(
-            preflight["blockers"]
+            !preflight["blockers"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|b| b == "review_transcription_cloud_not_authorized")
+                .any(|b| b == "review_transcription_cloud_not_authorized"
+                    || b == "review_transcription_budget_required")
         );
-        assert_eq!(preflight["estimate"]["maxCostUsd"], 0.003);
+        assert_eq!(preflight["estimate"]["maxCostUsd"], serde_json::Value::Null);
         let refused = fixture
             .app()
             .oneshot(post(base.clone(), unacknowledged, Some(&csrf)))
@@ -7227,7 +7228,7 @@ mod tests {
             .unwrap();
         assert_eq!(refused.status(), StatusCode::CONFLICT);
         let fallback = fixture.app().oneshot(post(base.clone(), serde_json::json!({"backend": "openrouter", "model": "google/gemini-2.5-flash", "authorizedMaxCostUsd": 0.5, "cloudUploadAcknowledged": true}), Some(&csrf))).await.unwrap();
-        assert_eq!(fallback.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(fallback.status(), StatusCode::CONFLICT);
         let listed = fixture
             .app()
             .oneshot(

@@ -439,3 +439,37 @@ test("recording renders live words beside the controls as soon as the server res
   expect(await screen.findByText("Live provisional words")).toBeVisible();
   expect(screen.getByRole("img", { name: "Shot 1 thumbnail" })).toBeVisible();
 });
+
+
+test("OpenRouter uses the chosen live model without spending or confirmation inputs", async () => {
+  const preflight = { ready: true, blockers: [], warnings: [], backend: "openrouter" as const, provider: "openrouter", model: "google/gemini-3.5-transcribe", audioFingerprint: "f", estimate: { receivedAudioSeconds: 4, segmentCount: 1, maxWindows: 1, priceUsdPerSecond: null, maxCostUsd: null, billingNote: null }, existingRunId: null };
+  const { client } = renderApp("/projects/p1/reviews/rtarget_one/sessions/rsession_1", {
+    ...targetsClient, getReviewSession: vi.fn().mockResolvedValue({ ...session, state: "completed" }),
+    preflightReviewTranscription: vi.fn().mockResolvedValue(preflight),
+    startReviewTranscription: vi.fn().mockResolvedValue(run({ backend: "openrouter", provider: "openrouter", state: "queued", utterances: [] })),
+  });
+  await userEvent.click(await screen.findByRole("button", { name: "OpenRouter (cloud)" }));
+  const choice = await screen.findByLabelText("OpenRouter model");
+  await waitFor(() => expect(within(choice).getAllByRole("option")).toHaveLength(2));
+  await userEvent.selectOptions(choice, "google/gemini-3.5-transcribe");
+  expect(screen.queryByLabelText(/Spending limit/)).toBeNull();
+  expect(screen.queryByLabelText(/Send this recording|Require zero data/)).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Check" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Transcribe" }));
+  expect(client.startReviewTranscription).toHaveBeenCalledWith("p1", "rsession_1", { backend: "openrouter", model: "google/gemini-3.5-transcribe" });
+});
+
+test("provider errors show HTTP status, upstream message and request ID with informational cost", async () => {
+  renderApp("/projects/p1/reviews/rtarget_one/sessions/rsession_1", {
+    ...targetsClient, getReviewSession: vi.fn().mockResolvedValue({ ...session, state: "completed" }),
+    listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [run({ backend: "openrouter", provider: "openrouter", state: "failed", utterances: [], errorCode: "review_transcription_failed",
+      providerErrors: [{ segmentIndex: 0, windowIndex: 0, protocolCode: "http_status", httpStatus: 400, code: "unsupported_parameter", message: "timestamp_granularities is unsupported", generationId: "gen-upstream" }],
+      spend: { authorizedMaxUsd: 0.5, reservedUsd: 0.003, knownCostUsd: 0.001, unknownCostWindows: 0, dispatchedWindows: 1, cachedWindows: 0 },
+    })] }),
+  });
+  expect(await screen.findByText("OpenRouter · HTTP 400 · unsupported_parameter")).toBeVisible();
+  expect(screen.getByText("timestamp_granularities is unsupported")).toBeVisible();
+  expect(screen.getByText(/gen-upstream/)).toBeVisible();
+  expect(screen.getByText(/Cost \$0.0010. Reported by OpenRouter./)).toBeVisible();
+  expect(screen.queryByText(/\$0.50 limit/)).toBeNull();
+});

@@ -2,9 +2,9 @@
 //!
 //! This is a protocol/client leaf, not a production backend selection. It does
 //! not read catalogs, claim media, authorize spending, retry, fall back, or
-//! persist transcripts. A future accounting slice must stage every request
-//! through the shared reservation/dispatch/receipt machinery before this client
-//! is called.
+//! persist transcripts. Analysis stages registered-model requests through its
+//! accounting machinery. Review transcription can use a discovered native model
+//! and reports provider costs after execution.
 //!
 //! The wire contract here is deliberately not the chat-completions contract:
 //! `POST /api/v1/audio/transcriptions` with raw base64 WAV in `input_audio`,
@@ -43,12 +43,14 @@ const NATIVE_STT_BILLING_SEMANTICS: &str =
 
 mod client;
 mod decode;
+mod discovery;
 #[cfg(test)]
 mod native_packing_tests;
 #[cfg(test)]
 mod tests;
 pub use client::{NativeSttClientError, OpenRouterSttClient};
 pub use decode::*;
+pub use discovery::{NativeSttModelChoice, discover_native_stt_models};
 
 /// Narrow transport seam for one native-audio transmission.
 ///
@@ -324,6 +326,7 @@ pub struct NativeSttRequest {
     language: Option<String>,
     temperature: f64,
     provider_policy: NativeSttProviderPolicy,
+    discovered: bool,
 }
 
 impl NativeSttRequest {
@@ -340,13 +343,45 @@ impl NativeSttRequest {
             language,
             temperature,
             provider_policy,
+            discovered: false,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// For review transcription after the caller has checked OpenRouter's live
+    /// native-transcription catalog. This does not extend the analysis pricing registry.
+    pub fn for_discovered_model(model: String, language: Option<String>) -> Result<Self> {
+        ensure!(
+            model.len() <= 200
+                && model.split('/').count() == 2
+                && model.split('/').all(|part| !part.is_empty())
+                && model
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric()
+                        || matches!(c, b'/' | b'-' | b'_' | b'.' | b':')),
+            "invalid native transcription model ID"
+        );
+        let request = Self {
+            provider: OPENROUTER_STT_PROVIDER.into(),
+            model,
+            language,
+            temperature: 0.0,
+            provider_policy: NativeSttProviderPolicy::new(false, SttDataCollection::Deny),
+            discovered: true,
         };
         request.validate()?;
         Ok(request)
     }
 
     fn validate(&self) -> Result<&'static NativeSttModelSpec> {
-        let spec = resolve_native_stt_model(&self.provider, &self.model)?;
+        let spec = if self.discovered {
+            // The common bounded 16 kHz WAV/30 s wire contract; pricing remains
+            // unavailable through native_stt_request_cost_bound for discovered models.
+            &NATIVE_STT_MODELS[0]
+        } else {
+            resolve_native_stt_model(&self.provider, &self.model)?
+        };
         ensure!(
             spec.supported_input_formats.contains(&"wav"),
             "selected native STT model does not support WAV input"
@@ -490,6 +525,10 @@ pub fn native_stt_request_cost_bound(
     request: &NativeSttRequest,
     audio: &NativeSttAudioWindow,
 ) -> Result<AnalysisRequestCostBound> {
+    ensure!(
+        !request.discovered,
+        "discovered review models have no analysis cost-bound contract"
+    );
     let spec = request.validate()?;
     audio.validate_for(spec)?;
     let billable_seconds_max = spec.max_window_ms.div_ceil(1_000);

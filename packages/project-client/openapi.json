@@ -1668,6 +1668,32 @@
         ],
         "type": "object"
       },
+      "ReviewTranscriptionModels": {
+        "properties": {
+          "items": {
+            "items": {
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "name"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
       "ReviewTranscriptionPreflight": {
         "additionalProperties": true,
         "type": "object"
@@ -1676,8 +1702,7 @@
         "additionalProperties": false,
         "properties": {
           "authorizedMaxCostUsd": {
-            "exclusiveMinimum": 0,
-            "maximum": 100,
+            "deprecated": true,
             "type": [
               "number",
               "null"
@@ -1691,6 +1716,7 @@
             "type": "string"
           },
           "cloudUploadAcknowledged": {
+            "deprecated": true,
             "type": "boolean"
           },
           "languageHint": {
@@ -1707,6 +1733,7 @@
             ]
           },
           "zeroDataRetention": {
+            "deprecated": true,
             "type": "boolean"
           }
         },
@@ -3995,7 +4022,7 @@
         }
       },
       "post": {
-        "description": "Create or reuse (by audio/provider/settings fingerprint) a durable transcription run. Cloud runs require explicit upload acknowledgement and a hard USD ceiling; no fallback.",
+        "description": "Start a transcription run. Explicit cloud retries create fresh attempts; concurrent submissions reuse active work. Cloud runs require explicit upload acknowledgement and a hard USD ceiling; no fallback.",
         "operationId": "startReviewTranscription",
         "parameters": [
           {
@@ -4050,7 +4077,7 @@
     },
     "/api/v1/projects/{projectId}/review-sessions/{sessionId}/transcriptions/preflight": {
       "post": {
-        "description": "Readiness and worst-case cost; never sends audio or loads a model.",
+        "description": "Check recording, model and credential readiness; never sends audio or loads a speech model.",
         "operationId": "preflightReviewTranscription",
         "parameters": [
           {
@@ -4556,6 +4583,37 @@
             "$ref": "#/components/responses/Error"
           },
           "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-transcription-models": {
+      "get": {
+        "description": "List eligible native transcription models from OpenRouter's current public catalog.",
+        "operationId": "listReviewTranscriptionModels",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTranscriptionModels"
+                }
+              }
+            },
+            "description": "ReviewTranscriptionModels"
+          },
+          "502": {
             "$ref": "#/components/responses/Error"
           }
         }

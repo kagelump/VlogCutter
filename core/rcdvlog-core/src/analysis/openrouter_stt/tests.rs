@@ -782,3 +782,64 @@ fn provider_language_and_full_confidence_are_validated_without_invention() {
         NativeSttProtocolError::InvalidQualityEvidence
     );
 }
+
+#[test]
+fn discovered_transcription_models_share_wire_bounds_but_not_analysis_billing_contracts() {
+    let request =
+        NativeSttRequest::for_discovered_model("google/gemini-3.5-transcribe".into(), None)
+            .unwrap();
+    let audio = audio_window();
+    let body = build_native_stt_request_body(&request, &audio).unwrap();
+    assert_eq!(body["model"], "google/gemini-3.5-transcribe");
+    assert_eq!(body["provider"]["zdr"], false);
+    assert_eq!(body["provider"]["data_collection"], "deny");
+    assert!(native_stt_request_cost_bound(&request, &audio).is_err());
+}
+
+#[test]
+fn structured_provider_errors_retain_status_and_message_with_credentials_redacted() {
+    let body = json!({"error":{"message":"Provider returned error test-secret", "code":400,
+        "metadata":{"raw":r#"{"error":{"message":"timestamp_granularities is unsupported sk-other-secret"}}"#}}}).to_string();
+    let (endpoint, server) = fake_provider(
+        "400 Bad Request",
+        &body,
+        &[("X-Generation-Id", "gen-error")],
+    );
+    let result = OpenRouterSttClient::new("test-secret")
+        .unwrap()
+        .with_endpoint(endpoint)
+        .transcribe(&request(), &audio_window())
+        .unwrap();
+    server.join().unwrap();
+    let error = result.provider_error.unwrap();
+    assert_eq!(error.http_status, 400);
+    assert_eq!(error.code.as_deref(), Some("400"));
+    assert!(
+        error
+            .message
+            .contains("timestamp_granularities is unsupported")
+    );
+    assert!(!error.message.contains("test-secret"));
+    assert!(!error.message.contains("sk-other-secret"));
+    assert_eq!(result.receipt.generation_id.as_deref(), Some("gen-error"));
+}
+
+#[test]
+fn invalid_timestamps_explain_input_and_provider_durations_without_accepting_the_transcript() {
+    let body = json!({"text":"hello","language":"en","duration":1.0,"segments":[{"start":0.0,"end":2.06,"text":"hello"}],"usage":{"cost":0.0001}}).to_string();
+    let (endpoint, server) = fake_provider("200 OK", &body, &[]);
+    let result = OpenRouterSttClient::new("test-key")
+        .unwrap()
+        .with_endpoint(endpoint)
+        .transcribe(&request(), &audio_window())
+        .unwrap();
+    server.join().unwrap();
+    assert!(matches!(
+        result.outcome,
+        NativeSttOutcome::Unusable(NativeSttProtocolError::InvalidTimestamp)
+    ));
+    let message = result.provider_error.unwrap().message;
+    assert!(message.contains("Audio sent: 1.000s"));
+    assert!(message.contains("latest segment end: 2.060s"));
+    assert_eq!(result.receipt.usage.cost, NativeSttCost::Known(0.0001));
+}

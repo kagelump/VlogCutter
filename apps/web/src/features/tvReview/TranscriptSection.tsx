@@ -90,9 +90,9 @@ export function TranscriptSection({ projectId, sessionId, sessionState, onOpenRe
         </Disclosure>
       ) : null}
       {shown ? (
-        <Disclosure title="Transcribe again"><TranscribeForm projectId={projectId} sessionId={sessionId} busy={Boolean(active)} /></Disclosure>
+        <Disclosure title="Transcribe again"><TranscribeForm projectId={projectId} sessionId={sessionId} busy={Boolean(active)} onStarted={() => setChosenRunId(null)} /></Disclosure>
       ) : runs.isSuccess ? (
-        <Panel title="Transcribe" description="Turn the recording into text so you can review what was said."><TranscribeForm projectId={projectId} sessionId={sessionId} busy={Boolean(active)} /></Panel>
+        <Panel title="Transcribe" description="Turn the recording into text so you can review what was said."><TranscribeForm projectId={projectId} sessionId={sessionId} busy={Boolean(active)} onStarted={() => setChosenRunId(null)} /></Panel>
       ) : null}
     </>
   );
@@ -124,11 +124,15 @@ function RunBody({ run }: { run: ReviewTranscriptionRun }) {
       {failedSegments.map((segment) => (
         <Notice key={segment.segmentIndex} tone="warning">{formatStamp(segment.startSeconds)}–{formatStamp(segment.endSeconds)} wasn’t transcribed: {describeCode(segment.errorCode ?? "review_transcription_failed")}</Notice>
       ))}
-      {spend.dispatchedWindows || spend.authorizedMaxUsd !== null ? (
+      {(run.providerErrors ?? []).map((error) => <Notice key={`${error.segmentIndex}:${error.windowIndex}`} tone="critical"
+        title={`OpenRouter${error.httpStatus ? ` · HTTP ${error.httpStatus}` : ""}${error.code && error.code !== String(error.httpStatus) ? ` · ${error.code}` : ""}`}>
+        {error.message}
+        {error.generationId ? <small className={styles.code}> Request: {error.generationId}</small> : null}
+      </Notice>)}
+      {run.backend === "openrouter" && !["queued", "running"].includes(run.state) && (spend.dispatchedWindows > 0 || spend.unknownCostWindows > 0) ? (
         <p className={styles.muted}>
-          Cost ${spend.knownCostUsd.toFixed(4)}
-          {spend.unknownCostWindows ? ` + ${plural(spend.unknownCostWindows, "request")} of unknown cost (up to $${spend.reservedUsd.toFixed(4)})` : ""}
-          {spend.authorizedMaxUsd !== null ? ` of $${spend.authorizedMaxUsd.toFixed(2)} limit` : ""}
+          {spend.unknownCostWindows && spend.knownCostUsd === 0 ? "Cost unavailable." : `Cost $${spend.knownCostUsd.toFixed(4)}.`}
+          {spend.unknownCostWindows ? ` OpenRouter did not report the cost of ${plural(spend.unknownCostWindows, "request")}.` : " Reported by OpenRouter."}
         </p>
       ) : null}
       {run.state === "noSpeech" ? <p className={styles.muted}>No speech was found, so nothing was sent to a model.</p> : null}
@@ -157,24 +161,25 @@ function RunBody({ run }: { run: ReviewTranscriptionRun }) {
   );
 }
 
-/** Choose where to transcribe, check what it will cost or why it can't run, then start. */
+/** Choose a backend/model, check availability, then start. Costs are informational after execution. */
 export function TranscribeForm({ projectId, sessionId, busy, onStarted }: { projectId: string; sessionId: string; busy: boolean; onStarted?: () => void }) {
   const client = useClient();
   const queryClient = useQueryClient();
   const [backend, setBackend] = useState<"local" | "openrouter">("local");
-  const [budget, setBudget] = useState("0.50");
-  const [acknowledged, setAcknowledged] = useState(false);
-  const [zdr, setZdr] = useState(true);
+  const [model, setModel] = useState("openai/whisper-1");
+  const models = useQuery({ queryKey: keys.transcriptionModels(projectId), queryFn: () => client.listReviewTranscriptionModels(projectId), enabled: backend === "openrouter", staleTime: 300_000 });
+  const choices = models.data?.items ?? [];
+  const selectedModel = choices.some((choice) => choice.id === model) ? model : choices[0]?.id ?? "";
   const request = (): ReviewTranscriptionRequest => backend === "local"
     ? { backend: "local" }
-    : { backend: "openrouter", model: "openai/whisper-1", authorizedMaxCostUsd: Number(budget) || null, cloudUploadAcknowledged: acknowledged, zeroDataRetention: zdr };
+    : { backend: "openrouter", model: selectedModel };
 
   const check = useMutation({ mutationFn: () => client.preflightReviewTranscription(projectId, sessionId, request()) });
   const start = useMutation({
     mutationFn: () => client.startReviewTranscription(projectId, sessionId, request()),
     onSuccess: () => { check.reset(); void queryClient.invalidateQueries({ queryKey: keys.transcriptions(projectId, sessionId) }); onStarted?.(); },
   });
-  useEffect(() => { check.reset(); }, [backend, budget, acknowledged, zdr]);
+  useEffect(() => { check.reset(); }, [backend, selectedModel]);
 
   const preflight = check.data;
   return (
@@ -189,12 +194,14 @@ export function TranscribeForm({ projectId, sessionId, busy, onStarted }: { proj
         <p className={styles.muted}>Whisper, offline. Nothing leaves the server.</p>
       ) : (
         <div className={styles.cloud}>
-          <Field label="Spending limit (USD)">
-            {(id) => <input id={id} inputMode="decimal" value={budget} onChange={(event) => setBudget(event.target.value)} />}
+          <Field label="OpenRouter model">
+            {(id) => <select id={id} value={selectedModel} disabled={models.isPending || models.isError} onChange={(event) => setModel(event.target.value)}>
+              {!choices.length ? <option value="">{models.isPending ? "Loading models…" : "No models available"}</option> : null}
+              {choices.map((choice) => <option key={choice.id} value={choice.id}>{choice.name} ({choice.id})</option>)}
+            </select>}
           </Field>
-          <Checkbox checked={acknowledged} onChange={setAcknowledged}>Send this recording to OpenRouter (openai/whisper-1).</Checkbox>
-          <Checkbox checked={zdr} onChange={setZdr}>Require zero data retention.</Checkbox>
-          <p className={styles.hintSmall}>Providers may never train on it. There’s no fallback to another provider or model.</p>
+          {models.error ? <Notice tone="warning">{describeError(models.error)} <Button size="sm" onClick={() => void models.refetch()}>Retry model list</Button></Notice> : null}
+
         </div>
       )}
 
@@ -204,7 +211,7 @@ export function TranscribeForm({ projectId, sessionId, busy, onStarted }: { proj
           {preflight.estimate ? (
             <p className={styles.muted}>
               {formatStamp(preflight.estimate.receivedAudioSeconds)} of audio in {plural(preflight.estimate.segmentCount, "segment")}.
-              {preflight.estimate.maxCostUsd !== null ? ` At most $${preflight.estimate.maxCostUsd.toFixed(4)}; silence isn’t sent.` : " Free."}
+              {backend === "local" ? " Free." : ""}
             </p>
           ) : null}
           {preflight.warnings.length ? <ul className={styles.bullets}>{preflight.warnings.map((code) => <li key={code}>{describeCode(code)}</li>)}</ul> : null}
@@ -214,9 +221,9 @@ export function TranscribeForm({ projectId, sessionId, busy, onStarted }: { proj
 
       <div className={styles.inlineActions}>
         {preflight?.ready ? (
-          <Button variant="primary" busy={start.isPending} disabled={busy} onClick={() => start.mutate()}>{preflight.existingRunId ? "Resume transcription" : "Transcribe"}</Button>
+          <Button variant="primary" busy={start.isPending} disabled={busy || (backend === "openrouter" && (!selectedModel || models.isError))} onClick={() => start.mutate()}>{preflight.existingRunId ? "Resume transcription" : "Transcribe"}</Button>
         ) : (
-          <Button type="submit" busy={check.isPending}>Check</Button>
+          <Button type="submit" busy={check.isPending} disabled={backend === "openrouter" && (!selectedModel || models.isError)}>Check</Button>
         )}
       </div>
     </form>

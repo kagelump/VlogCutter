@@ -83,6 +83,16 @@ pub struct NativeSttCallResult {
     pub receipt: NativeSttReceipt,
     pub latency_ms: u64,
     pub outcome: NativeSttOutcome,
+    pub provider_error: Option<NativeSttProviderError>,
+}
+
+/// Bounded provider error fields only; credentials and raw response bodies are excluded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSttProviderError {
+    pub http_status: u16,
+    pub code: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +216,7 @@ pub fn decode_native_stt_body(
                 generation_id: generation_id.and_then(|value| bounded_generation_id(&value)),
                 ..NativeSttReceipt::default()
             },
+            provider_error: None,
             latency_ms,
             outcome: NativeSttOutcome::Unusable(NativeSttProtocolError::ResponseTooLarge),
         };
@@ -218,6 +229,7 @@ pub fn decode_native_stt_body(
                 .unwrap_or_else(NativeSttOutcome::Unusable);
             NativeSttCallResult {
                 receipt,
+                provider_error: None,
                 latency_ms,
                 outcome,
             }
@@ -227,6 +239,7 @@ pub fn decode_native_stt_body(
                 generation_id: generation_id.and_then(|value| bounded_generation_id(&value)),
                 ..NativeSttReceipt::default()
             },
+            provider_error: None,
             latency_ms,
             outcome: NativeSttOutcome::Unusable(NativeSttProtocolError::InvalidJson),
         },

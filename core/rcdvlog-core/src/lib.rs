@@ -116,9 +116,10 @@ pub mod review_speech {
     pub use crate::analysis::openrouter::resolve_api_key;
     pub use crate::analysis::openrouter_stt::{
         NATIVE_STT_MODELS, NativeSttAudioWindow, NativeSttCallResult, NativeSttCost,
-        NativeSttOutcome, NativeSttProviderPolicy, NativeSttReceipt, NativeSttRequest,
-        NativeSttSegment, NativeSttTranscript, NativeSttTransport, NativeSttUsage,
-        OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL, OpenRouterSttClient, SttDataCollection,
+        NativeSttModelChoice, NativeSttOutcome, NativeSttProviderError, NativeSttProviderPolicy,
+        NativeSttReceipt, NativeSttRequest, NativeSttSegment, NativeSttTranscript,
+        NativeSttTransport, NativeSttUsage, OPENROUTER_STT_PROVIDER, OPENROUTER_WHISPER_MODEL,
+        OpenRouterSttClient, SttDataCollection, discover_native_stt_models,
         resolve_native_stt_model, validate_iso639_1,
     };
     pub use crate::analysis::quality::{DecodedSegment, RejectReason, reject_reason};

@@ -204,12 +204,13 @@ test("Chrome records a fake-microphone voice review with a manual cue and reopen
   await page.getByRole("button", { name: "Check" }).click();
   await expect(page.getByText(/Speech models aren't installed on this server/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Transcribe" })).toHaveCount(0);
+  await page.route("**/review-transcription-models", route => route.fulfill({json:{items:[{id:"openai/whisper-1",name:"OpenAI: Whisper"}]}}));
   await page.getByRole("button", { name: "OpenRouter (cloud)" }).click();
+  await expect(page.getByLabel("OpenRouter model")).toHaveValue("openai/whisper-1");
   await page.getByRole("button", { name: "Check" }).click();
-  await expect(page.getByText(/may be sent to the provider/)).toBeVisible();
-  // A developer may have a key file even when the fixture clears the env key.
-  // Capture must never enable cloud execution without explicit consent.
-  await expect(page.getByRole("checkbox", { name: /Send this recording to OpenRouter/ })).not.toBeChecked();
+  await expect(page.getByRole("checkbox", {name:/Send this recording|Require zero data/})).toHaveCount(0);
+  await expect(page.getByLabel("Spending limit (USD)")).toHaveCount(0);
+  // This disposable server lacks VAD models, so it cannot dispatch cloud audio.
   await expect(page.getByRole("button", { name: "Transcribe", exact: true })).toHaveCount(0);
 
   const href = await page.getByRole("link", { name: "Download WAV" }).getAttribute("href");
