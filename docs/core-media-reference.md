@@ -2,7 +2,7 @@
 
 ## Assets and patches
 
-`Asset` is defined canonically in `core/rcdvlog-core/src/lib.rs` and mirrored in `apps/desktop/src/types.ts`. Availability is computed on read:
+`Asset` is defined canonically in `core/rcdvlog-core/src/types.rs` and mirrored in `apps/desktop/src/types.ts`. Availability is computed on read:
 
 - `originalAvailable`: at least one node-local location exists and its sampled
   fingerprint has been verified against the asset identity.
