@@ -104,6 +104,7 @@ export function SessionPage() {
 function SessionFacts({ session }: { session: ReviewSessionDetail }) {
   const rate = session.sampleRate;
   const clockSamples = session.events.filter((event) => event.kind === "clockSample");
+  const playbackSamples = clockSamples.filter((event) => event.detail?.method === "playerObservation");
   const epochs = new Set(clockSamples.map((event) => Number(event.detail?.clockEpoch ?? 0))).size;
   const cues = session.events.filter((event) => event.kind === "manualSyncCue");
   const health = session.events.filter((event) => event.kind !== "manualSyncCue" && event.kind !== "clockSample");
@@ -114,6 +115,7 @@ function SessionFacts({ session }: { session: ReviewSessionDetail }) {
       ["Audio", `${session.sampleRate.toLocaleString()} Hz ${session.channels === 1 ? "mono" : "stereo"} · ${plural(session.coverage.chunkCount, "chunk")}`],
       ["Processing", `echo cancellation ${onOff(session.capture.echoCancellation)} · noise suppression ${onOff(session.capture.noiseSuppression)} · auto gain ${onOff(session.capture.autoGainControl)}`],
       ["Clock", clockSamples.length ? `${clockSamples.length} sample/performance clock pairs across ${plural(epochs, "clock epoch")}` : "No clock pairs"],
+      playbackSamples.length ? ["Playback", `${plural(playbackSamples.length, "YouTube position observation")} saved · automatic comment placement is not yet available`] : null,
       ["Gaps", session.coverage.gaps.length ? session.coverage.gaps.map((gap) => `${formatClock(gap.startFrame / rate)}–${formatClock(gap.endFrame / rate)}`).join(", ") : session.state === "recording" ? "Computed when finished" : "None"],
       cues.length ? ["Start marks", cues.map((cue) => `${formatClock(cue.audioSeconds)} (your mark, not measured sync)`).join(", ")] : null,
       health.length ? ["Capture events", health.map((event) => `${formatClock(event.audioSeconds)} ${humanize(event.kind).toLowerCase()}`).join(", ")] : null,

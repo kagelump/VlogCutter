@@ -289,6 +289,7 @@ export interface ReviewTargetReadiness {
 }
 
 export interface ReviewTargetSummary {
+  displayName?: string | null;
   reviewTargetId: string;
   contract: ReviewTargetContract;
   projectId: string;
@@ -706,6 +707,7 @@ export interface BrowserProjectClient extends ProjectClient {
   preflightHistoricalReviewTarget(projectId: string, request: HistoricalReviewTargetImportRequest): Promise<ReviewTargetPreflight>;
   importHistoricalReviewTarget(projectId: string, request: HistoricalReviewTargetImportRequest): Promise<ReviewTargetImportResult>;
   getReviewTarget(projectId: string, reviewTargetId: string): Promise<ReviewTargetDetail>;
+  renameReviewTarget(projectId: string, reviewTargetId: string, displayName: string | null): Promise<ReviewTargetDetail>;
   declareReviewTargetYoutube(projectId: string, reviewTargetId: string, youtubeVideoId: string | null): Promise<ReviewTargetImportResult>;
   getReviewTargetCandidates(projectId: string, reviewTargetId: string, startSeconds: number, endSeconds: number): Promise<ReviewTargetCandidates>;
   listReviewSessions(projectId: string, reviewTargetId?: string, limit?: number, before?: number): Promise<ReviewSessionPage>;

@@ -130,6 +130,23 @@ test("Chrome imports a verified TV review target through the real server and sho
   await expect(page.getByRole("link", { name: "YouTube" })).toHaveCount(0);
   await expect(page.getByRole("region", { name: /Shots/ }).getByRole("link")).toHaveCount(3);
 
+  const targetUrl = page.url();
+  await page.getByRole("button", { name: "Rename cut" }).click();
+  const rename = page.getByRole("dialog", { name: "Rename cut" });
+  await rename.getByLabel("Cut name").fill("RC7");
+  await rename.getByRole("button", { name: "Save name" }).click();
+  await expect(page.getByRole("heading", { name: /^RC7/ })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("heading", { name: /^RC7/ })).toBeVisible();
+  expect(page.url()).toBe(targetUrl);
+  await page.getByRole("link", { name: "TV reviews" }).first().click();
+  await expect(page.getByRole("main").getByRole("listitem").filter({ hasText: "RC7" })).toContainText("Revision syntheti");
+  await page.goto(targetUrl);
+  await page.getByRole("button", { name: "Rename cut" }).click();
+  await rename.getByLabel("Cut name").fill("");
+  await rename.getByRole("button", { name: "Save name" }).click();
+  await expect(page.getByRole("heading", { name: /^Cut syntheti/ })).toBeVisible();
+
   // Re-importing the identical handoff reuses the original target rather than adding one.
   await page.getByRole("link", { name: "TV reviews" }).first().click();
   await expect(targets).toHaveCount(2);

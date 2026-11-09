@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { keys, useClient } from "../../app/client";
 import { paths } from "../../app/paths";
 import { Page } from "../../app/Shell";
-import { formatClock, formatDate } from "../../lib/format";
+import { formatClock, formatDate, shortId } from "../../lib/format";
 import { useDocumentTitle } from "../../lib/hooks";
 import { Badge, Button, EmptyState, ErrorMessage, Icon, Loading } from "../../ui";
 import { useProjectId } from "../projects/ProjectLayout";
@@ -44,7 +44,7 @@ export function TargetsPage() {
               <Link to={paths.target(projectId, target.reviewTargetId)} className={styles.listItem}>
                 <span className={styles.listMain}>
                   <strong title={target.revisionId}>{targetTitle(target)}</strong>
-                  <span>{formatClock(target.durationSeconds)} · {target.cutCount.toLocaleString()} shots · imported {formatDate(target.importedAt)}</span>
+                  <span>{target.displayName ? `Revision ${shortId(target.revisionId)} · ` : ""}{formatClock(target.durationSeconds)} · {target.cutCount.toLocaleString()} shots · imported {formatDate(target.importedAt)}</span>
                 </span>
                 <span className={styles.listBadges}>
                   {target.youtube.videoId ? <Badge tone="accent">YouTube</Badge> : null}

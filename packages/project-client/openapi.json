@@ -1414,6 +1414,15 @@
       },
       "ReviewTargetDetail": {
         "additionalProperties": true,
+        "properties": {
+          "displayName": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "ReviewTargetImportRequest": {
@@ -1486,6 +1495,23 @@
         "required": [
           "outcome",
           "reviewTarget"
+        ],
+        "type": "object"
+      },
+      "ReviewTargetNameRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "displayName": {
+            "maxLength": 120,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "displayName"
         ],
         "type": "object"
       },
@@ -1591,6 +1617,15 @@
       },
       "ReviewTargetSummary": {
         "additionalProperties": true,
+        "properties": {
+          "displayName": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "ReviewTargetYoutubeRequest": {
@@ -4175,6 +4210,62 @@
             "description": "ReviewTargetDetail"
           },
           "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "patch": {
+        "description": "Set or clear a cut display name without changing the verified snapshot, receipt, recording bindings, or revision.",
+        "operationId": "renameReviewTarget",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "reviewTargetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewTargetNameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewTargetDetail"
+                }
+              }
+            },
+            "description": "ReviewTargetDetail"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
             "$ref": "#/components/responses/Error"
           },
           "404": {

@@ -4,13 +4,14 @@ import { keys, useClient } from "../../app/client";
 import { paths } from "../../app/paths";
 import { Page } from "../../app/Shell";
 import { describeCode } from "../../lib/errors";
-import { formatClock, formatRelative } from "../../lib/format";
+import { formatClock, formatRelative, shortId } from "../../lib/format";
 import { useDocumentTitle } from "../../lib/hooks";
 import { Button, ButtonAnchor, ButtonLink, ErrorMessage, Loading, Notice, PageHeader } from "../../ui";
 import { useProjectId } from "../projects/ProjectLayout";
 import { Recordings } from "./Recordings";
 import { HistoricalBadge, PendingRecoveries, ReadinessBadge, isHistorical, targetTitle } from "./shared";
 import { ShotGrid } from "./ShotGrid";
+import { RenameCut } from "./RenameCut";
 import styles from "./TvReview.module.css";
 
 export function TargetPage() {
@@ -29,13 +30,15 @@ export function TargetPage() {
     <Page wide>
       <PageHeader
         back={{ to: paths.reviews(projectId), label: "TV reviews" }}
-        title={<span title={detail.revisionId}>{targetTitle(detail)}</span>}
+        title={<span className={styles.cutTitle} title={detail.revisionId}>{targetTitle(detail)}</span>}
         titleExtra={<><HistoricalBadge target={detail} /><ReadinessBadge target={detail} /></>}
-        subtitle={`${formatClock(detail.durationSeconds)} · ${detail.cutCount.toLocaleString()} shots · verified ${formatRelative(detail.latestVerifiedAt)}`}
+        subtitle={`${detail.displayName ? `Revision ${shortId(detail.revisionId)} · ` : ""}${formatClock(detail.durationSeconds)} · ${detail.cutCount.toLocaleString()} shots · verified ${formatRelative(detail.latestVerifiedAt)}`}
         actions={<>
+          <RenameCut projectId={projectId} target={detail} />
           {videoId ? (
             <ButtonAnchor icon="external" href={`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`} target="_blank" rel="noreferrer noopener">YouTube</ButtonAnchor>
           ) : null}
+          {videoId && detail.readiness.ready ? <ButtonLink icon="mic" to={`${paths.record(projectId, detail.reviewTargetId)}?mode=play`}>Play + record review</ButtonLink> : null}
           {detail.readiness.ready
             ? <ButtonLink variant="primary" icon="mic" to={paths.record(projectId, detail.reviewTargetId)}>Record review</ButtonLink>
             : <Button variant="primary" icon="mic" disabled>Record review</Button>}

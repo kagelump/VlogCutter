@@ -891,7 +891,7 @@ pub fn router(state: HttpState) -> Router {
         )
         .route(
             "/api/v1/projects/{project_id}/review-targets/{review_target_id}",
-            get(review_target_http::get),
+            get(review_target_http::get).patch(review_target_http::set_display_name),
         )
         .route(
             "/api/v1/projects/{project_id}/review-targets/{review_target_id}/youtube",
@@ -6338,6 +6338,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(json(again).await["outcome"], "reused");
+
+        let patch_name = |body: Value, csrf_header: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("{base}/{id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie);
+            if let Some(csrf) = csrf_header {
+                builder = builder.header("x-csrf-token", csrf);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let denied = fixture
+            .app()
+            .oneshot(patch_name(serde_json::json!({"displayName":"RC7"}), None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"displayName":42}),
+            serde_json::json!({"displayName":""}),
+            serde_json::json!({"displayName":"RC7\n"}),
+        ] {
+            let response = fixture
+                .app()
+                .oneshot(patch_name(invalid, Some(&csrf)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let renamed = fixture
+            .app()
+            .oneshot(patch_name(
+                serde_json::json!({"displayName":" RC7 "}),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(renamed.status(), StatusCode::OK);
+        let renamed = json(renamed).await;
+        assert_eq!(renamed["displayName"], "RC7");
+        assert_eq!(renamed["reviewTargetId"], target["reviewTargetId"]);
+        assert_eq!(renamed["targetDigest"], target["targetDigest"]);
+        assert_eq!(renamed["observations"], target["observations"]);
+        let cleared = fixture
+            .app()
+            .oneshot(patch_name(
+                serde_json::json!({"displayName":null}),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        assert_eq!(json(cleared).await["displayName"], Value::Null);
 
         let mut conflicting = request.clone();
         conflicting["handoff"]["target"]["movie"]["blake3"] = Value::String("d".repeat(64));

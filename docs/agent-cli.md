@@ -1322,7 +1322,7 @@ catalog and immutable revision guards as the existing commands.
 
 ## TV review target handoff
 
-`edit-plan review-target-export --artifact <id> [--youtube-video-id <11-character-id>]`
+`edit-plan review-target-export --artifact <id> [--name <cut-name>] [--youtube-video-id <11-character-id>]`
 requires an existing explicit catalog and uses the writable verification/host-lease path. It freshly verifies
 the complete full-preview artifact and returns a version-1 path-free metadata
 handoff in the normal success envelope, command `edit-plan.review-target-export`.
@@ -1345,7 +1345,7 @@ ready for `tv-review sync-preview`. Commands: `review-markers.plan`,
 [acoustic markers](tv-review-acoustic-markers.md).
 
 Historical movie review: `edit-plan historical-review-target-export --artifact
-<id>` opens the explicit existing catalog read-only and returns the separate
+<id> [--name <cut-name>]` opens the explicit existing catalog read-only and returns the separate
 `HistoricalRenderedArtifactReview` v1 DTO. It checks fresh movie bytes and stored
 mapping/revision integrity; current source/constraint/renderability checks remain
 explicitly unresolved. See [historical review policy](tv-review-handoff.md#historical-rendered-artifact-review-separate-contract).

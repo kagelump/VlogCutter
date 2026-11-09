@@ -463,6 +463,7 @@ pub struct ReviewTargetReadiness {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewTargetSummary {
+    pub display_name: Option<String>,
     pub review_target_id: String,
     pub contract: ReviewTargetContract,
     pub project_id: String,
@@ -867,7 +868,45 @@ fn parse_historical(
     Ok(Some(ReviewTargetEvidence::Historical(review)))
 }
 
+pub(crate) fn migrate_display_names(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute_batch("ALTER TABLE review_targets ADD COLUMN display_name TEXT;")?;
+    Ok(())
+}
+
 impl ReviewTargets {
+    /// Change presentation metadata without renewing evidence or changing any
+    /// movie, snapshot, target identity, session, or canonical edit revision.
+    pub fn set_display_name(
+        &self,
+        project_id: &str,
+        review_target_id: &str,
+        display_name: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<ReviewTargetDetail, ReviewTargetServiceError> {
+        if let Some(name) = display_name
+            && (name.trim().is_empty()
+                || name.chars().count() > 120
+                || name.chars().any(char::is_control))
+        {
+            return Err(ReviewTargetServiceError::InvalidInput(
+                "cut name must contain 1–120 characters without control characters".into(),
+            ));
+        }
+        let mut connection = open_writable_connection(&self.database_path)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::project_registered(&tx, project_id)?;
+        if tx.execute(
+            "UPDATE review_targets SET display_name=?3 WHERE project_id=?1 AND review_target_id=?2",
+            params![project_id, review_target_id, display_name.map(str::trim)],
+        )? == 0
+        {
+            return Err(ReviewTargetServiceError::NotFound);
+        }
+        let detail = load_detail(&tx, project_id, review_target_id, now)?;
+        tx.commit()?;
+        Ok(detail)
+    }
+
     pub(crate) fn new(database_path: PathBuf) -> Self {
         Self { database_path }
     }
@@ -1369,7 +1408,12 @@ impl ReviewTargets {
         target.youtube_video_id = youtube_video_id.map(str::to_string);
         // The rebound snapshot keeps its parent's contract and receipt: a
         // historical target stays historical.
-        let evidence = evidence_from(stored.contract, target, &latest.verification)?;
+        let evidence = evidence_from(
+            stored.contract,
+            target,
+            &latest.verification,
+            stored.display_name.clone(),
+        )?;
         evidence.validate()?;
         let existing: Option<(String, String)> = tx
             .query_row(
@@ -1531,6 +1575,7 @@ impl ReviewTargets {
 }
 
 struct StoredTarget {
+    display_name: Option<String>,
     contract: ReviewTargetContract,
     snapshot: ReviewTargetSnapshot,
     schema_version: u32,
@@ -1562,8 +1607,8 @@ fn insert_target(
             revision_id, viewed_artifact_id, movie_blake3, movie_byte_length, duration_seconds,
             cut_count, youtube_video_id, youtube_declared_by, derived_from_review_target_id,
             snapshot_json, declared_issuer, imported_at, importer_actor_type, importer_actor_id,
-            contract)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            contract, display_name)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         params![
             id,
             t.project_id,
@@ -1585,6 +1630,11 @@ fn insert_target(
             actor.actor_type,
             actor.actor_id,
             evidence.contract().as_str(),
+            match evidence {
+                ReviewTargetEvidence::Current(h) => h.display_name.as_deref(),
+                ReviewTargetEvidence::Historical(h) => h.display_name.as_deref(),
+            }
+            .map(str::trim),
         ],
     )?;
     Ok(id)
@@ -1636,7 +1686,7 @@ fn load_stored(
         .query_row(
             "SELECT schema_version, target_digest, binding_digest, snapshot_json,
                     youtube_declared_by, derived_from_review_target_id, declared_issuer,
-                    imported_at, importer_actor_type, importer_actor_id, contract
+                    imported_at, importer_actor_type, importer_actor_id, contract, display_name
              FROM review_targets WHERE project_id=?1 AND review_target_id=?2",
             params![project_id, review_target_id],
             |row| {
@@ -1652,12 +1702,14 @@ fn load_stored(
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             },
         )
         .optional()?
         .ok_or(ReviewTargetServiceError::NotFound)?;
     Ok(StoredTarget {
+        display_name: row.11,
         contract: ReviewTargetContract::parse(&row.10)?,
         schema_version: row.0,
         target_digest: row.1,
@@ -1735,11 +1787,13 @@ fn evidence_from(
     contract: ReviewTargetContract,
     target: ReviewTargetSnapshot,
     receipt: &ReviewTargetReceipt,
+    display_name: Option<String>,
 ) -> Result<ReviewTargetEvidence, ReviewTargetServiceError> {
     let target_digest = ReviewTargetHandoff::snapshot_digest(&target)?;
     Ok(match (contract, receipt) {
         (ReviewTargetContract::ReviewTargetV1, ReviewTargetReceipt::Current(v)) => {
             ReviewTargetEvidence::Current(ReviewTargetHandoff {
+                display_name,
                 schema_version: REVIEW_TARGET_SCHEMA_VERSION,
                 target_digest,
                 target,
@@ -1750,6 +1804,7 @@ fn evidence_from(
             ReviewTargetContract::HistoricalRenderedArtifactReviewV1,
             ReviewTargetReceipt::Historical(h),
         ) => ReviewTargetEvidence::Historical(HistoricalRenderedArtifactReview {
+            display_name,
             schema_version: REVIEW_TARGET_SCHEMA_VERSION,
             purpose: HistoricalReviewPurpose::HistoricalRenderedArtifactReview,
             target_digest,
@@ -1779,7 +1834,12 @@ fn stored_evidence(
     let latest = load_observations(connection, stored.contract, review_target_id)?
         .pop()
         .context("review target has no verification observation")?;
-    let evidence = evidence_from(stored.contract, stored.snapshot, &latest.verification)?;
+    let evidence = evidence_from(
+        stored.contract,
+        stored.snapshot,
+        &latest.verification,
+        stored.display_name,
+    )?;
     if evidence.target_digest() != stored.target_digest || stored.schema_version != 1 {
         return Err(anyhow::anyhow!("stored review target digest does not round-trip").into());
     }
@@ -1810,6 +1870,7 @@ fn load_detail(
         .collect();
     let picture_end_seconds = cuts.last().map(|c| c.movie_out_seconds).unwrap_or(0.0);
     let summary = ReviewTargetSummary {
+        display_name: stored.display_name.clone(),
         review_target_id: review_target_id.to_string(),
         contract: stored.contract,
         project_id: snapshot.project_id.clone(),

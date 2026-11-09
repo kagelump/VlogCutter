@@ -81,6 +81,8 @@ fn export_envelope_is_path_free_preserves_revisions_and_refuses_missing_or_chang
                 "review-target-export",
                 "--artifact",
                 &artifact,
+                "--name",
+                "RC7",
                 "--youtube-video-id",
                 "synthetic01",
             ])
@@ -96,6 +98,7 @@ fn export_envelope_is_path_free_preserves_revisions_and_refuses_missing_or_chang
     assert!(output.stderr.is_empty());
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["displayName"], "RC7");
     assert_eq!(envelope["command"], "edit-plan.review-target-export");
     let handoff =
         ReviewTargetHandoff::from_json(&serde_json::to_vec(&envelope["data"]).unwrap()).unwrap();
@@ -126,6 +129,8 @@ fn export_envelope_is_path_free_preserves_revisions_and_refuses_missing_or_chang
             "historical-review-target-export",
             "--artifact",
             &artifact,
+            "--name",
+            "RC7",
         ])
         .output()
         .unwrap();
@@ -136,6 +141,7 @@ fn export_envelope_is_path_free_preserves_revisions_and_refuses_missing_or_chang
     );
     assert!(historical.stderr.is_empty());
     let historical: Value = serde_json::from_slice(&historical.stdout).unwrap();
+    assert_eq!(historical["data"]["displayName"], "RC7");
     assert_eq!(
         historical["data"]["purpose"],
         "historicalRenderedArtifactReview"

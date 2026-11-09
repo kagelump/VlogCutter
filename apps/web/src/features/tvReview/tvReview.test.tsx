@@ -331,3 +331,20 @@ test("an unmapped transcript line does not borrow a nearby video time or thumbna
   expect(screen.queryByRole("img")).toBeNull();
   expect(screen.queryByRole("link", { name: /^Video/ })).toBeNull();
 });
+
+test("named cuts appear in the review list with revision identity as secondary text", async () => {
+  renderApp("/projects/p1/reviews", { ...targetsClient, listReviewTargets: vi.fn().mockResolvedValue({ items: [{ ...target, displayName: "RC7" }], nextBefore: null }) });
+  expect(await screen.findByRole("link", { name: /RC7/ })).toBeVisible();
+  expect(screen.getByText(/Revision syntheti/)).toBeVisible();
+});
+
+test("renaming a cut updates its heading without replacing the target", async () => {
+  const named = { ...target, displayName: "RC7" };
+  const { client } = renderApp("/projects/p1/reviews/rtarget_one", { ...targetsClient, renameReviewTarget: vi.fn().mockResolvedValue(named) });
+  await userEvent.click(await screen.findByRole("button", { name: "Rename cut" }));
+  const dialog = await screen.findByRole("dialog", { name: "Rename cut" });
+  await userEvent.type(within(dialog).getByLabelText("Cut name"), "RC7");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Save name" }));
+  await waitFor(() => expect(client.renameReviewTarget).toHaveBeenCalledWith("p1", "rtarget_one", "RC7"));
+  expect(await screen.findByRole("heading", { name: /^RC7/ })).toBeVisible();
+});

@@ -20,6 +20,13 @@ pub(super) struct ListQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct NameRequest {
+    // Required even when clearing: a missing or misspelled property must not rename.
+    display_name: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct YoutubeRequest {
     youtube_video_id: Option<String>,
 }
@@ -243,6 +250,49 @@ pub(super) async fn get(
     }
 }
 
+pub(super) async fn set_display_name(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((project_id, review_target_id)): AxumPath<(String, String)>,
+    body: Result<Json<NameRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST);
+    };
+    let name = match body.display_name {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(name) => Some(name),
+        _ => return query_error_response(&request_id, "invalid_input", StatusCode::BAD_REQUEST),
+    };
+    let targets = state.foundation.catalog().review_targets();
+    let result = match blocking(&request_id, move || {
+        targets.set_display_name(
+            &project_id,
+            &review_target_id,
+            name.as_deref(),
+            chrono::Utc::now(),
+        )
+    })
+    .await
+    {
+        Ok(detail) => detail,
+        Err(response) => return response,
+    };
+    if let Err(response) = audit_admin(
+        &state,
+        &principal,
+        &request_id,
+        "review_target.renamed",
+        "review_target",
+        Some(&result.summary.review_target_id),
+        serde_json::json!({"displayName": result.summary.display_name}),
+    ) {
+        return *response;
+    }
+    Json(result).into_response()
+}
+
 pub(super) async fn rebind_youtube(
     State(state): State<HttpState>,
     Extension(request_id): Extension<RequestId>,
@@ -364,6 +414,12 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
             "operationId": "getReviewTarget",
             "parameters": [project.clone(), target.clone()],
             "responses": {"200": ok("ReviewTargetDetail"), "401": error.clone(), "404": error.clone()}
+        }, "patch": {
+            "operationId":"renameReviewTarget",
+            "description":"Set or clear a cut display name without changing the verified snapshot, receipt, recording bindings, or revision.",
+            "parameters":[project.clone(),target.clone()],
+            "requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ReviewTargetNameRequest"}}}},
+            "responses":{"200":ok("ReviewTargetDetail"),"400":error.clone(),"401":error.clone(),"403":error.clone(),"404":error.clone()}
         }},
         "/api/v1/projects/{projectId}/review-targets/{reviewTargetId}/youtube": {"post": {
             "operationId": "declareReviewTargetYoutube",
@@ -381,7 +437,6 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
             "responses": {"200": ok("ReviewTargetCandidates"), "400": error.clone(), "401": error.clone(), "404": error}
         }}
     });
-    let open = json!({"type":"object","additionalProperties":true});
     let schemas = json!({
         "ReviewTargetImportRequest": {
             "type":"object","additionalProperties":false,"required":["handoff"],
@@ -406,6 +461,10 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
                 "maxVerificationAgeSeconds":{"type":["integer","null"],"minimum":1}
             }
         },
+        "ReviewTargetNameRequest": {
+            "type":"object","additionalProperties":false,"required":["displayName"],
+            "properties":{"displayName":{"type":["string","null"],"minLength":1,"maxLength":120}}
+        },
         "ReviewTargetYoutubeRequest": {
             "type":"object","additionalProperties":false,"required":["youtubeVideoId"],
             "properties":{"youtubeVideoId":{"type":["string","null"],"pattern":"^[A-Za-z0-9_-]{11}$"}}
@@ -423,8 +482,8 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
         "ReviewTargetPage": {"type":"object","required":["items"],"properties":{
             "items":{"type":"array","items":{"$ref":"#/components/schemas/ReviewTargetSummary"}},
             "nextBefore":{"type":["integer","null"]}}},
-        "ReviewTargetSummary": open.clone(),
-        "ReviewTargetDetail": open.clone(),
+        "ReviewTargetSummary": {"type":"object","additionalProperties":true,"properties":{"displayName":{"type":["string","null"],"maxLength":120}}},
+        "ReviewTargetDetail": {"type":"object","additionalProperties":true,"properties":{"displayName":{"type":["string","null"],"maxLength":120}}},
         "ReviewTargetImportResult": {"type":"object","required":["outcome","reviewTarget"],"properties":{
             "outcome":{"type":"string","enum":["created","reused","refreshed"]},
             "reviewTarget":{"$ref":"#/components/schemas/ReviewTargetDetail"}}},

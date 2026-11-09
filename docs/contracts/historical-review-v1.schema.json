@@ -294,6 +294,15 @@
     },
     "currentPlanRenderability": {
       "const": "notEstablishedByThisReview"
+    },
+    "displayName": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 120,
+      "description": "Optional editorial display name; not part of targetDigest."
     }
   }
 }
