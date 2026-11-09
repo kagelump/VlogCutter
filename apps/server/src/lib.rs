@@ -623,12 +623,13 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     );
     headers.insert(
         header::HeaderName::from_static("referrer-policy"),
-        HeaderValue::from_static("same-origin"),
+        // YouTube embeds require the cross-origin Referer to identify this app.
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
     headers.insert(
         header::HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(
-            "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'",
+            "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'; script-src 'self' https://www.youtube.com https://s.ytimg.com; frame-src https://www.youtube.com",
         ),
     );
     headers.insert(
@@ -5114,6 +5115,22 @@ mod tests {
             .unwrap();
         assert_eq!(index.status(), StatusCode::OK);
         assert_eq!(index.headers()[header::CACHE_CONTROL], "no-cache");
+        // The IFrame API loads external scripts and creates a YouTube frame.
+        // Keep these permissions explicit while retaining the same-origin API
+        // boundary and the ban on embedding our app inside another site.
+        assert_eq!(
+            index.headers()["content-security-policy"],
+            "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'; script-src 'self' https://www.youtube.com https://s.ytimg.com; frame-src https://www.youtube.com"
+        );
+        assert_eq!(
+            index.headers()["referrer-policy"],
+            "strict-origin-when-cross-origin"
+        );
+        assert_eq!(index.headers()["x-frame-options"], "DENY");
+        assert_eq!(
+            index.headers()["permissions-policy"],
+            "camera=(), microphone=(self), geolocation=()"
+        );
         assert_eq!(
             to_bytes(index.into_body(), 1024).await.unwrap(),
             "<main>web shell</main>"
