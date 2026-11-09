@@ -265,7 +265,7 @@ invalidates transcript binding. Preparation preserves originals, human
 annotations, orientation choices, and chronology; see `docs/agent-cli.md`.
 
 Paid analysis is admitted only through a concrete `RunPolicy` (see
-`docs/analysis-preflight.md`). The policy binds exact project-owned asset/source
+`docs/analysis.md`). The policy binds exact project-owned asset/source
 identities, provider/model allowlist and permitted fallbacks, frames/audio/
 transcript payload, explicitly approved project-vocabulary context, expected
 cost, requested ceiling, prompt/schema/recipe/tool versions and readiness.

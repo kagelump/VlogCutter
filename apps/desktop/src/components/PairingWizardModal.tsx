@@ -6,9 +6,8 @@ export type PairingWizardStep = "endpoint" | "code" | "connecting";
  * The connect-to-server wizard (spec §14). Three steps: reach the server, enter
  * a pairing code, connect.
  *
- * Step state and the reset it needs live in `App` and arrive as props (the
- * decision recorded in HANDOFF_APP_DECOMPOSITION.md: wizards receive their step
- * rather than own it, so the shell can resolve Escape and Cancel to one reset).
+ * Step state and the reset it needs live in `App` and arrive as props (wizards
+ * receive their step rather than own it, so the shell can resolve Escape and Cancel to one reset).
  * `onCancel` is that reset; the backdrop's own Escape calls it too.
  */
 export function PairingWizardModal({
