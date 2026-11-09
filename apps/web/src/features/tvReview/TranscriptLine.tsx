@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { ReviewUtterance, MovieTimeEstimate } from "@rcdvlog/project-client";
+import type { ReviewUtterance, MovieTimeEstimate, MovieTimeRange } from "@rcdvlog/project-client";
 import { formatStamp } from "../../lib/format";
 import styles from "./TvReview.module.css";
 
@@ -11,8 +11,9 @@ const FLAG_COPY: Record<string, string> = {
   nearRecordingGap: "near a gap",
 };
 
-export function UtteranceLine({ utterance, showRaw, movieTime, thumbnail, shotNumber, videoId, timingLoading }: {
+export function UtteranceLine({ utterance, showRaw, movieTime, movieTimeRanges, thumbnail, shotNumber, videoId, timingLoading }: {
   utterance: ReviewUtterance; showRaw: boolean; movieTime?: MovieTimeEstimate;
+  movieTimeRanges?: MovieTimeRange[];
   thumbnail?: string; shotNumber?: number; videoId?: string; timingLoading: boolean;
 }) {
   return (
@@ -23,16 +24,27 @@ export function UtteranceLine({ utterance, showRaw, movieTime, thumbnail, shotNu
         {utterance.suppressed ? <em className={styles.muted}>Low quality: </em> : null}
         {showRaw ? utterance.text : utterance.displayText}
         {utterance.flags.length ? <small className={styles.flags}>{utterance.flags.map((flag) => FLAG_COPY[flag] ?? flag.replace("qualityGate:", "")).join(" · ")}</small> : null}
-        <VideoReference movieTime={movieTime} thumbnail={thumbnail} shotNumber={shotNumber} videoId={videoId} loading={timingLoading} />
+        <VideoReference movieTime={movieTime} ranges={movieTimeRanges} thumbnail={thumbnail} shotNumber={shotNumber} videoId={videoId} loading={timingLoading} />
       </span>
     </li>
   );
 }
 
 
-function VideoReference({ movieTime, thumbnail, shotNumber, videoId, loading }: {
+function VideoReference({ movieTime, ranges, thumbnail, shotNumber, videoId, loading }: {
   movieTime?: MovieTimeEstimate; thumbnail?: string; shotNumber?: number; videoId?: string; loading: boolean;
+  ranges?: MovieTimeRange[];
 }) {
+  if (!movieTime && ranges?.length) return <span className={styles.videoReference}>
+    <small className={styles.muted}>Partial video timing · line start unknown</small>
+    {ranges.map((range, index) => {
+      const label = `Video ≈ ${formatStamp(range.movieStartSeconds)}–${formatStamp(range.movieEndSeconds)}`;
+      return <small key={index} className={styles.videoTime} title={`Estimated from saved playback observations (±${range.uncertaintySeconds.toFixed(2)}s). No timing is inferred outside this audio range.`}>
+        {videoId ? <a href={`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&t=${Math.floor(range.movieStartSeconds)}s`} target="_blank" rel="noopener noreferrer">{label}</a> : label}
+        {` · audio ${formatStamp(range.recordingStartSeconds)}–${formatStamp(range.recordingEndSeconds)} only`}
+      </small>;
+    })}
+  </span>;
   if (!movieTime) return <small className={styles.muted}>{loading ? "Matching video time…" : "Video time unavailable"}</small>;
   const label = `Video ${movieTime.source === "humanCorrection" ? "" : "≈ "}${formatStamp(movieTime.movieSeconds)}`;
   return <span className={styles.videoReference}>

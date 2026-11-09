@@ -113,7 +113,7 @@ function RunBody({ run }: { run: ReviewTranscriptionRun }) {
   });
   const context = workspace.data?.runId === run.runId && workspace.data.sessionId === run.sessionId
     && workspace.data.revisionId === run.revisionId ? workspace.data : undefined;
-  const timedLines = new Map(context?.utterances.map((line) => [line.machine.utteranceId, line.movieTime]));
+  const timedLines = new Map(context?.utterances.map((line) => [line.machine.utteranceId, line]));
   const [showRaw, setShowRaw] = useState(false);
   const projected = run.utterances.some((utterance) => utterance.displayProjection && utterance.displayText !== utterance.text);
   const failedSegments = run.segments.filter((segment) => segment.state === "failed");
@@ -144,12 +144,14 @@ function RunBody({ run }: { run: ReviewTranscriptionRun }) {
           </div>
           <ol className={styles.utterances}>
             {run.utterances.map((utterance) => {
-              const movieTime = timedLines.get(utterance.utteranceId);
+              const timing = timedLines.get(utterance.utteranceId);
+              const movieTime = timing?.movieTime;
               const seconds = movieTime?.movieSeconds;
               const cut = seconds !== undefined && Number.isFinite(seconds) && seconds >= 0
                 ? context?.cuts.find((shot) => shot.movieInSeconds <= seconds && seconds < shot.movieOutSeconds) : undefined;
               return <UtteranceLine key={utterance.utteranceId} utterance={utterance} showRaw={showRaw}
                 movieTime={movieTime && Number.isFinite(movieTime.movieSeconds) && movieTime.movieSeconds >= 0 ? movieTime : undefined}
+                movieTimeRanges={timing?.movieTimeRanges}
                 thumbnail={cut ? client.projectAssetThumbnailUrl(run.projectId, cut.assetId) : undefined}
                 shotNumber={cut ? cut.position + 1 : undefined}
                 videoId={target.data?.youtube.videoId ?? undefined} timingLoading={workspace.isPending} />;

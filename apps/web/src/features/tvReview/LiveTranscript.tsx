@@ -44,7 +44,7 @@ export function LiveTranscriptPanel({ data, projectId, videoId, recording = fals
       if (el && el.scrollHeight - el.clientHeight - el.scrollTop > 48) setFollowing(false);
     }}>
       {data.lines.map((line) => <UtteranceLine key={line.utterance.utteranceId} utterance={line.utterance} showRaw={false}
-        movieTime={line.movieTime ?? undefined} thumbnail={line.assetId ? client.projectAssetThumbnailUrl(projectId, line.assetId) : undefined}
+        movieTime={line.movieTime ?? undefined} movieTimeRanges={line.movieTimeRanges} thumbnail={line.assetId ? client.projectAssetThumbnailUrl(projectId, line.assetId) : undefined}
         shotNumber={line.shotNumber ?? undefined} videoId={videoId} timingLoading={false} />)}
     </ol> : <p className={styles.muted}>{refining ? "Waiting for the full transcript…" : "Waiting for live text…"}</p>}
   </Panel>;

@@ -14,7 +14,7 @@ import { microphoneConstraints, type CaptureStatus } from "./recording/recorder"
 import { PendingRecoveries, targetTitle, useVoiceDeps, type VoiceDeps } from "./shared";
 import styles from "./TvReview.module.css";
 import { LiveTranscriptPanel, useLiveTranscript } from "./LiveTranscript";
-import { YouTubePlayer } from "./YouTubePlayer";
+import { YouTubePlayer, type YouTubePlayerHandle } from "./YouTubePlayer";
 
 type Phase = "setup" | "starting" | "recording" | "stopping" | "queued";
 type Recording = Awaited<ReturnType<VoiceDeps["startRecording"]>>;
@@ -40,6 +40,7 @@ export function RecordPage() {
   const [error, setError] = useState<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const recording = useRef<Recording | null>(null);
+  const player = useRef<YouTubePlayerHandle | null>(null);
   const microphone = useRef<MediaStream | null>(null);
   const micRequest = useRef(0);
   const liveTranscript = useLiveTranscript(projectId, activeSessionId ?? "");
@@ -134,6 +135,8 @@ export function RecordPage() {
   async function stop() {
     const active = recording.current;
     if (!active) return;
+    // Capture a fresh endpoint while the microphone clock is still running.
+    player.current?.sample();
     setPhase("stopping");
     const result = await active.stop("stopped");
     recording.current = null;
@@ -205,7 +208,7 @@ export function RecordPage() {
         )}
 
         {playMode && detail.youtube.videoId ? <>
-          <YouTubePlayer videoId={detail.youtube.videoId} recording={phase === "recording"} onObservation={(position, state, rate, time) => recording.current?.observePlayback(position, state, rate, time)} />
+          <YouTubePlayer ref={player} videoId={detail.youtube.videoId} recording={phase === "recording"} captureReady={(status?.capturedFrames ?? 0) > 0} onObservation={(position, state, rate, time) => recording.current?.observePlayback(position, state, rate, time)} />
         </> : playMode ? <Notice tone="warning">This review has no YouTube video. Return to the cut and use Record review.</Notice> : null}
       </div>
       {liveEnabled ? <aside className={styles.recordTranscript} aria-label="Recording transcript">

@@ -164,6 +164,84 @@ fn calibrated_player_observations_use_shared_mapping_without_extrapolation() {
 }
 
 #[test]
+fn partial_video_timing_is_visible_without_inventing_an_utterance_start() {
+    let f = fixture(false, true);
+    calibration_event(&f, "calibration", 0, 0);
+    // The first utterance starts before the first player sample and ends
+    // after the last, exactly like a single long cloud-transcribed line.
+    player_event(&f, "player_a", 2.0, 1.0, 1, 1.0);
+    player_event(&f, "player_b", 3.0, 2.0, 1, 1.0);
+    player_event(&f, "player_c", 5.0, 4.0, 1, 1.0);
+    let w = workspace(&f);
+    let first = &w.utterances[0];
+    assert!(first.movie_time.is_none());
+    assert_eq!(first.sync.state, "mixed");
+    assert_eq!(first.sync.slices.first().unwrap().state, SyncState::Unknown);
+    assert_eq!(first.sync.slices.last().unwrap().state, SyncState::Unknown);
+    assert_eq!(first.movie_time_ranges.len(), 1);
+    let span = &first.movie_time_ranges[0];
+    assert_eq!(span.recording_start_seconds, 2.0);
+    assert_eq!(span.recording_end_seconds, 5.0);
+    assert!((span.movie_start_seconds - 1.0).abs() < 0.01);
+    assert!((span.movie_end_seconds - 4.0).abs() < 0.01);
+    assert_eq!(span.evidence_ids, vec!["player_a", "player_b", "player_c"]);
+    assert!(
+        w.utterances[1..]
+            .iter()
+            .all(|u| u.movie_time_ranges.is_empty())
+    );
+    // A reviewer clearing a locator still takes precedence over projections.
+    let run_id = w.run_id;
+    let utterance_id = first.machine.utterance_id.clone();
+    let corrected = f
+        .catalog
+        .review_discussions()
+        .correct_utterance(
+            PROJECT,
+            &run_id,
+            &utterance_id,
+            "movieTime",
+            serde_json::Value::Null,
+            None,
+            &crate::ReviewActor {
+                actor: crate::review_targets::tests::actor(),
+                may_assert_human: true,
+            },
+        )
+        .unwrap();
+    assert!(corrected.utterances[0].movie_time.is_none());
+    assert!(corrected.utterances[0].movie_time_ranges.is_empty());
+}
+
+#[test]
+fn partial_video_ranges_do_not_bridge_a_pause() {
+    let f = fixture(false, true);
+    calibration_event(&f, "calibration", 0, 0);
+    player_event(&f, "player_a", 2.0, 1.0, 1, 1.0);
+    player_event(&f, "player_b", 2.5, 1.5, 1, 1.0);
+    player_event(&f, "paused", 3.0, 2.0, 2, 1.0);
+    player_event(&f, "player_c", 4.0, 2.0, 1, 1.0);
+    player_event(&f, "player_d", 5.0, 3.0, 1, 1.0);
+    let w = workspace(&f);
+    let spans = &w.utterances[0].movie_time_ranges;
+    assert_eq!(spans.len(), 2);
+    assert_eq!(
+        (
+            spans[0].recording_start_seconds,
+            spans[0].recording_end_seconds
+        ),
+        (2.0, 2.5)
+    );
+    assert_eq!(
+        (
+            spans[1].recording_start_seconds,
+            spans[1].recording_end_seconds
+        ),
+        (4.0, 5.0)
+    );
+}
+
+#[test]
 fn player_observations_without_calibration_do_not_invent_movie_time() {
     let f = fixture(false, true);
     player_event(&f, "player_a", 0.5, 0.0, 1, 1.0);
@@ -171,6 +249,7 @@ fn player_observations_without_calibration_do_not_invent_movie_time() {
     let w = workspace(&f);
     assert_eq!(w.sync.status, "pending");
     assert!(w.utterances.iter().all(|u| u.movie_time.is_none()));
+    assert!(w.utterances.iter().all(|u| u.movie_time_ranges.is_empty()));
 }
 
 #[test]

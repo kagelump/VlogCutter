@@ -327,6 +327,24 @@ test("an unmapped transcript line does not borrow a nearby video time or thumbna
   expect(screen.queryByRole("link", { name: /^Video/ })).toBeNull();
 });
 
+test("a long transcript line shows known video ranges when its beginning is unobserved", async () => {
+  const mapped = workspace();
+  mapped.utterances[0].movieTimeRanges = [{ recordingStartSeconds: 4.032, recordingEndSeconds: 29.034,
+    movieStartSeconds: 7.032, movieEndSeconds: 32.031, uncertaintySeconds: 0.385, evidenceIds: ["pa", "pb"] }];
+  renderApp("/projects/p1/reviews/rtarget_one/sessions/rsession_1", {
+    ...targetsClient,
+    getReviewSession: vi.fn().mockResolvedValue({ ...session, state: "completed" }),
+    listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [run()] }),
+    getReviewWorkspace: vi.fn().mockResolvedValue(mapped),
+    getReviewTarget: vi.fn().mockResolvedValue({ ...target, youtube: { ...target.youtube, videoId: "dQw4w9WgXcQ" } }),
+  });
+  expect(await screen.findByText("Partial video timing · line start unknown")).toBeVisible();
+  expect(screen.getByRole("link", { name: "Video ≈ 0:07.0–0:32.0" })).toHaveAttribute("href", "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=7s");
+  expect(screen.getByText(/audio 0:04.0–0:29.0 only/)).toBeVisible();
+  expect(screen.queryByText("Video time unavailable")).toBeNull();
+  expect(screen.queryByRole("img")).toBeNull();
+});
+
 test("named cuts appear in the review list with revision identity as secondary text", async () => {
   renderApp("/projects/p1/reviews", { ...targetsClient, listReviewTargets: vi.fn().mockResolvedValue({ items: [{ ...target, displayName: "RC7" }], nextBefore: null }) });
   expect(await screen.findByRole("link", { name: /RC7/ })).toBeVisible();
@@ -349,6 +367,7 @@ const liveDraft = {
   sync: workspace().sync, processedSeconds: 4, receivedSeconds: 6, revision: 1, finalRunId: null, errorCode: null,
   lines: [{ utterance: { ...run().utterances[0], text: "Live provisional words", displayText: "Live provisional words" },
     movieTime: { movieSeconds: 1.5, uncertaintySeconds: 0.25, source: "sharedSync:estimated", evidenceIds: ["pa", "pb"] },
+    movieTimeRanges: [],
     assetId: "asset_repeated", shotNumber: 1 }],
 };
 

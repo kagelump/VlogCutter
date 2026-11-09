@@ -486,7 +486,7 @@ export interface LiveReviewTranscript {
   revision: number;
   finalRunId: string | null;
   errorCode: string | null;
-  lines: { utterance: ReviewUtterance; movieTime: MovieTimeEstimate | null; assetId: string | null; shotNumber: number | null }[];
+  lines: { utterance: ReviewUtterance; movieTime: MovieTimeEstimate | null; movieTimeRanges: MovieTimeRange[]; assetId: string | null; shotNumber: number | null }[];
 }
 
 export type ReviewTranscriptionBackend = "local" | "openrouter";
@@ -579,6 +579,16 @@ export type DecisionAction = "accepted" | "declined" | "deferred";
 /** Utterance-start locator: a human declaration or the shared synchronizer's first slice. */
 export interface MovieTimeEstimate { movieSeconds: number; uncertaintySeconds: number; source: string; evidenceIds: string[] }
 
+/** Measured playback span, which may cover only part of an utterance. */
+export interface MovieTimeRange {
+  recordingStartSeconds: number;
+  recordingEndSeconds: number;
+  movieStartSeconds: number;
+  movieEndSeconds: number;
+  uncertaintySeconds: number;
+  evidenceIds: string[];
+}
+
 /** One slice of the shared synchronizer (`rcdvlog_core::tv_review_sync`) result. */
 export interface SyncSlice {
   recording: { clockId: string; startSample: number; endSample: number };
@@ -609,6 +619,7 @@ export interface WorkspaceUtterance {
   language: string;
   excluded: boolean;
   movieTime: MovieTimeEstimate | null;
+  movieTimeRanges: MovieTimeRange[];
   sync: UtteranceSync;
   candidateOperationIds: string[];
   referenceHint: string | null;
