@@ -1,19 +1,333 @@
-# Analysis request accounting: admission and receipt reconciliation
+# Paid analysis: run policy, accounting and native speech
 
-This document describes the canonical persistence foundation and the runtime
-integrations added for issue #122. The authorized run-policy pilot, bulk
+Paid (cloud) analysis is fail-closed: a concrete `RunPolicy` is described, authorized and piloted before bulk work, and every provider request is admitted, dispatched and settled through one canonical SQLite accounting owner. Part 1 is the policy lifecycle and CLI; Part 2 is request accounting, recovery and native speech.
+
+## Part 1: Run policy, authorization and pilots
+
+A fail-closed preflight sits around paid analysis work. The policy
+materializes what a proposed run would do; authorization and pilot observations
+are separate records bound to that exact policy.
+
+### Lifecycle
+
+The lifecycle below describes existing VLM CLI/desktop batches. The bounded
+native speech pilot is described separately below; native bulk and CLI/desktop
+selection are not yet available.
+
+Existing explicit CLI/desktop batch invocations remain usable: the core treats
+that invocation as approval intent, materializes the exact concrete policy,
+records authorization, runs the bounded pilot, and only then starts bulk work.
+That automatic materialization is still one exact policy; it never turns a
+single-asset/sample result into project-wide or different-model authorization.
+
+1. **Describe** re-reads canonical SQLite ownership and source identity and
+   emits one `RunPolicy` containing:
+   - project ID and the exact project-owned asset IDs;
+   - original source fingerprints, durations, representation fingerprints,
+     sampled representation fingerprints, transcript fingerprints and the
+     time-mapping identity;
+   - explicit provider, primary model, complete model allowlist and permitted
+     fallbacks;
+   - payload selection (`frames`, `frames-and-transcript`, and explicit
+     audio/transcript choices that currently fail readiness);
+   - explicit prompt context: whether the exact current project vocabulary is
+     attached, with its digest/count, and an explicit absence record for trip
+     context. Frames-only requests never read or transmit a transcript, and the
+     batch/pilot runners load vocabulary only when this approval is present;
+   - expected cost, requested ceiling, cost basis and bounded readiness
+     blockers;
+   - prompt, output-schema, recipe and tool versions;
+   - a deterministic provider cost-bound contract fingerprint over the exact
+     registered context, completion and provider price ceilings used for
+     admission and wire routing.
+
+   Description is read-only and never resolves a key into the output. It may
+   report only `credentialsPresent: true|false`.
+
+2. **Authorize** re-materializes the policy, refuses any unsupported capability,
+   source-readiness or budget problem, and stores the complete policy JSON under
+   its content-addressed `policyId`. This is approval of scope/model/payload/
+   budget. It is not a provider capability observation and performs no network
+   request.
+
+3. **Pilot** requires the exact authorization row. Local frame extraction uses
+   the shared cancellable local-heavy lease, and cancellation is checked again
+   immediately before transmission, so a pre-transmission cancel makes zero
+   provider calls. It runs at most one bounded provider request against the
+   first exact scoped asset, using the real frame pack or editorial source-time
+   contract for the selected policy. The response is first parsed, then checked
+   against the configured JSON Schema, then checked by the existing
+   domain/source-time semantics. Only a schema-valid and semantically valid
+   response with complete usage is `passed`. A passed pilot is persisted as
+   **observed capability**, never as a promise of future availability, price or
+   semantic correctness.
+
+4. **Run** accepts only the stored `policyId`, re-materializes the policy, and
+   refuses to proceed unless the policy digest is unchanged and its pilot is
+   `passed`. The runner uses the policy's exact asset scope, model allowlist,
+   fallbacks and payload. Pilot cost is deducted from the same authorized
+   ceiling before bulk work begins.
+
+Any change to scope/source identity, model, allowlist/fallback, payload, budget,
+prompt/schema/recipe/tool versions, or static capability contract changes the
+policy digest. Transient credential/model presence and readiness do not change
+that digest.
+Old approvals and pilots therefore stop matching and cannot be reused for a
+broader or altered batch.
+
+### Exact failed-asset recovery
+
+For a completed paid request whose domain response was rejected, recover only
+the exact failed asset by creating a new policy scoped to that asset and an
+explicitly approved healthy primary model/allowlist. Use the same Preflight →
+Authorize → Pilot → Run lifecycle. A same-policy rerun does not resend the
+rejected paid response, and the ordinary Analyze Missing path continues to treat
+that result as present. The authorized runner admits the rejected result as
+pending only when its requested primary model differs from the model that
+produced the rejection; successful observations remain current and are reused.
+
+An old reserved, dispatched, or uncertain request for that source blocks a
+replacement policy. Let dispatched work finish, then reconcile its receipt and
+authorize any exact retry under the existing accounting recovery flow before
+creating the replacement policy. The old policy's confirmed and unknown spend
+remain in its canonical ledger; a changed model allowlist does not clear it.
+
+### SQLite provenance
+
+Migration 37 adds:
+
+- `analysis_run_authorizations(policy_id, project_id, policy_json, authorized_at)`
+- `analysis_run_pilots(policy_id, project_id, status, record_json, started_at, finished_at)`
+- `analysis_runs.policy_id`
+
+Pilot records contain only bounded provenance: status, requested/actual model,
+reported provider/generation IDs, attempted models, token counts, returned cost,
+usage-completeness, stable failure code, structural/semantic validation
+conclusions and a warning. VLM records contain no prompt/frame/transcript content.
+Native records may additionally retain one explicitly partial, bounded typed
+sample with accepted or review-required source-mapped candidates, plus local
+NoAudio/NoSpeech facts. Rejected text is discarded. Neither kind retains raw audio
+or response bodies, credentials, provider error text or absolute source paths.
+An interrupted or unknown-usage pilot is recorded as `uncertain` and blocks
+further provider calls until its receipt is reconciled. The operator inspects
+the immutable request/receipt/event history, imports trusted late receipt
+evidence, proves a marker-absent local failure, or explicitly retains an unknown
+outcome. Reconciliation can refresh the existing pilot projection but cannot
+invent a capability pass. An explicit retry flag alone cannot clear unknown
+spending; a separate durable authorization for that particular request and
+exact next epoch is required before one targeted paid dispatch. Retrying a fully
+accounted failed pilot retains its known cost within the same immutable policy
+ceiling.
+
+### Provider cost-bound contract
+
+This section describes the provider-side cost contract consumed by the canonical
+accounting owner. The full conservative bound is an input to durable
+atomic admission, not a confirmed charge. Cross-process reservations, append-only
+receipts and interrupted-request reconciliation are implemented in
+[Part 2: request accounting](#part-2-request-accounting-and-native-speech).
+
+For each registered OpenRouter model, the contract records:
+
+- the public model context window and maximum completion length;
+- routing ceilings in USD per million prompt/completion tokens, per image, and
+  per request. `max_price.request` is one request fee, never a cap on the total
+  request price;
+- the exact `max_tokens` value sent on the wire (currently 1,500).
+
+Public source evidence as of 2026-10-24 is the OpenRouter model metadata at
+`https://openrouter.ai/api/v1/models` and the provider-routing documentation at
+`https://github.com/OpenRouterTeam/docs/blob/main/guides/routing/provider-selection.mdx`.
+The context/completion limits come from that public metadata. The prompt and
+completion ceilings are explicit configured values at or above the highest
+public context-tier metadata; the image and request ceilings are also explicit
+configured routing limits. None of these are claims about current live prices.
+
+`openrouter_request_cost_bound` computes a conservative admission bound from the
+full model context window, that exact `max_tokens` value, the exact transmitted
+frame count, and the separate price components. The same numeric ceilings are
+sent to OpenRouter as `provider.max_price` with `require_parameters: true`.
+Routing ceilings are configured limits, not claims about current live prices.
+OpenRouter documents that `max_price` prevents a request from running when a
+provider at or below the ceiling is unavailable.
+
+The deterministic contract fingerprint is stored in `RunPolicy` and included in
+its policy ID, so changing a context, completion or price ceiling invalidates
+prior approvals rather than silently reusing them. Unregistered models and
+missing, non-finite, negative or internally inconsistent bounds fail closed
+before paid network I/O. The bound is only a reservation input: it is never
+presented as a confirmed provider charge. Provider adherence to routing
+metadata is assumed, arbitrary external invoice components are not controlled,
+and a returned charge above the bound is retained as confirmed provider evidence
+and durably stops further dispatch under that authority.
+
+### JSON Schema dependency
+
+Structural validation uses `jsonschema = 0.60.1` with
+`default-features = false`. The validator is built with the crate's `.offline()`
+retriever, so `$ref` resolution cannot fetch HTTP or filesystem resources.
+This version requires Rust 1.85 or newer; the repository is verified with the
+pinned Rust 1.97.1 toolchain. Existing small stable provider schema declarations
+remain in the Rust domain modules. Schemars was not added because generating
+schemas from Rust would not provide runtime validation and would replace stable
+contracts for no functional gain.
+
+Schema validity remains insufficient. The existing vision and moment domain
+validators enforce explicit source-time names, millisecond units, inspected-span
+containment, core/payoff ordering, frame-key grounding, dialogue-speech overlap
+and edit-profile bounds. The test suite includes a schema-valid moment response
+with inverted source times that the pilot refuses.
+
+### CLI
+
+```bash
+# Describe a policy. No credentials, network or writes.
+rcdvlog --catalog /absolute/project/catalog.sqlite3 analyze preflight \
+  --project <project-id> --asset <asset-a> --asset <asset-b> \
+  --provider openrouter --primary-model qwen/qwen3.7-flash \
+  --budget-usd 0.50 --payload frames-and-transcript
+
+# Persist explicit approval for that exact policy.
+rcdvlog ... analyze authorize ...same policy flags...  # add --project-vocabulary to approve vocabulary context
+
+# Run one bounded pilot.
+rcdvlog ... analyze pilot ...same policy flags...
+
+# Execute only the stored exact policy and matching passed pilot.
+rcdvlog ... analyze run --policy-id <policy-id>
+
+# Inspect and recover interrupted paid requests without network I/O.
+rcdvlog ... analyze accounting inspect --project <project-id>
+rcdvlog ... analyze accounting reconcile --project <project-id> \
+  --request <request-key> --receipt-file <path>
+rcdvlog ... analyze accounting retry-authorize --project <project-id> \
+  --request <request-key>
+rcdvlog ... analyze accounting targeted-retry-dispatch --project <project-id> \
+  --request <request-key> --expected-next-attempt-epoch <next> \
+  --payload-file <original-vlm-request.json>
+
+# Moment discovery uses the same lifetime:
+rcdvlog ... moments plan ...      # describe, includes runPolicy
+rcdvlog ... moments authorize ... # persist exact approval
+rcdvlog ... moments pilot ...     # bounded editorial/pilot request
+rcdvlog ... moments run --policy-id <policy-id>
+```
+
+The legacy `analyze missing`, `moments discover` and preparation paths remain
+available, but policy-bound execution is the canonical paid boundary and is the
+only path that carries a matching approval and pilot into bulk work.
+
+### Native speech proposal
+
+`AnalysisRunKind::NativeSpeechTranscription` / serialized
+`native_speech_transcription` is representable in the existing `RunPolicy`
+owner as a native cloud-speech choice. The common
+`RunPolicyRequest` provider/model/allowlist/budget/exact-asset fields remain
+authoritative; the native parameters carry only an optional lowercase ISO 639-1
+language, the supported `zdr`/`data_collection` data-policy fields, and `force`.
+The provider/model pair must resolve the exact registered native
+`openrouter` + `openai/whisper-1` audio-transcription contract. There is no
+default, chat-slug inference, fallback or extra allowlist, and native requests
+always canonicalize to the `audio` payload. Project vocabulary, transcripts,
+frames, prompts and trip context are never attached or bound by a native
+proposal. Unsupported provider routing such as `order`, `only`, `ignore` or
+`max_price`, and unknown parameter fields, fail during strict deserialization
+rather than being silently dropped.
+
+Describe reuses the existing ownership, excluded/duplicate, exact
+`RunAssetScope`, derived-proxy fingerprint, freshness and source-identity
+helpers. An offline original with a usable current derived proxy remains valid;
+a missing/stale proxy is blocked. The proposal binds the native endpoint/window/
+rate contract via `native_stt_cost_bound_contract_id()`, the shared Silero
+VAD/packing recipe, fixed protocol version labels, language, data policy, exact
+scope and budget. Its `recipeVersion` comes from the transcript owner's single
+`native_stt_transcript_recipe()` helper for a validated registered request: a
+`native-stt.transcript-recipe.v1:<blake3>` identity over the explicit
+provider/model, language, provider data policy, fixed temperature, registered
+endpoint/response/timestamp/input/window semantics, shared Silero VAD artifact,
+packing algorithm and native quality-recipe version. Budget, tariff and asset
+scope stay in the run-policy identity but not in the transcript cache recipe, so
+budget/scope approval changes do not create a false transcript-cache change.
+Quality or native protocol/config semantic changes do change the recipe and thus
+future approval identity. Invalid or unregistered proposals keep a stable
+`:unregistered` placeholder and their structured blockers; they never acquire a
+valid recipe, authorization or runtime capability. Historical native approval,
+receipt and accounting rows are not reset. Native expected cost uses the
+registered full-window duration
+tariff and the conservative pre-VAD source-duration window upper bound
+`floor(2 * duration_ms / 30_000) + 1`; it never uses the VLM reference clip
+estimate or constructs a fake audio request. The cost basis and warnings state
+that the external duration tariff is not a wire-enforced hard invoice cap and
+that above-bound or unknown usage remains owned by receipt settlement.
+
+Native policies authorize through the ordinary `authorize_run_policy`, which persists the exact policy before any run or budget row. Execution is covered under [Bounded native speech pilot](#bounded-native-speech-pilot): only the bounded core pilot is wired; native bulk, targeted retry and CLI/desktop selection are not. Existing VLM pilot/bulk/recovery entry points reject the native kind before local preparation, credentials or a provider call.
+
+### Boundaries and non-goals
+
+- Native cloud speech has a bounded core pilot only. It is not selectable from the CLI, desktop or preparation, and native bulk and targeted retry are not wired.
+- Concurrent atomic full-bound reservations, append-only receipt reconciliation
+  and explicit targeted retry are owned by the canonical catalog accounting.
+  No second general-purpose spend ledger, cloud scheduler or provider invoice
+  query is introduced.
+- The pilot is a synthetic/public-fixture capability check. It does not replace
+  human editorial review and it does not claim that a prompt bypasses external
+  approval review.
+- Original media and human-authored fields remain immutable. Pilot frame
+  extraction writes only to the managed project cache.
+
+Native speech cost proposals reserve a conservative pre-VAD upper bound for bulk speech windows plus one separate capability-pilot window. Each window reserves the full registered 30-second duration; pilot and bulk spending share the policy ceiling. Native approval and cache identity bind to the deterministic recipe above, and a read-only projection links each native transcript to its accounting request (see Part 2).
+
+### Bounded native speech pilot
+
+Core callers explicitly select `RunPolicyRequest::native_speech_transcription`
+and authorize that exact proposal before using
+`Catalog::run_native_speech_pilot` or its injected-transport/cancellation variant.
+The generic core pilot entrypoint routes an explicitly native kind to this path;
+it never converts native audio into a VLM request. Local/offline transcription
+remains the default, and these core APIs do not imply native CLI/desktop or bulk
+support.
+
+The pilot scans selected proxies with FFprobe and local Silero VAD, sends at most
+one 30-second packed speech window, and keeps a typed partial result under the
+existing pilot record. A passed native pilot observes protocol/source mapping
+with complete accounting usage; it is not a full-asset transcript or an accuracy
+claim. Candidates with insufficient confidence evidence remain explicitly
+review-required and unaccepted. Missing actual serving identities remain unknown.
+A different, unverified returned model identifier requires review rather than an
+assumed alias match. Requested broker and serving upstream are distinct fields.
+
+All selected sources with verified local NoAudio/NoSpeech facts produce
+`no_provider_required`, with no paid request and `capabilityObserved: false`.
+This does not unlock bulk. NoAudio requires no VAD model; successful VAD silence
+on an audio stream does. Native execution defers secure credential resolution
+until an actual speech transmission needs local transport preparation. Missing
+credentials/model files affect paid-pilot readiness and carry explicit
+remediation without changing the approved policy identity.
+
+Receipts settle before cached domain results and post-response cancellation.
+Unknown usage remains uncertain; repeated invocation, force or a generic retry
+flag cannot blindly resend prior native paid work. Receipt-only interruptions
+require explicit reconciliation and later targeted recovery support.
+
+Complete-clip assembly and native-transcript currentness are covered in Part 2. They add no bulk dispatch, targeted retry or CLI/desktop native selection.
+
+
+## Part 2: Request accounting and native speech
+
+This part describes the canonical persistence foundation and the runtime
+integrations for paid-request accounting. The authorized run-policy pilot, bulk
 observation, policy-bound moment discovery, chronology suggestions and label
 consolidation, including transport and domain-validation fallback, are wired
 through the accounted provider boundary. CLI inspection, typed reconciliation
 and explicitly authorized targeted retry are now thin adapters over the same
 canonical owner. Process-interruption recovery is verified with synthetic
-transports; no live OpenRouter/native acceptance is claimed by this slice.
+transports; no live OpenRouter/native acceptance is claimed.
 
 Native speech uses the same private admission -> prepare -> domain guard ->
 dispatch marker -> one send -> receipt lifecycle as VLM requests. The core now
 implements a bounded native capability pilot using selected proxy audio, local
 FFprobe/FFmpeg and standalone whisper-rs Silero VAD. Native bulk, targeted retry
-and CLI/desktop native selection remain separate follow-up work.
+and CLI/desktop native selection are not implemented.
 
 The pilot scans the explicitly authorized scope until the first speech asset and
 sends only its first bounded window. It stores that partial typed result in the
@@ -32,7 +346,7 @@ VAD. Provider credentials are resolved by the native transport only when speech
 reaches pre-dispatch preparation. Local preparation releases the heavy lease
 before cloud I/O and keeps source/speech claims through result persistence.
 
-## Native transcript provenance (C4B slice)
+### Native transcript provenance
 
 Migration 43 extends the existing canonical transcript owner with a nullable
 native-policy association and native quality-recipe identity, plus
@@ -75,7 +389,7 @@ unavailable. Public policy readiness checks only the VAD artifact and credential
 for paid native pilots; transient prerequisite presence does not change approval
 identity.
 
-## Canonical owner
+### Canonical owner
 
 The project SQLite catalog remains the single accounting owner. Migrations 38
 through 40 add child rows and the run accounting marker beneath the existing
@@ -98,11 +412,11 @@ There is no JSON ledger, second database, scheduler or competing paid balance.
 Existing run and pilot summaries remain historical evidence or projections, not
 independent live ceilings.
 
-## Published token estimates (schema 57)
+### Published token estimates (schema 57)
 
 The ledger can retain an explicitly registered published token tariff separately
 from a provider-reported charge. This is the accounting prerequisite for the
-direct-video transport in issue 176; it does not itself enable a native upload or
+direct-video transport; it does not itself enable a native upload or
 a new authorization path. Existing VLM and native-speech adapters keep their
 original receipt rules and reject a published token quote at their boundary.
 
@@ -154,7 +468,7 @@ fingerprints. Zero estimate totals are omitted from old projection JSON. Read-on
 schema-56 diagnostics use an absent estimate projection without migrating, while
 writable upgrades preserve existing accounting rows.
 
-## Required C call ordering
+### Required call ordering
 
 Before runtime creates the analysis run or pilot rows for a new attempt, C must
 call `Catalog::initialize_analysis_accounting_authority` with the project/policy
@@ -176,7 +490,7 @@ The authority API takes no request payload fingerprint and does not invent one.
 Request-specific model, source, run-ownership and payload checks are separate
 and happen in reservation.
 
-## C1 accounted pilot boundary
+### Accounted pilot boundary
 
 `analysis::accounting::AccountedVlmProvider` wraps exactly one provider
 transmission. Passing that wrapper into the existing `ProviderChain` means each
@@ -211,7 +525,7 @@ remains active/uncertain until supported reconciliation. An explicit retry for
 the same intended request requires the caller's consideration flag and a durable
 authorization for that exact prior request and next epoch.
 
-## C2 bulk observation runtime boundary
+### Bulk observation runtime boundary
 
 `Catalog::analyze_authorized_with_provider_and_workers` verifies the existing
 whole-policy authority before creating an accounted analysis run, then opens
@@ -245,7 +559,7 @@ count is capped at the authority's in-flight bound. Unresolved or interrupted
 usage blocks a later bulk run, and the same asset-level intended request cannot
 be blindly replayed merely by starting a new run.
 
-## C2 moment-discovery runtime boundary
+### Moment-discovery runtime boundary
 
 Policy-bound moment discovery verifies the same frozen authority before opening
 an accounted run. Its provider-injectable boundary rejects caller mismatch in
@@ -268,7 +582,7 @@ The unaccounted moment pipeline is compiled only under `#[cfg(test)]` for
 focused domain tests. Production entry points always supply an authorized policy
 and therefore cannot silently bypass the accounted boundary.
 
-## Strict admission and exposure bound
+### Strict admission and exposure bound
 
 Reservation runs in a SQLite `BEGIN IMMEDIATE` transaction. It revalidates the
 canonical project, policy authorization, requested provider, model allowlist,
@@ -280,13 +594,13 @@ committed = confirmed charges + active reservations + unresolved uncertainty
 
 The complete conservative provider-owned bound must fit the remaining ceiling.
 It is never clipped to available budget. At most four requests may be active per
-authority. This document does not claim a finite software dollar guarantee
+authority. This design does not claim a finite software dollar guarantee
 against arbitrary external provider invoice deviations: reservation is strict
 under the provider cost-bound contract assumptions. An external charge outside
 that contract remains an external fact that receipt reconciliation retains and
 exposes, never a reservation estimate.
 
-## Interruption and receipt settlement
+### Interruption and receipt settlement
 
 The durable dispatch marker is committed before transport I/O. Missing marker is
 the only local no-upload proof. Once the marker exists, a generic failure code,
@@ -314,7 +628,7 @@ An observed returned cost above the request bound is persisted honestly, stops
 further dispatch on the authority, and is never represented as a reservation or
 estimate.
 
-## Explicit retries and unknown outcomes
+### Explicit retries and unknown outcomes
 
 An exact request identity cannot be dispatched twice by default. A retry requires
 an explicit durable authorization event for the immediately prior request and
@@ -328,7 +642,7 @@ reconciliation for a crashed dispatched request. It retains uncertainty and does
 not mark the request as a local no-upload release. Reconciliation never
 automatically resends a potentially completed paid request.
 
-## Canonical aggregates
+### Canonical aggregates
 
 `Catalog::analysis_accounting_aggregate` is the whole-policy projection: it
 includes all operations and the frozen legacy evidence exactly once. The
@@ -352,7 +666,7 @@ event, so metadata-only enrichment cannot erase known usage or multiply tokens.
 The projection is not a second balance: run-policy state is updated from this
 canonical calculation.
 
-## Legacy evidence
+### Legacy evidence
 
 Authorizations created before migration 38 have an empty
 `accounting_contract` and require explicit reauthorization. Reauthorization
@@ -371,7 +685,7 @@ zero-charge proof. Original run and pilot history is preserved and frozen with
 the authority.
 
 
-## Compatibility with spending after an authority snapshot
+### Compatibility with spending after an authority snapshot
 
 Migration 40 extends the existing analysis-run owner with an accounting-contract
 marker. Every accounted pilot, bulk, moment and non-policy operation run sets
@@ -397,7 +711,7 @@ increase and a repeated observation adds nothing. Unknown zero-cost legacy work
 remains unknown; unreadable frozen pilot records retain their prior reserve.
 Direct evidence deletion is rejected while project-owned cleanup still cascades.
 
-## Non-policy operation authorities
+### Non-policy operation authorities
 
 Chronology suggestions and label consolidation are not RunPolicy-owned, so they
 use the same canonical authority machinery with a project/operation scope such as
@@ -437,7 +751,7 @@ reservations and uncertain-usage reserves. Actual provider/model/generation
 identity is read exclusively from receipt evidence; missing identity stays
 `None`/empty rather than being inferred from the requested route.
 
-## Operator recovery commands
+### Operator recovery commands
 
 The CLI exposes the canonical owner without a second ledger or scheduler:
 
@@ -530,20 +844,19 @@ boundary before the wire. Cancellation before the dispatch marker releases only
 the absent-marker reservation; after the wire, known receipts are retained and
 unknown usage remains uncertain.
 
-## Production transport call-site audit
+### Production transport call-site audit
 
 Every production paid path reaches a raw `VlmProvider::analyze` only through
 `AccountedVlmProvider`: run-policy pilots and bulk observation, bulk/authorized
 moment discovery, chronology suggestions, label consolidation and the new
 targeted-retry entry point. The moments unaccounted pipeline is compiled only
 under `#[cfg(test)]`; synthetic fake providers in domain unit tests are not
-production call sites. This slice adds no alternate network implementation or
+production call sites. This adds no alternate network implementation or
 credential/base-URL test flag.
 
-## Remaining acceptance boundary
+### Unverified
 
-The canonical implementation and offline process-interruption tests are
-complete for this slice. Live OpenRouter streaming/native interruption and
+The canonical implementation and offline process-interruption tests are in place. Live OpenRouter streaming/native interruption and
 provider-receipt retrieval are not claimed by these tests: receipt evidence is
 explicitly user-provided, and inspection/reconciliation never query or resend a
 potentially completed paid request. Any future adapter-specific batch helper
@@ -551,9 +864,9 @@ that reaches a paid transmission without a real owned run id, source/payload
 identity and whole-authority context must be wired through this owner before it
 can be a supported paid path.
 
-## Native STT audio reservation contract (B1, not wired)
+### Native STT audio reservation contract
 
-B1 adds one optional `AnalysisAudioCostBound` component to the existing
+The native contract adds one optional `AnalysisAudioCostBound` component to the existing
 `AnalysisRequestCostBound`. It carries the actual bounded speech-window duration,
 the conservative full-window billable-seconds maximum, and the approved
 duration rate in USD/second. Native audio bounds use zero prompt, completion and
@@ -584,11 +897,11 @@ hash input only; persisted request rows carry only the bounded content-free
 digest. Changed audio, language, model/provider policy, temperature, endpoint or
 window mapping changes the fingerprint. Production cloud selection, dispatch,
 CLI/desktop wiring and native retry recovery remain intentionally disconnected
-in this slice.
+here.
 
-## Native STT policy authorization (B2, superseded runtime blocker)
+### Native STT policy authorization
 
-B2 extends the existing `RunPolicy` owner with the explicit
+The native kind extends the existing `RunPolicy` owner with the explicit
 `native_speech_transcription` kind. A native proposal binds the exact scoped
 asset/source identities, provider-qualified native endpoint/model contract,
 optional language, supported `zdr`/`data_collection` provider policy, local
@@ -598,18 +911,9 @@ duration rate; before VAD runs, the window count is the conservative source
 duration upper bound `floor(2 * duration_ms / 30_000) + 1`. This estimate is not
 the VLM reference clip cost and is not a provider invoice cap.
 
-B2 originally kept the proposal blocked with
-`native_accounted_runtime_unavailable` and a failed
-`native_stt.accounted_runtime` capability. B3 supersedes that fact only because
-the shared accounted native request leaf now exists: real
-`Catalog::authorize_run_policy` can persist the exact native policy, and a
-caller can initialize the existing authority and create a real running
-accounted run before invoking the leaf. High-level native pilot/bulk
-orchestration is still absent, so `ready_for_pilot` remains false and an
-explicit native-pilot-unavailable warning is reported separately from
-provider/model authorization.
+Because the shared accounted native request leaf and bounded pilot exist, `authorize_run_policy` persists the exact native policy and a caller can initialize the authority and create a real running accounted run before invoking the leaf. Native bulk orchestration, targeted retry and CLI/desktop selection are not wired.
 
-## Native STT accounted pilot leaf (B3)
+### Native STT accounted pilot leaf
 
 `AccountedNativeSttProvider` owns exactly one explicitly supplied bounded
 `NativeSttAudioWindow` for an authorized native policy. It is restricted to the
@@ -656,14 +960,14 @@ or non-2xx response still returns a typed unusable outcome after its known
 charge is retained. Transport failure after the marker remains uncertain and is
 never automatically retried.
 
-Native targeted retry dispatch remains intentionally unwired in B3. Existing
+Native targeted retry dispatch remains intentionally unwired. Existing
 generic inspection/reconciliation can inspect and reconcile a native request,
 but the VLM targeted-retry wrapper rejects native policies and no high-level
 native retry parser/permit path exists yet. A default repeat of a completed or
 uncertain native request is fenced by the canonical stable intended-attempt key
 and cannot be forced merely by creating a new run.
 
-## Incomplete native speech checkpoints
+### Incomplete native speech checkpoints
 
 Native window recovery extends the existing transcript owner. Migration 45 adds
 an optional versioned window plan and its semantic fingerprint to
@@ -691,7 +995,7 @@ settled request require recovery; they are never ordinary cache misses authorizi
 a new upload. This persistence boundary does not enable bulk execution, targeted
 retry or native CLI/desktop selection.
 
-## Complete native clip assembly (C10 slice)
+### Complete native clip assembly
 
 A fully retained native checkpoint can now be assembled into the existing
 terminal transcript artifact without additional provider dispatch. The internal
@@ -715,7 +1019,7 @@ incomplete-checkpoint accessor returns `None` for terminal output. This does not
 enable native bulk, targeted retry, current terminal reuse or CLI/desktop
 selection.
 
-## Native transcript currentness
+### Native transcript currentness
 
 Generic missing preparation reuses native terminal evidence only after one
 canonical snapshot proves its frozen recipe, current selected proxy, complete
@@ -734,3 +1038,4 @@ replace native output through the existing claim and atomic writer. Aggregate
 coverage includes proved native terminal work; its compatibility `recipeKey`
 field describes the local recipe, while each artifact retains its actual recipe
 and provider provenance.
+

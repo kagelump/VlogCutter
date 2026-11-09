@@ -1,4 +1,8 @@
-# Edit-plan preview artifacts
+# Edit plan: preview artifacts and review bundles
+
+Verified preview renders (receipts, current-media verification) and the portable local bundles built from them. Previews are node-local evidence, not synced decisions. Building plans: [edit-plan.md](edit-plan.md). Review: [edit-plan-review.md](edit-plan-review.md).
+
+## Edit-plan preview artifacts
 
 `edit-plan preview` renders a local review movie without activating or changing
 the addressed edit-plan revision. Each invocation creates a distinct attempt
@@ -62,7 +66,7 @@ source/tool identity and full content hashes, assembles a fresh movie, and
 performs final full-movie decode and coverage validation. Reuse does not skip
 the fresh audio mix or final validation.
 
-## What the receipt measures
+### What the receipt measures
 
 The input identity records the recipe, revision and plan digest, requested
 preview size, current human-range constraint key, selected source and
@@ -80,7 +84,7 @@ last picture interval because AAC priming or padding may add an audio tail. That
 tail is not assigned a fictitious picture frame or added to the final cut's
 picture duration.
 
-## Explicit current-media verification
+### Explicit current-media verification
 
 Pass `--verify` to `edit-plan preview-status` to request fresh verification; on
 `preview-wait`, it requests verification after the attempt becomes terminal.
@@ -97,10 +101,80 @@ source-audio content parity, continuity, or editorial pacing. A stored receipt,
 path existence, or green technical verification is not a human editorial
 approval. These are derived, node-local catalog receipts, not synchronized
 project decisions.
-# RC6 local renderer compatibility
+### Local renderer compatibility
 
-The RC6 tool carries the existing full-range source normalization fix: the
+The current renderer carries the existing full-range source normalization fix: the
 scaler explicitly converts source pixels to TV range before H.264 encoding.
 Preview and segment recipes are version 2 (`tv-range`) so outputs and rate
 history from the earlier scaler cannot silently satisfy the changed recipe.
 Originals, proxies, declared source ranges and chronology facts are unchanged.
+
+
+## Local edit-plan review bundles
+
+`edit-plan bundle --input bundle.json` creates a portable, local review folder
+from one completed preview artifact. The core verifies the exact artifact and
+its current source/constraint identity before copying it. It accepts either a
+complete revision preview or a bounded cut neighborhood. It does not render,
+activate, change a revision, invoke a provider, or upload media.
+
+The request is capped by the CLI adapter and has this shape:
+
+```json
+{
+  "artifactId": "preview-artifact-id",
+  "outputDirectory": "/chosen/review-folder",
+  "name": "antarctica-rough-cut-r1",
+  "contactSheet": false,
+  "contextEvidenceId": null,
+  "pictureCoverage": null
+}
+```
+
+`outputDirectory` is the caller-selected parent directory. `name` is a stable
+portable folder component containing only ASCII letters, digits, `_` and `-`.
+The resulting folder contains `bundle-owner.json`, `movie.mp4`, `mapping.json`,
+`provenance.json`, `coverage.json`, `index.html`, and `manifest.json`. With `contactSheet: true`,
+bounded neighborhoods also contain three rendered frames per cut (start,
+middle, and end), up to 36, plus `contact-sheet.json`. Full-revision contact
+sheets are omitted because they have no bounded frame budget. Supplying a
+matching `contextEvidenceId` embeds the existing context evidence in the review
+index and packages its receipt-verified source frame images and playable audio
+files beside the movie; it adds no new inspection or provider work. Optional `pictureCoverage`
+embeds an inventory-based picture coverage report, and its revision must match
+the verified artifact. The caller may provide a canonical `inventoryAssetIds`
+scope when the project inventory contains non-footage placeholders.
+
+The copy is a full-byte copy whose BLAKE3 digest and length must match the
+verified preview receipt. A create-only ownership marker binds the folder to
+the artifact, output name, and request before any media is copied. Every file is
+create-only, and `manifest.json` is published last, after the other files have
+been synced. A later call can reuse
+an existing bundle only when the manifest names the same artifact and all
+listed file hashes and lengths still match. Existing unrelated folders, files,
+and damaged bundles are never replaced. If publication stops before the
+manifest, a later call takes the released directory lock, checks the ownership
+marker, rejects unrelated contents, and reuses only files whose bytes match the
+current verified receipts or deterministic bundle documents. The absent
+manifest marks the folder incomplete until publication finishes.
+
+`mapping.json` distinguishes the encoded movie clock from source clocks. Movie
+cut positions are derived from the verified output PTS and its declared time
+base/origin. Source in/out values and source stream clocks remain declared
+locators; preview resampling and frame holds do not establish exact source
+frame identity. Attached context evidence also contributes its measured 48 kHz
+audio mappings. Canonical selection metadata supplies chapter spans when
+available; the bundle does not invent chapter boundaries.
+
+The standalone `index.html` plays the copied rendered movie, lists cut IDs,
+source asset handles, source ranges, and movie ranges, and optionally includes
+the already-recorded context evidence. The movie's actual audio is preserved
+and playable. `coverage.json` carries the local review coverage report and its
+limitations. Coverage and technical verification are evidence, not human
+approval, word-completeness, continuity, or pacing certification.
+
+For a metadata-only web/TV review handoff, use
+[`edit-plan review-target-export`](tv-review.md). It exports a versioned
+allowlist after fresh verification; it does not send the local bundle's movie,
+source provenance or paths to a server.
+

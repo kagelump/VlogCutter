@@ -119,3 +119,28 @@ interrupts local I/O and stops new work, while already-dispatched uncertainty
 remains reserved. Optional provider-internal navigation is explicitly blocked
 until its actual endpoint/model/tier and bounded tool evidence are qualified.
 Generated/fake tests do not establish live capability or human listening quality.
+
+## Direct Gemini experiments (agent-run, not a product adapter)
+
+The application has no direct-Gemini adapter; do not change provider routing or
+fallback as part of an analysis run. For agent-run editorial experiments with an
+authorized key, the Google Gemini Developer API with native video input and an
+explicit `service_tier: flex` was far cheaper than an image-frame workflow
+through OpenRouter in a 2026-10 trial (estimates from published token rates, not
+invoices; sampling and request count also differed).
+
+- Read the key from the user's secret source (for example `~/.gemini.key`) and
+  send it only as an authentication header. Never put it in a URL, argv, prompt,
+  trace, catalog or project file; strip credentials and video bytes from logs.
+- Omit temperature, top-p and top-k for Gemini 3.5 Flash-Lite (ignored).
+- Ask for clock-string locators; validate parsing, duration bounds and event
+  meaning locally. Plausible timestamps can still point at the wrong scene, so
+  caption a short window blind and compare it to the claim, and route uncertain
+  results to human review. For long sources use short local clips and add
+  offsets in code.
+- Event discovery is retrieval, not final edit-boundary selection. Keep
+  atmospheric footage eligible, describe actions neutrally, and require playback
+  review for final selects.
+- Record model/version, endpoint, tier, token usage, estimated cost, latency,
+  failures, media/prompt identity and manual checks. Keep estimates distinct
+  from billed receipts.

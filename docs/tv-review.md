@@ -1,17 +1,22 @@
-# TV review target handoff v1 (#221)
+# TV review
 
-This is the first contract slice of #220, for cloud web implementation against
-synthetic data. It does not complete #221's authenticated server import/UI,
-#222 recording, #224 ASR, #223 synchronization or #227 soundtrack matching.
-It introduces no desktop recorder (#228).
+TV review lets a reviewer watch an exported rough cut on a TV (via YouTube), talk about it while Chrome on a laptop records the conversation, and turn that conversation into canonical edit-plan feedback. Everything here lives on the companion server (control catalog); the project catalog stays canonical and the server never writes it.
 
-The owning catalog exports a **path-free, immutable snapshot of derived review
-evidence** after fresh verification of a completed full preview. SQLite and
-`edit-plan feedback` remain canonical. The server may retain this snapshot and
-review-session evidence; it must not materialize these cuts as a competing edit
-plan, adopt a live SQLite/WAL file, or invent absent edit-plan history in a replica.
+## Pipeline and owners
 
-## Implemented local boundary
+| Stage | What it does | Doc |
+| --- | --- | --- |
+| Review target | Owning catalog exports a path-free, immutable, verified snapshot of a rendered cut; the server imports it | [below](#review-target-handoff-v1) |
+| Recording | Chrome records the reviewer's voice as private session evidence on the recording clock | [tv-review-recording.md](tv-review-recording.md) |
+| Transcription | Finalized recordings become timed utterances (local Whisper or native OpenRouter); live transcription gives provisional text | [tv-review-recording.md](tv-review-recording.md) |
+| Timing | Shared Rust clock mapper turns recording time into movie time from manual cues, acoustic markers and passive soundtrack matching | [tv-review-timing.md](tv-review-timing.md) |
+| Discussions | Utterances become grouped editorial discussions with explicit human decisions, exported as `edit-plan feedback record` payloads | [tv-review-discussions.md](tv-review-discussions.md) |
+| Open work | Unverified acceptance and planned work | [tv-review-future.md](tv-review-future.md) |
+
+Principles: SQLite and `edit-plan feedback` remain canonical; the server may retain the snapshot and review-session evidence but must not materialize these cuts as a competing edit plan, adopt a live SQLite/WAL file, or invent absent edit-plan history in a replica. No stage turns TV dialogue, a transcript, a sync candidate or an agent proposal into a human decision.
+
+## Review target handoff v1
+### Implemented local boundary
 
 ```bash
 rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan review-target-export \
@@ -39,8 +44,8 @@ Core owners:
 - [JSON Schema](contracts/review-target-v1.schema.json) (transport shape).
 - [Synthetic fixture](../core/rcdvlog-core/tests/fixtures/review-target/v1.json)
   and [fixture notes](../core/rcdvlog-core/tests/fixtures/review-target/README.md).
-- [Existing bundle](edit-plan-delivery.md), [preview receipts](edit-plan-preview-artifacts.md),
-  [canonical feedback](edit-plan-feedback.md), and [replica ownership](server/sync.md).
+- [Existing bundle](edit-plan-output.md#local-edit-plan-review-bundles), [preview receipts](edit-plan-output.md#edit-plan-preview-artifacts),
+  [canonical feedback](edit-plan-review.md#revision-bound-edit-plan-feedback), and [replica ownership](server/sync.md).
 
 Shared typed error codes are `review_target_unsupported_version`,
 `review_target_digest_mismatch`, `review_target_verification_expired`, and
@@ -55,7 +60,7 @@ null in Rust; producers emit all fields. JSON Schema describes this emitted
 shape. Do not widen v1 to accept arbitrary JSON metadata, paths or filenames.
 A new incompatible clock or mapping meaning requires a new version.
 
-## Identity, clocks and precision
+### Identity, clocks and precision
 
 The snapshot binds project, immutable revision, `viewedArtifactId`, plan and
 constraint digests, full rendered movie BLAKE3/byte length, movie clock and every
@@ -93,10 +98,10 @@ prevent a frame-accurate source-trim claim. `declaredAudio: null` means legacy
 linked-source semantics, `{"mode":"silent"}` explicitly silences that owner,
 and `{"mode":"source", ...}` retains independent placement/source/gain/fades.
 An audio declaration does not prove audible source presence or measured PCM
-alignment. For #227, decode the final mixed audio of the exact movie digest
+alignment. For passive soundtrack matching, decode the final mixed audio of the exact movie digest
 locally; never reconstruct its reference by concatenating picture sources.
 
-## Verification and import responsibility
+### Verification and import responsibility
 
 `verification` records when the owning host checked output bytes, source inputs,
 constraints and renderability, with a fully decoded output receipt. These checks
@@ -117,7 +122,7 @@ its observation time. New imports/sessions must fail preflight when required
 verification or availability is unresolved; retain historical sessions/evidence.
 
 The following is the **server integration contract**; the routes that
-implement it are described under [Server import](#server-import-implemented). Claude's implementation should use existing authenticated
+implement it are described under [Server import](#server-import). The server implementation uses existing authenticated
 HTTPS/CSRF/Host/Origin guards and the generated OpenAPI client:
 
 1. Accept metadata through a bounded explicit import/preflight, scoped to the
@@ -149,7 +154,7 @@ snapshot crosses the handoff boundary, privately and on explicit import. No
 movie, PCM, transcript, source clock metadata, filename, absolute path, tool path,
 free-text rationale or private real-project identifiers belong in cloud fixtures.
 
-## Server import (implemented)
+### Server import
 
 The companion server owner is
 [`review_targets.rs`](../core/rcdvlog-server/src/review_targets.rs) (control
@@ -216,9 +221,9 @@ Not exercised: real exported handoffs, HTTPS behind Caddy/Tailscale, or any
 YouTube/TV playback.
 
 Recording sessions bound to an imported target are described in
-[TV voice review recording](tv-voice-review-recording.md) (#222).
+[TV voice review recording](tv-review-recording.md).
 
-## Canonical feedback reconciliation
+### Canonical feedback reconciliation
 
 For a reviewed and corrected note, send the existing `RecordReviewNoteRequest`
 through `edit-plan feedback record` on the owning catalog. Carry exact project,
@@ -237,29 +242,7 @@ the existing `record` command has no idempotency-key parameter. Do not blindly
 replay it after a lost response. `propose`, `decide`, explicit `map`, and guarded
 `apply` retain their existing revisions, provenance and acceptance checks.
 
-## Validation split and next work
-
-Cloud CI uses only the synthetic fixture. It includes split/repeated sources,
-nonzero PTS origin, a container audio tail, explicit silence and independently
-timed sound. Mutations in Rust tests cover digest mismatch, version/field/size
-rejection, duplicates, gaps, overlaps, bad clocks, stale verification and unsafe
-IDs. A generated-media test renders/decode-verifies a movie, exports twice and
-refuses changed or missing bytes. A CLI process contract tests envelopes and
-preservation of immutable revisions.
-
-Real-project validation receipts and any audio stay outside Git. Record exact
-candidate commit, executable digest, revision/artifact/mapping/movie identities,
-commands, tool versions, measured errors, coverage and failures. Compare #223
-anchors to independent known times; label injected/cropped-reference tests
-separately from room/TV/microphone tests. Report unknowns and false matches.
-Synthetic mapping tests cannot establish browser capture, speaker ASR, real TV
-playback, acoustic delay or YouTube timing. No cloud PR existed at this handoff's
-initial inspection; validate each later candidate in an isolated worktree.
-
-Priority remains #221 import integration, then the shared #223 anchor mapper,
-then #227 final-mix matching. Do not duplicate the cloud web recorder or ASR.
-
-## Historical rendered-artifact review (separate contract)
+### Historical rendered-artifact review (separate contract)
 
 `edit-plan historical-review-target-export --artifact <id>` opens the catalog
 read-only and emits `HistoricalRenderedArtifactReview` version 1. Hashing uses
@@ -276,7 +259,7 @@ The `purpose: historicalRenderedArtifactReview` discriminator and different Rust
 DTO prevent parsing it as `ReviewTargetHandoff`. Importing it through the
 strict v1 route fails with `review_target_historical_contract`.
 
-### Server historical-review policy
+#### Server historical-review policy
 
 The companion server accepts this contract only through
 `POST /api/v1/projects/{projectId}/review-targets/historical/preflight` and
@@ -341,7 +324,7 @@ measured clock/mapping representation. Unknown renderer recipes are refused.
 This compatibility applies only to historical integrity review: fresh strict
 export still requires the current recipe and every existing verification guard.
 
-## Cut names
+### Cut names
 
 Both review export commands accept `--name RC7`. The optional top-level
 `displayName` is presentation metadata outside `target` and its digest. Imports
@@ -357,3 +340,4 @@ targets inherit the original name. Control migration 19 adds a nullable column
 and preserves existing review snapshots. Updated readers accept legacy exports;
 older readers that reject unknown fields must be upgraded before importing a
 named export.
+
