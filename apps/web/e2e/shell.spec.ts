@@ -342,3 +342,20 @@ test("Chrome imports a historical rendered-artifact review only with an acknowle
   await page.getByRole("link", { name: "TV reviews" }).first().click();
   await expect(page.getByRole("main").getByRole("listitem").filter({ hasText: "Cut historic" })).toContainText("Historical");
 });
+
+
+test("Chrome plays and seeks the attached CLI proxy through real byte ranges", async ({ page }) => {
+  await signIn(page, bootstrapCode(9));
+  await page.getByRole("link", { name: "Clips" }).first().click();
+  const video = page.locator("video");
+  await expect(video).toHaveAttribute("src", /\/assets\/asset_web_e2e\/proxy$/);
+  await expect(page.getByText("No preview", { exact: true })).toHaveCount(0);
+  await video.evaluate(async (element: HTMLVideoElement) => { element.muted = true; await element.play(); });
+  await expect.poll(() => video.evaluate((element: HTMLVideoElement) => element.currentTime)).toBeGreaterThan(0.1);
+  await video.evaluate((element: HTMLVideoElement) => { element.pause(); element.currentTime = 2.5; });
+  await expect.poll(() => video.evaluate((element: HTMLVideoElement) => element.seeking)).toBe(false);
+  expect(await video.evaluate((element: HTMLVideoElement) => ({time: element.currentTime, error: element.error?.code ?? null, width: element.videoWidth}))).toMatchObject({time: 2.5, error: null, width: 160});
+  const ranged = await page.evaluate(async (url) => { const r = await fetch(url, {headers: {Range: "bytes=4-15"}}); return {status:r.status, bytes:(await r.arrayBuffer()).byteLength, contentRange:r.headers.get("content-range")}; }, (await video.getAttribute("src"))!);
+  expect(ranged).toMatchObject({status:206, bytes:12});
+  expect(ranged.contentRange).toMatch(/^bytes 4-15\//);
+});

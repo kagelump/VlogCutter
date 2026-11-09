@@ -22,7 +22,8 @@ const state = join(fixture, "state");
 const temp = join(state, "tmp");
 const derived = join(fixture, "derived");
 const backup = join(fixture, "backup");
-for (const path of [temp, derived, backup]) mkdirSync(path, { recursive: true });
+const working = join(fixture, "working");
+for (const path of [temp, derived, backup, working]) mkdirSync(path, { recursive: true });
 
 const runtimeEnvironment = {
   ...process.env,
@@ -31,6 +32,7 @@ const runtimeEnvironment = {
   RCDVLOG_DERIVED_DIR: derived,
   RCDVLOG_BACKUP_DIR: backup,
   RCDVLOG_LISTEN_ADDR: listenAddress,
+  RCDVLOG_ATTACHED_PROJECT_ROOTS: working,
   RCDVLOG_WEB_DIR: join(repository, "apps/web/dist"),
   RCDVLOG_FFMPEG: "/usr/bin/true",
   RCDVLOG_FFPROBE: "/usr/bin/true",
@@ -57,7 +59,7 @@ if (seed.status !== 0) {
   throw new Error(`seed real web project fixture: ${seed.error ?? seed.stderr}`);
 }
 
-const bootstrapFiles = [1, 2, 3, 4, 5, 6, 7, 8].map((index) => bootstrapCodePath(listenAddress, index));
+const bootstrapFiles = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((index) => bootstrapCodePath(listenAddress, index));
 for (const bootstrapFile of bootstrapFiles) {
   rmSync(bootstrapFile, { force: true });
   const bootstrapLaunch = rustLaunch(process.env, "server", ["admin", "bootstrap", "create", "--output-file", bootstrapFile]);

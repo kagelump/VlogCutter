@@ -116,6 +116,7 @@ export interface ProjectReviewAsset extends ProjectAssetItem {
   materializedRevision: number;
   activeNoteRevisionId: string | null;
   noteRevisionCount: number;
+  localProxyAvailable: boolean;
   proxy: ReviewRepresentation | null;
   thumbnail: ReviewRepresentation | null;
   originalAvailability: NodeAvailabilityState | null;
@@ -669,6 +670,8 @@ export interface BrowserProjectClient extends ProjectClient {
   getProjectReviewAsset(projectId: string, assetId: string): Promise<ProjectReviewAsset>;
   /** Same-origin URL of the clip's project-local thumbnail; 404 when this server can't serve one. */
   projectAssetThumbnailUrl(projectId: string, assetId: string): string;
+  /** Authenticated same-origin streaming URL for an available attached CLI proxy. */
+  projectAssetProxyUrl(projectId: string, assetId: string): string;
   createReviewNote(projectId: string, assetId: string, text: string, baseRevision: number): Promise<ReviewMutationResult>;
   addReviewLabel(projectId: string, assetId: string, label: string, baseRevision: number): Promise<ReviewMutationResult>;
   removeReviewLabel(projectId: string, assetId: string, label: string, baseRevision: number): Promise<ReviewMutationResult>;

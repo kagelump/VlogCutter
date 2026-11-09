@@ -20,6 +20,7 @@ export function memoryVoice(overrides: Partial<VoiceDeps> = {}): VoiceDeps {
 /** Mount the real route table at `path` against a mocked client. Unlisted client I/O methods are absent; thumbnail URLs use the real builder. */
 export function renderApp(path: string, overrides: Partial<BrowserProjectClient> = {}, voice: VoiceDeps = memoryVoice()) {
   const client = {
+    projectAssetProxyUrl: (projectId: string, assetId: string) => new HttpProjectClient().projectAssetProxyUrl(projectId, assetId),
     projectAssetThumbnailUrl: (projectId: string, assetId: string) => new HttpProjectClient().projectAssetThumbnailUrl(projectId, assetId),
     getServerStatus: vi.fn().mockResolvedValue(readyStatus),
     getSession: vi.fn().mockResolvedValue({ authenticated: true, sessions: [] }),
