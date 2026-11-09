@@ -173,10 +173,9 @@ async function openSeededTarget(page: import("@playwright/test").Page, code: str
 async function startRecording(page: import("@playwright/test").Page) {
   await page.getByRole("link", { name: "Record review" }).click();
   await expect(page.getByRole("heading", { name: "Record review" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Record", exact: true })).toBeDisabled();
-  await page.getByRole("button", { name: "Allow microphone" }).click();
-  await expect(page.getByLabel("Input", { exact: true })).toBeVisible();
-  await page.getByLabel(/Everyone here knows/).check();
+
+  await expect(page.getByLabel("Microphone", { exact: true })).toBeVisible();
+
   await page.getByRole("button", { name: "Record", exact: true }).click();
   await expect(page.getByRole("status").filter({ hasText: /^Recording/ })).toBeVisible();
 }
@@ -205,12 +204,13 @@ test("Chrome records a fake-microphone voice review with a manual cue and reopen
   await page.getByRole("button", { name: "Check" }).click();
   await expect(page.getByText(/Speech models aren't installed on this server/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Transcribe" })).toHaveCount(0);
+  await page.route("**/review-transcription-models", route => route.fulfill({json:{items:[{id:"openai/whisper-1",name:"OpenAI: Whisper"}]}}));
   await page.getByRole("button", { name: "OpenRouter (cloud)" }).click();
+  await expect(page.getByLabel("OpenRouter model")).toHaveValue("openai/whisper-1");
   await page.getByRole("button", { name: "Check" }).click();
-  await expect(page.getByText(/may be sent to the provider/)).toBeVisible();
-  // A developer may have a key file even when the fixture clears the env key.
-  // Capture must never enable cloud execution without explicit consent.
-  await expect(page.getByRole("checkbox", { name: /Send this recording to OpenRouter/ })).not.toBeChecked();
+  await expect(page.getByRole("checkbox", {name:/Send this recording|Require zero data/})).toHaveCount(0);
+  await expect(page.getByLabel("Spending limit (USD)")).toHaveCount(0);
+  // This disposable server lacks VAD models, so it cannot dispatch cloud audio.
   await expect(page.getByRole("button", { name: "Transcribe", exact: true })).toHaveCount(0);
 
   const href = await page.getByRole("link", { name: "Download WAV" }).getAttribute("href");

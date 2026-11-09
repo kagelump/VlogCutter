@@ -56,6 +56,73 @@ pub struct UtteranceSync {
     pub uncovered_frames: u64,
 }
 
+/// Displayable measured spans, including spans later than an unknown line start.
+/// These are not utterance-start locators or word-level timestamps.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MovieTimeRange {
+    pub recording_start_seconds: f64,
+    pub recording_end_seconds: f64,
+    pub movie_start_seconds: f64,
+    pub movie_end_seconds: f64,
+    pub uncertainty_seconds: f64,
+    pub evidence_ids: Vec<String>,
+}
+
+impl UtteranceSync {
+    pub fn movie_time_ranges(
+        &self,
+        sample_rate: u32,
+        handoff: &ReviewTargetEvidence,
+    ) -> Vec<MovieTimeRange> {
+        use rcdvlog_core::tv_review_sync::SyncState;
+        let movie = &handoff.target().movie;
+        let tps = movie.time_base_denominator as f64 / movie.time_base_numerator as f64;
+        let mut ranges: Vec<MovieTimeRange> = Vec::new();
+        let mut previous: Option<&SyncSlice> = None;
+        for slice in &self.slices {
+            if !matches!(slice.state, SyncState::Anchored | SyncState::Estimated)
+                || slice.candidates.len() != 1
+            {
+                previous = None;
+                continue;
+            }
+            let candidate = &slice.candidates[0];
+            let range = MovieTimeRange {
+                recording_start_seconds: slice.recording.start_sample as f64
+                    / f64::from(sample_rate),
+                recording_end_seconds: slice.recording.end_sample as f64 / f64::from(sample_rate),
+                movie_start_seconds: (candidate.start_pts - movie.origin_pts as f64) / tps,
+                movie_end_seconds: (candidate.end_pts - movie.origin_pts as f64) / tps,
+                uncertainty_seconds: candidate.uncertainty_ticks as f64 / tps,
+                evidence_ids: candidate.evidence_ids.clone(),
+            };
+            // Coalesce only adjacent slices with a shared recording/movie
+            // endpoint. Never bridge an unknown/conflicting span or a seek.
+            let adjacent = previous.is_some_and(|p| {
+                p.recording.clock_id == slice.recording.clock_id
+                    && p.recording.end_sample == slice.recording.start_sample
+                    && (p.candidates[0].end_pts - candidate.start_pts).abs() < 1e-6
+            });
+            if adjacent {
+                let last = ranges.last_mut().expect("previous safe slice has a range");
+                last.recording_end_seconds = range.recording_end_seconds;
+                last.movie_end_seconds = range.movie_end_seconds;
+                last.uncertainty_seconds = last.uncertainty_seconds.max(range.uncertainty_seconds);
+                for id in range.evidence_ids {
+                    if !last.evidence_ids.contains(&id) {
+                        last.evidence_ids.push(id);
+                    }
+                }
+            } else {
+                ranges.push(range);
+            }
+            previous = Some(slice);
+        }
+        ranges
+    }
+}
+
 pub struct SessionSync {
     request: Option<SyncRequest>,
     clocks: Vec<CaptureClock>,

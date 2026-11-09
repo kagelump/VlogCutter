@@ -1,42 +1,40 @@
-# TV voice review recording and transcription
-
-Chrome records a reviewer's conversation while they watch a rough cut on a TV and stores it as **private session evidence** on the companion server, bound to one imported, immutable [review target](tv-review.md). Finalized recordings are then transcribed into timed utterances. Neither stage synchronizes to the movie or writes feedback; see [timing](tv-review-timing.md) and [discussions](tv-review-discussions.md).
-
-## Recording
+# TV voice review recording (#222)
 
 Chrome records a reviewer's conversation while they watch a rough cut on a TV,
 then stores it as **private session evidence** on the companion server. The
-recording is bound to one imported, immutable [review target](tv-review.md). Transcription, timing and feedback read this evidence later; see [Transcription](#transcription), [timing](tv-review-timing.md) and [discussions](tv-review-discussions.md).
+recording is bound to one imported, immutable [review target](tv-review.md)
+(#221). This feature does not transcribe (#224), synchronize (#223), or write
+feedback (#225). Those owners read this evidence later; see
+[TV review transcription](tv-review-recording.md#transcription).
 
 In **Record review** the TV plays on its own. In **Play + record review**, the page embeds the target’s declared YouTube video and records playback observations alongside the microphone.
 The only statement the page makes about the video is the reviewer's optional
 **manual cue** ("the first frame is showing now"), which is recorded as a
 declaration and not as measured sync.
 
-### Play + record review
+## Play + record review
 
-For a target with a YouTube ID, choose **Play + record review**, allow the microphone, acknowledge consent, and press Record. Press play in the embedded player after recording starts. Player position, state and playback rate are sampled every five seconds and on player state/rate changes; each observation retains its browser monotonic time, a contemporaneous microphone-clock pairing and clock epoch. Observations are durable session events and can be lost if local event storage fails (the recorder reports unsaved events). Pauses, buffering and seeks can make the mapping discontinuous. The observations are approximate and do not measure TV output latency or verify that the YouTube video matches the target. The existing synchronization pipeline does not yet consume these observations for automatic comment placement. An independent TV player is not observed.
+For a target with a YouTube ID, choose **Play + record review**, allow the browser’s microphone request, and press Record above the video. Press play in the embedded player after recording starts. Player position, state and playback rate are sampled as soon as both the player and microphone capture are ready, every five seconds thereafter, on player state/rate changes, and immediately before the user stops recording. Each observation retains its browser monotonic time, a contemporaneous microphone-clock pairing and clock epoch. Observations are durable session events and can be lost if local event storage fails (the recorder reports unsaved events). Pauses, buffering and seeks can make the mapping discontinuous. The observations are approximate and do not measure TV output latency or verify that the YouTube video matches the target. The shared synchronization pipeline uses valid playback observations to estimate comment positions and shot thumbnails; uncertainty and interruptions remain explicit. An independent TV player is not observed.
 
-### User flow
+## User flow
 
 *Projects → TV reviews → cut → Record review*:
 
 1. Open the target's YouTube video on the TV.
-2. Press **Allow microphone**. The browser asks for permission and nothing is
-   captured yet. Then pick the input device.
-3. Confirm that everyone present knows they are being recorded (required). If a
-   second speaker will be recorded, tick the separate opt-in disclosure.
-4. Press **Record**. The recorder shows `Recording <elapsed>`. The level meter
+2. The page requests microphone permission on load. Allow it in the browser,
+   then pick the input device. Recording begins only when you press Record;
+   blocked permission offers a retry button.
+3. Press **Record** above the player. There are no consent checkboxes. The recorder shows `Recording <elapsed>`. The level meter
    and upload counters update while you record.
-5. Optionally press **Mark start** (or `M`) when the first frame appears.
-6. Press **Stop**. The page flushes and uploads the tail and finalizes the
+4. Optionally press **Mark start** (or `M`) when the first frame appears.
+5. Press **Stop**. The page flushes and uploads the tail and finalizes the
    session, then opens the session page.
 
 Recording keeps running while the tab is in the background, as long as Chrome
 keeps the AudioContext alive. The target page lists every session for that
 exact target.
 
-### Capture and clock
+## Capture and clock
 
 - `getUserMedia` requests the device with `echoCancellation`,
   `noiseSuppression` and `autoGainControl` all off, and `channelCount` ideally 1.
@@ -102,7 +100,7 @@ calibration, not a measured ADC/acoustic delay. Slow (>500 ms), negative or
 invalid observations stay uncalibrated. Probes repeat every 30 s; suspend/resume
 records a discontinuity and starts a new clock identity. A consumer must retain
 these observations and reject incompatible epochs rather than reconstructing
-sample zero from request-start or packet arrival. TV alignment is the [synchronizer's](tv-review-timing.md)
+sample zero from request-start or packet arrival. TV alignment remains #223's
 job and has its own uncertainty.
 
 Stop waits for a same-port worklet acknowledgment containing its final frame,
@@ -111,7 +109,7 @@ finalizing. A timeout records `captureTailStatus: unknown`, ends as interrupted,
 and keeps the session incomplete; an arbitrary timer cannot certify the tail.
 Concurrent stop calls share the same completion.
 
-### Durability
+## Durability
 
 Each 2-second chunk is SHA-256 hashed and written to an IndexedDB **outbox**
 before any upload. The outbox has a 256 MiB cap. The uploader drains the outbox
@@ -155,7 +153,7 @@ replayed `eventId` must carry the identical payload (kind, frame,
 silently. A session is never finalized while audio or an event for it is still
 buffered in the browser.
 
-### Server owner and API
+## Server owner and API
 
 The server owner is [`review_sessions.rs`](../core/rcdvlog-server/src/review_sessions.rs)
 (control catalog migration 14). The adapter is
@@ -194,15 +192,64 @@ geolocation stay disabled. Session evidence is separate from source-asset
 transcripts and from canonical edit-plan revisions. The rendered movie is
 never touched.
 
+## Tests
 
-## Transcription
+- **Rust core** (`review_sessions_tests.rs`):
+  - complete recording with out-of-order and duplicate chunks, cue and WAV bytes
+  - gaps with a reported local overflow
+  - conflicting, overlapping, corrupt and oversized chunks
+  - a stored chunk modified after upload (marked corrupt)
+  - consent and readiness and the concurrency limit
+  - full event-payload idempotency, frame limits and unknown-tail evidence
+  - deletion tombstone
+  - abandoned-but-finalizable sessions
+- **HTTP**: auth, CSRF, the Permissions-Policy header, duplicate and corrupt
+  chunks, WAV streaming, 409 after deletion, and audit events.
+- **Vitest**:
+  - chunker rebasing, discontinuity gaps and stereo interleave
+  - SHA-256 vector
+  - outbox bound
+  - uploader backoff and permanent stop
+  - recovery finalization and the refusal to finalize while audio is buffered
+  - microphone permission on load, refusal and retry, cue keyboard shortcut,
+    queued stop
+  - incomplete session view and deletion
+- **Playwright with headless Chromium** against a real disposable server, using
+  Chrome's `--use-fake-device-for-media-stream` microphone:
+  - record, cue, stop, the completed session, a WAV of the expected length,
+    reopen, delete, and a 409 afterwards
+  - reload mid-recording, recover, and an `interrupted` finalization
 
-A finalized [recording](#recording) is transcribed into **timed utterances on the
-recording clock**. For provisional text during capture and automatic refinement,
-see [Live transcription](#live-transcription). The results are stored in
+## Manual real-device acceptance (not run)
+
+Run against the HTTPS deployment in desktop Chrome, with a real microphone and
+a real TV:
+
+1. Refuse the microphone permission, then allow it from site settings and retry.
+2. Record 10+ minutes while the TV plays. Use the manual cue on the first frame,
+   and let the tab go to the background for part of the time.
+3. Unplug a USB microphone mid-recording. Expect the session to end as
+   `deviceLost`, with the audio captured so far kept.
+4. Disable the network for 30 s mid-recording. Expect buffered chunks to upload
+   after reconnection.
+5. Close the tab mid-recording, reopen it, and use **Finish upload**.
+6. Fill the server disk to `RCDVLOG_MIN_FREE_BYTES`. Expect 507 retries with
+   the audio kept in the browser.
+7. Download the WAV and confirm it plays. Delete the session, and confirm that
+   the audio directory is gone and the tombstone remains.
+
+Record the browser version, device, sample rate the context actually used,
+applied processing flags, and any gaps. None of this was exercised in the
+cloud environment.
+
+# TV voice review transcription (#224)
+
+This page covers transcribing a finalized [voice review recording](tv-review-recording.md)
+into **timed utterances on the recording clock**. For provisional text during capture
+and automatic refinement, see [Live voice review transcription](tv-review-recording.md#live-voice-review-transcription). The results are stored in
 their own tables in the companion server's control catalog. They are never
 written into source-asset transcripts, project annotations, edit plans or
-canonical feedback. Movie time comes later, from the shared synchronizer;
+canonical feedback. Movie time comes later, from the shared synchronizer (#223);
 editing and export happen in [editorial discussions](tv-review-discussions.md).
 
 | | |
@@ -213,88 +260,60 @@ editing and export happen in [editorial discussions](tv-review-discussions.md).
 | Job | `review_session.transcribe.v1` on the existing durable job engine |
 | DTO | `review-transcript.v1` |
 
-### Backends and authorization
+## Backends and model selection
 
 | Backend | What runs | Requirements |
 | --- | --- | --- |
-| `local` | whisper.cpp large-v3-turbo q5_0 with Silero VAD, on this server | Both installed model files in `RCDVLOG_SPEECH_MODEL_DIR`, or the shared application model directory otherwise. **Models are never downloaded by a run.** The job takes the shared local-heavy filesystem lease, so it never overlaps proxy or hash work on the host. |
-| `openrouter` | Local Silero VAD, then one native `openai/whisper-1` request per speech window | All of: `cloudUploadAcknowledged: true`, an `authorizedMaxCostUsd` ceiling, an OpenRouter credential on the server, and a model registered in `NATIVE_STT_MODELS`. |
+| `local` | whisper.cpp large-v3-turbo q5_0 with local Silero VAD | Installed models in `RCDVLOG_SPEECH_MODEL_DIR`. Runs never download models and use the shared local-heavy lease. |
+| `openrouter` | Local Silero VAD, then the selected native transcription model | Installed VAD model, an OpenRouter credential and a model in the live native-transcription catalog. |
 
-Cloud runs follow these rules:
+`GET …/projects/{projectId}/review-transcription-models` reads OpenRouter's
+public models API, filtered to audio input, transcription output and the native
+`/audio/transcriptions` endpoint. The server caches metadata for five minutes.
+Models documented as incompatible with `verbose_json` are excluded. Provider
+format differences may still produce an error, which is displayed to the user.
+There is no provider or model fallback.
 
-- Provider data collection is always `deny`. Zero data retention is the
-  default in the UI.
-- There is **no provider or model fallback**. An unregistered model is
-  refused with 400.
+Choosing OpenRouter authorizes sending the recording. Standard provider
+retention is used and data collection remains `deny`. There are no upload/ZDR
+checkboxes, spending ceilings, admission reservations or budget checks in the
+review workflow. Legacy request fields remain accepted for saved-run
+compatibility but do not control cloud execution. This does not change the
+separate analysis workflow's cost-bound registry or accounting policy.
 
-Preflight (`POST …/review-sessions/{sessionId}/transcriptions/preflight`) never
-sends audio, loads a model or reads audio. It reports:
+Preflight checks finalized audio, installed models, provider credentials and
+model eligibility. It does not send audio or load a speech model. Its duration
+and segment counts describe the recording; costs are reported after execution.
 
-- **blockers**:
-  - `review_transcription_session_not_finalized`
-  - `review_transcription_no_audio`
-  - `review_transcription_local_model_unavailable`
-  - `review_transcription_cloud_not_authorized`
-  - `review_transcription_budget_required`
-  - `review_transcription_provider_unavailable`
-- **warnings**:
-  - `diarization_unavailable`
-  - `tv_dialogue_not_separated`
-  - `recording_has_gaps`
-  - `budget_below_worst_case`
-- **an estimate**: received audio, number of segments, a worst-case window
-  count, and the worst-case cost. Each 30 s window is reserved at its full
-  registered price, which is $0.003 for `openai/whisper-1`. The provider
-  endpoint has no wire-level price cap, which is why the server reserves.
+## Processing
 
-### Processing
+1. **Audio identity and attempts.** SHA-256 covers the recording format and
+   verified chunk identities. Local retries resume cached work. Every explicit
+   cloud retry creates a fresh immutable run, including after an unknown
+   response or a completed run. Concurrent submissions reuse matching active
+   work. Earlier attempts and their reported/unknown costs remain unchanged.
+2. **Segments.** Read only verified chunk files in contiguous received ranges,
+   in segments of at most ten minutes. Recording gaps are never bridged.
+   Downmix to mono and resample to 16 kHz with a Hann-windowed sinc low-pass.
+3. **Speech detection.** Local VAD packs only speech into at-most-30-second
+   windows. Coverage re-splitting handles missing language regions.
+4. **Window persistence.** Successful decoded windows are cached by run,
+   segment, window and fingerprint. Worker crash recovery reuses cached work.
+   Durable dispatch markers prevent duplicate background sends within a run;
+   they do not prevent an explicit retry from creating a new run.
+5. **Provider results and cost.** Preserve reported usage/cost, generation ID,
+   returned provider/model and latency independently of transcript usability.
+   Missing cost stays unknown and never blocks execution. The UI reports
+   known cost and the number of requests with unreported cost after execution.
+6. **Errors.** Keep HTTP status, bounded credential-redacted provider error
+   messages/codes and safe upstream details. Response validation errors include
+   input duration and provider duration/segment-end measurements. No raw
+   response body or audio is placed in errors. Strict timestamp bounds remain.
+7. **Cancellation and states.** Cancellation is checked between windows and
+   segments; completed evidence is kept. Terminal states are `completed`,
+   `noSpeech`, `partial`, `failed` and `cancelled`.
 
-1. **Audio identity.** The audio fingerprint is SHA-256 over the format plus
-   each chunk's sequence, frames and hash. A run is idempotent by
-   `(session, audio fingerprint, backend/provider/model/hint/ZDR, recipe)`:
-   - An identical request reuses its run.
-   - A completed run is returned as is.
-   - A failed, partial or cancelled run is re-queued with `attemptCount + 1`.
-2. **Segments.** Audio is read only from verified chunk files, inside
-   contiguous received ranges, in segments of at most 10 minutes. **Recording
-   gaps are never bridged.** Each segment is downmixed to mono and resampled
-   to 16 kHz with a Hann-windowed sinc low-pass. Unit tests check that
-   in-band tone survives and 15 kHz does not alias.
-3. **Speech detection.** The VAD gate runs first, and only speech is packed
-   into 30 s windows. If a mixed-language window loses a language's coverage,
-   its regions are decoded one by one. This is the same re-split rule the clip
-   pipeline uses.
-4. **Window cache.** Every decoded window is stored, keyed by `(run, segment,
-   window, window fingerprint)`. Retries and crash recovery reuse cached
-   windows, so **billable work is never repeated**.
-5. **Cloud ledger.** For each cloud window, one immediate transaction:
-   - checks committed spend plus the window's full reservation against the
-     ceiling
-   - inserts a `dispatched` marker
-
-   Only then is the request sent, and the response settles the window with
-   the provider-reported cost and provenance (generation id, actual provider
-   and actual model). If a response is lost or a process crashes after the
-   marker:
-   - the window becomes `unknown`
-   - it keeps counting at its reservation
-   - it is **never resent**
-   - its segment is failed with `review_transcription_dispatch_outcome_unknown`
-
-   Unsent reservations are released on recovery.
-6. **Budget exhaustion.** When the budget runs out, dispatch stops and the run
-   ends `partial` with `review_transcription_budget_exhausted`. A retry with a
-   new explicit ceiling resumes from the cached windows.
-7. **Cancellation.** It is checked between windows and segments, through
-   both the run flag and the job cancellation token. Completed work is kept.
-8. **Run states.** A run ends in one of:
-   - `completed`
-   - `noSpeech`: VAD found nothing and no model was called
-   - `partial`
-   - `failed`
-   - `cancelled`
-
-### Transcript DTO (`review-transcript.v1`)
+## Transcript DTO (`review-transcript.v1`)
 
 Each utterance carries:
 
@@ -326,44 +345,104 @@ Each utterance carries:
   conversation is not discarded for one bad window.
 
 Each run also carries its segments (with per-segment failures), the recording
-gaps, spend (authorized, reserved, known cost, unknown-cost windows),
+gaps, reported cost and unknown-cost request counts (legacy budget/reservation fields remain in the DTO for historical runs),
 `diarization: { status: "unavailable" }` and fixed limitations.
 
-### Speaker diarization
+## Speaker diarization
 
 **Not implemented, and deliberately not faked.** Whisper output is not speaker
 evidence. Every utterance is `unknown` until either:
 
 - a diarization backend is chosen and evaluated (for example pyannote via
   ONNX on the server, or a cloud diarization model), or
-- a human corrects it. That is part of the correction workflow.
+- a human corrects it. That is part of #225's correction workflow.
 
 Choosing a diarizer is an open decision because it brings model, runtime,
 cost and privacy trade-offs. Overlap, TV dialogue and background speakers
 must stay `unknown` or flagged under any backend.
 
-### Web
+## Web
 
-The session page has a **Transcript** panel. It offers:
+The Transcript panel provides backend selection, a live OpenRouter model
+dropdown, readiness checking, Transcribe and Cancel. Failed attempts display
+provider HTTP status, code, message and request ID when returned. Costs appear
+after execution as informational reported totals; there is no spending-limit
+input. History retains previous results and explicit retries show a new attempt.
 
-- the backend choice
-- for cloud: a ceiling, an explicit upload checkbox, and a ZDR checkbox
-- **Check**, showing blockers, warnings and the worst-case quote
-- **Transcribe**, **Resume / reuse** and **Cancel**, with polling while
-  queued or running
-- the utterance list, with Traditional display, raw text and a raw toggle,
-  `Speaker ?`, flags, quality-gated rows and per-segment failure lines
+## Tests
+
+Rust tests cover model discovery filtering, shared wire bounds, credential
+redaction, absence of budget/checkbox gates, alternate model execution,
+in-flight deduplication, fresh explicit retries, retained provider errors and
+costs, crash recovery, cancellation, gap handling and local transcript quality
+projections. HTTP tests retain authentication and CSRF checks. Vitest covers
+model selection, request shape, error display and informational costs. Chrome
+journeys use disposable catalogs and fake microphones; no provider upload is
+needed for those tests.
+
+## Not verified
+
+- Real Whisper or OpenRouter decoding of English/Mandarin code-switching
+  conversation.
+- Per-model WER or CER.
+- Any diarization accuracy.
+- Film dialogue behind reviewers, quiet passages, or real room audio.
+- Concurrent memory use next to proxy work on the server.
+
+The public two-speaker code-switching fixture the issue asks for is not in the
+repository. It needs a licensed recording, and should be chosen together with
+the diarization decision. Real-audio evaluation belongs to the local
+acceptance stage.
 
 
-## Live transcription
+## Historical failures
+
+Older failures that discarded their provider response/receipt cannot be
+reconstructed. They remain visible in history. A new explicit cloud attempt
+can now execute without being blocked by an earlier unknown outcome or cost.
+
+
+## Provider response compatibility
+
+Recognized returned language codes and full names are matched without case
+sensitivity. The shared native transcript preserves the exact provider value;
+review utterances use canonical codes (`English` → `en`). Unknown,
+missing or malformed language values are still rejected.
+
+For review requests using the three Whisper models, the sent derivative WAV
+is rounded up to Whisper's 20 ms timestamp grid by appending at most 19 ms of
+zero-valued samples. This handles a 14.150 s input whose last timestamp token
+ends at 14.160 s. Response validation still uses the exact duration of the
+actual sent WAV; no provider timestamps or source recording samples are
+rewritten. Recording-clock projection uses the original speech-window map,
+and padding-only spans are omitted. Successful window caches retain
+`input_padding_ms` alongside the original decoded endpoints. Registered
+source-analysis requests and other review models keep their original WAVs.
+
+The explicit `review_stt_repro` Rust example accepts a PCM16 WAV, model ID and
+new output directory. It uses the same resampler, VAD, packing and audio
+preparation as review capture, sends one native request and saves private
+response/audio files plus a body-free receipt in an owner-only directory:
+
+```sh
+RCDVLOG_SPEECH_MODEL_DIR=/absolute/model/directory \
+  cargo run -p rcdvlog-server-core --example review_stt_repro -- \
+  INPUT.wav openai/whisper-large-v3-turbo NEW_OUTPUT_DIRECTORY
+```
+
+It does not mutate a project catalog or retry the provider request. The checked-in
+regression fixtures preserve the reproduced provider's shape and numeric times,
+with private text and identifiers removed.
+
+# Live voice review transcription
 
 Play + record review combines the embedded video, microphone controls and a
 read-only live transcript. The regular Record review page can also show live
 words, with video matches only where its synchronization evidence supports them.
-The **Show live transcription and refine it automatically after recording**
+The **Live transcription**
 checkbox defaults on. Turning it off keeps the explicit post-recording workflow.
 
-### Model choice and setup
+## Model choice and setup
 
 The draft uses **multilingual Whisper Tiny** (`ggml-tiny.bin`, 39M parameters,
 about 75 MiB on disk), with Silero VAD and greedy CPU decoding on four threads.
@@ -391,7 +470,7 @@ startup never download models and never send microphone audio to a cloud.
 
 Upstream model information: [whisper.cpp models](https://github.com/ggml-org/whisper.cpp/blob/master/models/README.md).
 
-### Processing and persistence
+## Processing and persistence
 
 Control catalog migration 19 adds opt-in state and provisional utterance tables.
 The existing two-second PCM upload and durable audio/event outboxes stay the
@@ -423,7 +502,7 @@ before committing. A racing finalize/delete prevents draft publication. Expired
 recordings stop live work. Temporary live failures retain prior text and retry;
 model absence is shown honestly and does not stop capture.
 
-### Movie matching
+## Movie matching
 
 Draft utterances retain native recording-frame intervals. Every snapshot maps
 those intervals through `SessionSync` and the shared core synchronizer using the
@@ -431,6 +510,11 @@ same immutable review target, calibrated capture clocks, playback observations
 and discontinuity boundaries as the final transcript. New timing evidence can
 therefore update thumbnails even without new text. The matching shot is selected
 at the mapped utterance start, never at the time the ASR response arrived.
+The transcript displays shot thumbnails without timing captions. For a final
+line with an unknown start, the first safe `movieTimeRanges` span can supply a
+thumbnail linked to that observed video position; its hover hint identifies it
+as later observed playback rather than the line's beginning. The start locator
+and full timing diagnostics remain unchanged in the workspace data.
 
 No movie time or thumbnail is invented when timing is pending, conflicting or
 outside supported evidence. In particular, the current shared policy does not
@@ -438,7 +522,7 @@ extrapolate from one player observation, bridge a seek/pause, or estimate non-1x
 playback. Thumbnails represent catalog shots, not exact frames extracted from
 the YouTube embed. An independent TV still needs synchronization evidence.
 
-### Final pass and recovery
+## Final pass and recovery
 
 After audio and events finish uploading and the recorder finalizes, the worker
 enqueues the existing durable **local full-pass** job. The stored actor and
@@ -461,3 +545,24 @@ The response reports model availability, state, processed/received seconds,
 revision, final run ID, stable error code, sync policy/diagnostics and timed draft
 lines with shot matches.
 
+## Verification
+
+Focused Rust tests cover opt-in, overlap replacement, bounded backlog, gaps,
+silence, contention, cancellation, late sync evidence, deletion, final dispatch
+and restart/idempotency. Migration tests upgrade schema 18 and reopen twice.
+HTTP tests exercise auth, CSRF and the snapshot contract. Web interaction tests
+cover provisional rendering, changing matches, refinement and failure retention.
+The Chrome recording test also exercises live opt-in against a real server.
+
+Run real model acceptance explicitly with the installed models and a 16 kHz mono
+PCM16 public speech fixture (the upstream whisper.cpp `samples/jfk.wav` works):
+
+```sh
+RCDVLOG_SPEECH_MODEL_DIR=/absolute/model/directory \
+RCDVLOG_LIVE_TEST_WAV=/absolute/jfk.wav \
+  cargo test -p rcdvlog-server-core real_live_model_latency_and_full_pass -- --ignored --nocapture
+```
+
+This measures model load, 4/8/11-second draft updates and the final model pass.
+It is not a room-microphone, Mandarin accuracy, diarization or HTTPS deployment
+acceptance test. Those require an actual review recording on the deployed host.

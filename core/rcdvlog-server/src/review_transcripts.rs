@@ -15,10 +15,9 @@
 //!   conversation; flagged text is kept as evidence and marked suppressed.
 //! - Every decoded window is cached by `(run, segment, window, fingerprint)`.
 //!   A retry reuses it, so billable work is never repeated.
-//! - Cloud windows reserve their full worst-case price against the run's
-//!   authorized ceiling *before* a durable dispatch marker, and only then send.
-//!   An interrupted dispatch becomes `unknown`, keeps counting at its
-//!   reservation, and is never resent. No provider/model fallback exists.
+//! - Cloud dispatch markers avoid duplicate sends after a worker crash. Costs
+//!   are informational receipts after execution. Explicit cloud retries create
+//!   new runs; no spending or acknowledgement gate is applied.
 //! - Whisper output is not speaker evidence. Without a diarization backend
 //!   every utterance is `unknown` speaker and the transcript says so.
 use crate::{
@@ -28,12 +27,15 @@ use crate::{
 };
 use anyhow::{Context, anyhow};
 use chrono::{SecondsFormat, Utc};
+use rcdvlog_core::NativeSttProtocolError;
 use rcdvlog_core::review_speech::{DecodedSegment, RejectReason, reject_reason};
 use rcdvlog_core::review_speech::{
-    NATIVE_STT_MODELS, NativeSttAudioWindow, NativeSttCost, NativeSttOutcome,
-    NativeSttProviderPolicy, NativeSttRequest, NativeSttTransport, OPENROUTER_STT_PROVIDER,
-    OPENROUTER_WHISPER_MODEL, OpenRouterSttClient, SttDataCollection, resolve_native_stt_model,
-    validate_iso639_1,
+    NativeSttCost, NativeSttOutcome, NativeSttRequest, NativeSttTransport, OPENROUTER_STT_PROVIDER,
+    OPENROUTER_WHISPER_MODEL, OpenRouterSttClient,
+};
+use rcdvlog_core::review_speech::{
+    NativeSttModelChoice, NativeSttProviderError, canonical_native_stt_language,
+    discover_native_stt_models,
 };
 use rcdvlog_core::review_speech::{PackedWindow, SpeechRegion, pack_windows, translate_span};
 use rcdvlog_core::review_speech::{SttEngine, VAD_MODEL, WHISPER_MODEL};
@@ -79,6 +81,8 @@ pub enum ReviewTranscriptError {
     InvalidInput(String),
     #[error("transcription preflight failed")]
     NotReady(Vec<&'static str>),
+    #[error("OpenRouter transcription models could not be loaded")]
+    ModelsUnavailable,
     #[error("transcription request conflicts with an existing run")]
     Conflict,
     #[error(transparent)]
@@ -98,6 +102,7 @@ impl ReviewTranscriptError {
                 .copied()
                 .unwrap_or("review_transcription_not_ready"),
             Self::Conflict => "conflict",
+            Self::ModelsUnavailable => "review_transcription_models_unavailable",
             Self::Infrastructure(_) | Self::Database(_) => "internal_error",
         }
     }
@@ -116,16 +121,16 @@ pub enum ReviewTranscriptionBackend {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReviewTranscriptionRequest {
     pub backend: ReviewTranscriptionBackend,
-    /// Required for `openrouter`; must name a registered model.
+    /// For `openrouter`: a model from the native transcription catalog.
     #[serde(default)]
     pub model: Option<String>,
     /// Optional ISO 639-1 hint (cloud only). Omit for code-switching speech.
     #[serde(default)]
     pub language_hint: Option<String>,
-    /// Required for `openrouter`: the hard ceiling for this run, in USD.
+    /// Legacy request field, accepted for saved-run compatibility; no longer enforced.
     #[serde(default)]
     pub authorized_max_cost_usd: Option<f64>,
-    /// Required `true` for `openrouter`: private mic audio leaves this server.
+    /// Legacy request field; selecting OpenRouter authorizes upload.
     #[serde(default)]
     pub cloud_upload_acknowledged: bool,
     #[serde(default)]
@@ -288,6 +293,19 @@ pub struct ReviewTranscriptionRun {
     pub spend: ReviewTranscriptionSpend,
     pub diarization: ReviewDiarization,
     pub limitations: &'static [&'static str],
+    pub provider_errors: Vec<ReviewTranscriptionProviderError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewTranscriptionProviderError {
+    pub segment_index: u32,
+    pub window_index: u32,
+    pub protocol_code: String,
+    pub http_status: Option<u16>,
+    pub code: Option<String>,
+    pub message: String,
+    pub generation_id: Option<String>,
 }
 
 /// Model availability and transports, behind one seam so tests use fakes.
@@ -304,6 +322,12 @@ pub trait ReviewSpeechRuntime: Send + Sync {
     fn local_engine(&self) -> anyhow::Result<Box<dyn SttEngine>>;
     /// Local Silero VAD only, used to gate cloud requests.
     fn detect_speech(&self, pcm: &[f32]) -> anyhow::Result<Vec<SpeechRegion>>;
+    fn cloud_models(&self) -> anyhow::Result<Vec<NativeSttModelChoice>> {
+        Ok(vec![NativeSttModelChoice {
+            id: OPENROUTER_WHISPER_MODEL.into(),
+            name: "OpenAI: Whisper".into(),
+        }])
+    }
     fn cloud_credentials_present(&self) -> bool;
     fn cloud_transport(&self) -> anyhow::Result<Box<dyn NativeSttTransport>>;
 }
@@ -355,6 +379,9 @@ impl ReviewSpeechRuntime for ModelDirSpeechRuntime {
     fn detect_speech(&self, pcm: &[f32]) -> anyhow::Result<Vec<SpeechRegion>> {
         rcdvlog_core::review_speech::detect_silero_speech(&self.vad_path(), 4, pcm)
     }
+    fn cloud_models(&self) -> anyhow::Result<Vec<NativeSttModelChoice>> {
+        discover_native_stt_models()
+    }
     fn cloud_credentials_present(&self) -> bool {
         rcdvlog_core::review_speech::resolve_api_key().is_ok()
     }
@@ -388,8 +415,6 @@ fn usd(micro: i64) -> f64 {
 struct ResolvedRequest {
     provider: String,
     model: String,
-    price_micro_per_second: Option<u64>,
-    window_reservation_micro: Option<i64>,
 }
 
 fn resolve_request(
@@ -410,8 +435,6 @@ fn resolve_request(
             Ok(ResolvedRequest {
                 provider: "local".into(),
                 model: WHISPER_MODEL.file_name.into(),
-                price_micro_per_second: None,
-                window_reservation_micro: None,
             })
         }
         ReviewTranscriptionBackend::Openrouter => {
@@ -419,23 +442,11 @@ fn resolve_request(
                 .model
                 .clone()
                 .unwrap_or_else(|| OPENROUTER_WHISPER_MODEL.to_string());
-            let spec = resolve_native_stt_model(OPENROUTER_STT_PROVIDER, &model)
-                .map_err(|_| invalid("model is not a registered native transcription model"))?;
-            if let Some(language) = &request.language_hint {
-                validate_iso639_1(language).map_err(|e| invalid(e.to_string()))?;
-            }
-            if let Some(cap) = request.authorized_max_cost_usd
-                && (!cap.is_finite() || cap <= 0.0 || cap > 100.0)
-            {
-                return Err(invalid("authorizedMaxCostUsd must be in (0, 100]"));
-            }
-            let per_second = spec.duration_price_micro_usd_per_second;
-            let window_seconds = u64::from(spec.max_window_ms).div_ceil(1000);
+            NativeSttRequest::for_discovered_model(model.clone(), request.language_hint.clone())
+                .map_err(|_| invalid("invalid native transcription model or language"))?;
             Ok(ResolvedRequest {
                 provider: OPENROUTER_STT_PROVIDER.into(),
                 model,
-                price_micro_per_second: Some(per_second),
-                window_reservation_micro: Some((per_second * window_seconds) as i64),
             })
         }
     }
@@ -445,15 +456,19 @@ fn settings_fingerprint(
     request: &ReviewTranscriptionRequest,
     resolved: &ResolvedRequest,
 ) -> String {
-    let document = serde_json::json!({
+    let mut document = serde_json::json!({
         "recipe": REVIEW_TRANSCRIBE_RECIPE,
         "backend": request.backend,
         "provider": resolved.provider,
         "model": resolved.model,
         "languageHint": request.language_hint,
-        "zeroDataRetention": request.zero_data_retention,
-        "contract": NATIVE_STT_MODELS.iter().map(|m| (m.model, m.duration_price_micro_usd_per_second)).collect::<Vec<_>>(),
+        "zeroDataRetention": false,
+        "contract": "review-transcription-post-execution-cost-v2",
     });
+    if request.backend == ReviewTranscriptionBackend::Openrouter {
+        document["responseCompatibility"] =
+            serde_json::json!("known-language-code.whisper-input-grid20ms.v1");
+    }
     blake3::hash(document.to_string().as_bytes())
         .to_hex()
         .to_string()
@@ -601,7 +616,19 @@ impl ReviewTranscripts {
             .ok_or(ReviewTranscriptError::ProjectNotFound)
     }
 
-    /// Checks readiness and quotes the worst-case cost. Never sends audio,
+    pub fn models(
+        &self,
+        project_id: &str,
+        runtime: &dyn ReviewSpeechRuntime,
+    ) -> Result<Vec<NativeSttModelChoice>, ReviewTranscriptError> {
+        let connection = open_read_only_connection(&self.database_path)?;
+        Self::project_registered(&connection, project_id)?;
+        runtime
+            .cloud_models()
+            .map_err(|_| ReviewTranscriptError::ModelsUnavailable)
+    }
+
+    /// Checks recording and provider readiness. Never sends audio,
     /// downloads a model or initializes an engine.
     pub fn preflight(
         &self,
@@ -635,12 +662,6 @@ impl ReviewTranscripts {
                 if !runtime.vad_model_present() {
                     blockers.push("review_transcription_local_model_unavailable");
                 }
-                if !request.cloud_upload_acknowledged {
-                    blockers.push("review_transcription_cloud_not_authorized");
-                }
-                if request.authorized_max_cost_usd.is_none() {
-                    blockers.push("review_transcription_budget_required");
-                }
                 if !runtime.cloud_credentials_present() {
                     blockers.push("review_transcription_provider_unavailable");
                 }
@@ -653,30 +674,35 @@ impl ReviewTranscripts {
             .iter()
             .map(|(a, b)| ((b - a) as f64 / f64::from(audio.sample_rate) / 30.0).ceil() as u64)
             .sum();
-        let max_cost = resolved
-            .window_reservation_micro
-            .map(|per| usd(per * max_windows as i64));
-        if let (Some(cap), Some(max)) = (request.authorized_max_cost_usd, max_cost)
-            && max > cap
-        {
-            warnings.push("budget_below_worst_case");
+        if request.backend == ReviewTranscriptionBackend::Openrouter && blockers.is_empty() {
+            let models = runtime
+                .cloud_models()
+                .map_err(|_| ReviewTranscriptError::ModelsUnavailable)?;
+            if !models.iter().any(|model| model.id == resolved.model) {
+                return Err(invalid(
+                    "model is not an eligible OpenRouter transcription model",
+                ));
+            }
         }
         let fingerprint = (!audio.chunks.is_empty()).then(|| audio.fingerprint());
-        let existing_run_id = fingerprint.as_ref().and_then(|fp| {
-            connection
-                .query_row(
-                    "SELECT run_id FROM review_transcription_runs WHERE idempotency_key=?1",
-                    [idempotency_key(
-                        session_id,
-                        fp,
-                        &settings_fingerprint(request, &resolved),
-                    )],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-                .ok()
-                .flatten()
-        });
+        let existing_run_id = (request.backend == ReviewTranscriptionBackend::Local)
+            .then_some(())
+            .and(fingerprint.as_ref())
+            .and_then(|fp| {
+                connection
+                    .query_row(
+                        "SELECT run_id FROM review_transcription_runs WHERE idempotency_key=?1",
+                        [idempotency_key(
+                            session_id,
+                            fp,
+                            &settings_fingerprint(request, &resolved),
+                        )],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+            });
         Ok(ReviewTranscriptionPreflight {
             ready: blockers.is_empty(),
             blockers,
@@ -689,19 +715,16 @@ impl ReviewTranscripts {
                 received_audio_seconds: received_seconds,
                 segment_count: segments.len(),
                 max_windows,
-                price_usd_per_second: resolved.price_micro_per_second.map(|p| p as f64 / 1e6),
-                max_cost_usd: max_cost,
-                billing_note: resolved.price_micro_per_second.map(|_| {
-                    "Each 30 s window is reserved at its full registered price before sending; the provider has no hard price cap on the wire."
-                }),
+                price_usd_per_second: None,
+                max_cost_usd: None,
+                billing_note: None,
             }),
             existing_run_id,
         })
     }
 
-    /// Create (or reuse) a run and enqueue its durable job. Identical
-    /// requests for identical audio reuse the run; a terminal run that did not
-    /// complete is re-queued and resumes from its cached windows.
+    /// Enqueue a durable job. Local retries reuse cached work; explicit cloud
+    /// retries create fresh immutable attempts, while active work is deduplicated.
     pub fn start(
         &self,
         project_id: &str,
@@ -711,6 +734,13 @@ impl ReviewTranscripts {
         jobs: &JobEngine,
         actor: &ReviewTargetActor,
     ) -> Result<ReviewTranscriptionRun, ReviewTranscriptError> {
+        let mut effective = request.clone();
+        if effective.backend == ReviewTranscriptionBackend::Openrouter {
+            effective.authorized_max_cost_usd = None;
+            effective.cloud_upload_acknowledged = true;
+            effective.zero_data_retention = false;
+        }
+        let request = &effective;
         let preflight = self.preflight(project_id, session_id, request, runtime)?;
         if !preflight.ready {
             return Err(ReviewTranscriptError::NotReady(preflight.blockers));
@@ -720,21 +750,29 @@ impl ReviewTranscripts {
             .audio_fingerprint
             .clone()
             .context("audio fingerprint")?;
-        let key = idempotency_key(
+        let cloud = request.backend == ReviewTranscriptionBackend::Openrouter;
+        let base_key = idempotency_key(
             session_id,
             &fingerprint,
             &settings_fingerprint(request, &resolved),
         );
+        let key = if cloud {
+            format!("{base_key}:{}", Uuid::new_v4().simple())
+        } else {
+            base_key.clone()
+        };
         let mut connection = open_writable_connection(&self.database_path)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let audio = load_session_audio(&tx, project_id, session_id)?;
-        let existing = tx
-            .query_row(
-                "SELECT run_id, state, attempt_count FROM review_transcription_runs WHERE idempotency_key=?1",
-                [&key],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?)),
-            )
-            .optional()?;
+        let existing = if cloud {
+            tx.query_row(
+                "SELECT run_id, state, attempt_count FROM review_transcription_runs WHERE idempotency_key LIKE ?1 AND state IN ('queued','running') ORDER BY created_at DESC LIMIT 1",
+                [format!("{base_key}:%")], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?)),
+            ).optional()?
+        } else {
+            tx.query_row("SELECT run_id, state, attempt_count FROM review_transcription_runs WHERE idempotency_key=?1",
+                [&key], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?))).optional()?
+        };
         let (run_id, attempt) = match existing {
             Some((run_id, state, attempts)) => {
                 let state = ReviewTranscriptionState::parse(&state);
@@ -748,12 +786,11 @@ impl ReviewTranscripts {
                     tx.commit()?;
                     return Ok(run);
                 }
-                // A retry is a fresh explicit authorization: its ceiling applies
-                // to the whole run, including spend already committed.
+                // Local retries resume cached work. Cloud retries create new runs.
                 tx.execute(
                     "UPDATE review_transcription_runs SET state='queued', error_code=NULL, cancel_requested=0,
                         attempt_count=attempt_count+1, authorized_max_micro_usd=?3, updated_at=?2 WHERE run_id=?1",
-                    params![run_id, now_text(), request.authorized_max_cost_usd.map(micro)],
+                    params![run_id, now_text(), None::<i64>],
                 )?;
                 tx.execute(
                     "UPDATE review_transcription_segments SET state='pending', error_code=NULL
@@ -783,7 +820,7 @@ impl ReviewTranscripts {
                         serde_json::to_string(request).context("serialize settings")?,
                         key,
                         fingerprint,
-                        request.authorized_max_cost_usd.map(micro),
+                        None::<i64>,
                         now_text(),
                         actor.actor_type,
                         actor.actor_id,
@@ -936,12 +973,12 @@ impl ReviewTranscripts {
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ReviewTranscriptionState, ReviewTranscriptError> {
         self.recover_dispatches(run_id)?;
-        let (project_id, settings, backend, cap) = {
+        let (project_id, settings, backend) = {
             let connection = open_read_only_connection(&self.database_path)?;
             connection.query_row(
-                "SELECT project_id, settings_json, backend, authorized_max_micro_usd FROM review_transcription_runs WHERE run_id=?1",
+                "SELECT project_id, settings_json, backend FROM review_transcription_runs WHERE run_id=?1",
                 [run_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?)),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
             ).optional()?.ok_or(ReviewTranscriptError::NotFound)?
         };
         let request: ReviewTranscriptionRequest =
@@ -1015,16 +1052,9 @@ impl ReviewTranscripts {
                         );
                     }
                 };
-                let native = NativeSttRequest::new(
-                    resolved.provider.clone(),
+                let native = NativeSttRequest::for_discovered_model(
                     resolved.model.clone(),
                     request.language_hint.clone(),
-                    0.0,
-                    // Private review audio: provider data collection is always denied.
-                    NativeSttProviderPolicy::new(
-                        request.zero_data_retention,
-                        SttDataCollection::Deny,
-                    ),
                 )?;
                 Box::new(CloudEngine {
                     runtime,
@@ -1054,8 +1084,6 @@ impl ReviewTranscripts {
         let ledger = WindowLedger {
             database_path: self.database_path.clone(),
             run_id: run_id.to_string(),
-            cap_micro: cap,
-            reservation_micro: resolved.window_reservation_micro.unwrap_or(0),
             cloud: request.backend == ReviewTranscriptionBackend::Openrouter,
         };
         for (index, start, end, state) in segments {
@@ -1095,11 +1123,6 @@ impl ReviewTranscripts {
                         Some("review_transcription_cancelled"),
                     );
                 }
-                Err(SegmentFailure::Budget) => {
-                    self.segment_failed(run_id, index, "review_transcription_budget_exhausted")?;
-                    // Stop dispatching: later segments would need budget too.
-                    break;
-                }
                 Err(SegmentFailure::DispatchUnknown) => {
                     self.segment_failed(
                         run_id,
@@ -1118,11 +1141,6 @@ impl ReviewTranscripts {
                 .query_map([run_id], |r| r.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let budget_stopped: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM review_transcription_segments WHERE run_id=?1 AND error_code='review_transcription_budget_exhausted')",
-            [run_id],
-            |r| r.get(0),
-        )?;
         drop(connection);
         let done = states.iter().filter(|s| *s == "done").count();
         let silent = states.iter().filter(|s| *s == "noSpeech").count();
@@ -1132,7 +1150,7 @@ impl ReviewTranscripts {
             } else {
                 (ReviewTranscriptionState::Completed, None)
             }
-        } else if done + silent == 0 && !budget_stopped {
+        } else if done + silent == 0 {
             (
                 ReviewTranscriptionState::Failed,
                 Some("review_transcription_failed"),
@@ -1140,11 +1158,7 @@ impl ReviewTranscripts {
         } else {
             (
                 ReviewTranscriptionState::Partial,
-                Some(if budget_stopped {
-                    "review_transcription_budget_exhausted"
-                } else {
-                    "review_transcription_partial"
-                }),
+                Some("review_transcription_partial"),
             )
         };
         self.finish(run_id, state, code)
@@ -1348,27 +1362,40 @@ struct SegmentResult {
 
 enum SegmentFailure {
     Cancelled,
-    Budget,
     DispatchUnknown,
     Failed(&'static str),
 }
 
 #[derive(Debug, Error)]
 enum DispatchError {
-    #[error("budget exhausted")]
-    Budget,
     #[error("dispatch outcome unknown")]
     Unknown,
     #[error("provider returned unusable output")]
-    Unusable,
+    Unusable(NativeSttProtocolError),
+}
+
+/// Stable, body-free reasons suitable for a transcript segment and UI.
+fn provider_failure_code(reason: NativeSttProtocolError) -> &'static str {
+    use NativeSttProtocolError::*;
+    match reason {
+        InvalidTimestamp | MissingTimestamp | OutOfOrderTimestamp => {
+            "review_transcription_provider_invalid_timestamp"
+        }
+        MissingText | MissingLanguage | MissingDuration | MissingSegments => {
+            "review_transcription_provider_incomplete_response"
+        }
+        HttpStatus(401 | 403) => "review_transcription_provider_auth_failed",
+        HttpStatus(404) => "review_transcription_provider_no_route",
+        HttpStatus(429) => "review_transcription_provider_rate_limited",
+        HttpStatus(_) => "review_transcription_provider_http_error",
+        _ => "review_transcription_provider_unusable",
+    }
 }
 
 /// Durable per-window cache and, for cloud, the reservation ledger.
 struct WindowLedger {
     database_path: PathBuf,
     run_id: String,
-    cap_micro: Option<i64>,
-    reservation_micro: i64,
     cloud: bool,
 }
 
@@ -1398,62 +1425,38 @@ impl WindowLedger {
             .optional()?;
         match row {
             Some((stored, Some(json))) if stored == fingerprint => {
-                let rows: Vec<CachedSegment> = serde_json::from_str(&json)?;
-                Ok(Some(rows.into_iter().map(Into::into).collect()))
+                match serde_json::from_str::<CachedWindow>(&json)? {
+                    CachedWindow::Segments(rows)
+                    | CachedWindow::Completed { segments: rows, .. } => {
+                        Ok(Some(rows.into_iter().map(Into::into).collect()))
+                    }
+                    CachedWindow::Unusable { unusable, .. } => {
+                        Err(DispatchError::Unusable(unusable).into())
+                    }
+                }
             }
             _ => Ok(None),
         }
     }
 
-    /// Atomically reserve the window's full price against the cap and mark it
-    /// dispatched. Only after this commit may the request be sent.
-    fn reserve_and_mark_dispatched(
+    /// Durable dispatch identity only. Costs never gate execution.
+    fn mark_dispatched(
         &self,
         segment: u32,
         index: u32,
         fingerprint: &str,
     ) -> Result<(), DispatchError> {
-        let result = (|| -> anyhow::Result<bool> {
-            let mut connection = open_writable_connection(&self.database_path)?;
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let committed: i64 = tx.query_row(
-                "SELECT COALESCE(SUM(CASE WHEN state='settled' AND cost_known=1 THEN cost_micro_usd
-                                         WHEN state IN ('settled','dispatched','unknown','reserved') THEN reserved_micro_usd
-                                         ELSE 0 END),0)
-                 FROM review_transcription_windows WHERE run_id=?1",
-                [&self.run_id],
-                |r| r.get(0),
-            )?;
-            let cap = self.cap_micro.unwrap_or(0);
-            if committed + self.reservation_micro > cap {
-                return Ok(false);
-            }
-            tx.execute(
-                "INSERT INTO review_transcription_windows(run_id, segment_index, window_index, window_fingerprint, state, reserved_micro_usd, cost_known, created_at, updated_at)
-                 VALUES(?1,?2,?3,?4,'dispatched',?5,0,?6,?6)
-                 ON CONFLICT(run_id, segment_index, window_index) DO UPDATE SET window_fingerprint=excluded.window_fingerprint,
-                    state='dispatched', reserved_micro_usd=excluded.reserved_micro_usd, cost_known=0, cost_micro_usd=NULL,
-                    result_json=NULL, updated_at=excluded.updated_at
-                 WHERE review_transcription_windows.state='released'",
-                params![self.run_id, segment, index, fingerprint, self.reservation_micro, now_text()],
-            )?;
-            let state: String = tx.query_row(
-                "SELECT state FROM review_transcription_windows WHERE run_id=?1 AND segment_index=?2 AND window_index=?3",
-                params![self.run_id, segment, index],
-                |r| r.get(0),
-            )?;
-            if state != "dispatched" {
-                // A settled/unknown window is never resent.
-                anyhow::bail!("window already dispatched");
-            }
-            tx.commit()?;
-            Ok(true)
-        })();
-        match result {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(DispatchError::Budget),
-            Err(_) => Err(DispatchError::Unknown),
+        let connection =
+            open_writable_connection(&self.database_path).map_err(|_| DispatchError::Unknown)?;
+        let inserted = connection.execute(
+            "INSERT OR IGNORE INTO review_transcription_windows(run_id,segment_index,window_index,window_fingerprint,state,reserved_micro_usd,cost_known,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,'dispatched',0,0,?5,?5)",
+            params![self.run_id, segment, index, fingerprint, now_text()],
+        ).map_err(|_| DispatchError::Unknown)?;
+        if inserted != 1 {
+            return Err(DispatchError::Unknown);
         }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1468,10 +1471,18 @@ impl WindowLedger {
         actual_model: Option<&str>,
         latency_ms: Option<u64>,
         decoded: &[DecodedSegment],
+        input_padding_ms: u32,
     ) -> anyhow::Result<()> {
         let connection = open_writable_connection(&self.database_path)?;
-        let json =
-            serde_json::to_string(&decoded.iter().map(CachedSegment::from).collect::<Vec<_>>())?;
+        let segments = decoded.iter().map(CachedSegment::from).collect::<Vec<_>>();
+        let json = if input_padding_ms > 0 {
+            serde_json::to_string(&CachedWindow::Completed {
+                segments,
+                input_padding_ms,
+            })?
+        } else {
+            serde_json::to_string(&segments)?
+        };
         connection.execute(
             "INSERT INTO review_transcription_windows(run_id, segment_index, window_index, window_fingerprint, state, reserved_micro_usd,
                 cost_known, cost_micro_usd, generation_id, actual_provider, actual_model, latency_ms, result_json, created_at, updated_at)
@@ -1498,6 +1509,27 @@ impl WindowLedger {
         Ok(())
     }
 
+    fn settle_unusable(
+        &self,
+        segment: u32,
+        index: u32,
+        reason: NativeSttProtocolError,
+        receipt: Option<CloudReceipt>,
+    ) -> anyhow::Result<()> {
+        let (cost, generation, provider, model, latency, provider_error) = receipt
+            .map(|(c, g, p, m, l, e, _)| (c, g, p, m, Some(l as i64), e))
+            .unwrap_or((None, None, None, None, None, None));
+        let connection = open_writable_connection(&self.database_path)?;
+        connection.execute(
+            "UPDATE review_transcription_windows SET state='settled', cost_known=?4, cost_micro_usd=?5,
+             generation_id=?6, actual_provider=?7, actual_model=?8, latency_ms=?9, result_json=?10, updated_at=?11
+             WHERE run_id=?1 AND segment_index=?2 AND window_index=?3",
+            params![self.run_id, segment, index, cost.is_some(), cost, generation, provider, model, latency,
+                serde_json::to_string(&CachedWindow::Unusable { unusable: reason, provider_error })?, now_text()],
+        )?;
+        Ok(())
+    }
+
     fn mark_unknown(&self, segment: u32, index: u32) {
         if let Ok(connection) = open_writable_connection(&self.database_path) {
             let _ = connection.execute(
@@ -1506,6 +1538,21 @@ impl WindowLedger {
             );
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum CachedWindow {
+    Segments(Vec<CachedSegment>),
+    Completed {
+        segments: Vec<CachedSegment>,
+        input_padding_ms: u32,
+    },
+    Unusable {
+        unusable: NativeSttProtocolError,
+        #[serde(default)]
+        provider_error: Option<NativeSttProviderError>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1556,6 +1603,8 @@ type CloudReceipt = (
     Option<String>,
     Option<String>,
     u64,
+    Option<NativeSttProviderError>,
+    u32,
 );
 
 thread_local! {
@@ -1571,7 +1620,7 @@ impl SttEngine for CloudEngine<'_> {
         pcm: &[f32],
         window: &PackedWindow,
     ) -> anyhow::Result<Vec<DecodedSegment>> {
-        let audio = NativeSttAudioWindow::from_pcm(pcm, window)?;
+        let audio = self.request.prepare_audio(pcm, window)?;
         self.transport.prepare()?;
         let result = self
             .transport
@@ -1588,21 +1637,27 @@ impl SttEngine for CloudEngine<'_> {
                 result.receipt.actual_provider.clone(),
                 result.receipt.actual_model.clone(),
                 result.latency_ms,
+                result.provider_error.clone(),
+                audio.padding_ms(),
             ));
         });
         match result.outcome {
-            NativeSttOutcome::Usable(transcript) => Ok(transcript
-                .segments
-                .into_iter()
-                .map(|s| DecodedSegment {
-                    start_ms: s.start_ms,
-                    end_ms: s.end_ms,
-                    language: transcript.language.clone(),
-                    text: s.text,
-                    mean_token_probability: None,
-                })
-                .collect()),
-            NativeSttOutcome::Unusable(_) => Err(DispatchError::Unusable.into()),
+            NativeSttOutcome::Usable(transcript) => {
+                let language = canonical_native_stt_language(&transcript.language)
+                    .map_err(DispatchError::Unusable)?;
+                Ok(transcript
+                    .segments
+                    .into_iter()
+                    .map(|s| DecodedSegment {
+                        start_ms: s.start_ms,
+                        end_ms: s.end_ms,
+                        language: language.clone(),
+                        text: s.text,
+                        mean_token_probability: None,
+                    })
+                    .collect())
+            }
+            NativeSttOutcome::Unusable(reason) => Err(DispatchError::Unusable(reason).into()),
         }
     }
 }
@@ -1642,11 +1697,18 @@ fn transcribe_segment(
         let fingerprint = window_fingerprint(segment_index, &window);
         let decoded = match ledger.cached(segment_index, index, &fingerprint) {
             Ok(Some(decoded)) => decoded,
-            _ => {
+            Err(error) => {
+                return Err(match error.downcast_ref::<DispatchError>() {
+                    Some(DispatchError::Unusable(reason)) => {
+                        SegmentFailure::Failed(provider_failure_code(*reason))
+                    }
+                    _ => SegmentFailure::Failed("review_transcription_store_failed"),
+                });
+            }
+            Ok(None) => {
                 if ledger.cloud {
-                    match ledger.reserve_and_mark_dispatched(segment_index, index, &fingerprint) {
+                    match ledger.mark_dispatched(segment_index, index, &fingerprint) {
                         Ok(()) => {}
-                        Err(DispatchError::Budget) => return Err(SegmentFailure::Budget),
                         Err(_) => return Err(SegmentFailure::DispatchUnknown),
                     }
                 }
@@ -1654,10 +1716,11 @@ fn transcribe_segment(
                 match engine.decode_window(pcm, &window) {
                     Ok(decoded) => {
                         let receipt = LAST_CLOUD_RECEIPT.with(|slot| slot.borrow_mut().take());
-                        let (cost, generation, provider, model, latency) = match receipt {
-                            Some((c, g, p, m, l)) => (c, g, p, m, Some(l)),
-                            None => (None, None, None, None, None),
-                        };
+                        let (cost, generation, provider, model, latency, input_padding_ms) =
+                            match receipt {
+                                Some((c, g, p, m, l, _, padding)) => (c, g, p, m, Some(l), padding),
+                                None => (None, None, None, None, None, 0),
+                            };
                         ledger
                             .settle(
                                 segment_index,
@@ -1669,6 +1732,7 @@ fn transcribe_segment(
                                 model.as_deref(),
                                 latency,
                                 &decoded,
+                                input_padding_ms,
                             )
                             .map_err(|_| {
                                 SegmentFailure::Failed("review_transcription_store_failed")
@@ -1677,14 +1741,23 @@ fn transcribe_segment(
                     }
                     Err(error) => {
                         if ledger.cloud {
-                            // Sent or possibly sent: never resend, keep the reservation.
+                            if let Some(DispatchError::Unusable(reason)) =
+                                error.downcast_ref::<DispatchError>()
+                            {
+                                // The response arrived: preserve its receipt even when the
+                                // timed transcript is invalid. Never cache it as decoded text.
+                                let receipt =
+                                    LAST_CLOUD_RECEIPT.with(|slot| slot.borrow_mut().take());
+                                ledger
+                                    .settle_unusable(segment_index, index, *reason, receipt)
+                                    .map_err(|_| {
+                                        SegmentFailure::Failed("review_transcription_store_failed")
+                                    })?;
+                                return Err(SegmentFailure::Failed(provider_failure_code(*reason)));
+                            }
+                            // Sent or possibly sent with no response: keep the reservation.
                             ledger.mark_unknown(segment_index, index);
-                            return Err(match error.downcast_ref::<DispatchError>() {
-                                Some(DispatchError::Unusable) => {
-                                    SegmentFailure::Failed("review_transcription_provider_unusable")
-                                }
-                                _ => SegmentFailure::DispatchUnknown,
-                            });
+                            return Err(SegmentFailure::DispatchUnknown);
                         }
                         return Err(SegmentFailure::Failed("review_transcription_decode_failed"));
                     }
@@ -1741,6 +1814,9 @@ fn to_utterances(
         .enumerate()
         .filter_map(|(i, segment)| {
             let (start_ms, end_ms) = translate_span(window, segment.start_ms, segment.end_ms)?;
+            if start_ms >= end_ms {
+                return None;
+            }
             let start_frame =
                 segment_start_frame + (u64::from(start_ms) * u64::from(sample_rate)) / 1000;
             let end_frame =
@@ -1857,17 +1933,63 @@ fn load_run(
         });
     }
     let spend = connection.query_row(
-        "SELECT COALESCE(SUM(CASE WHEN state IN ('dispatched','unknown','reserved') THEN reserved_micro_usd ELSE 0 END),0),
+        "SELECT COALESCE(SUM(CASE WHEN (state IN ('dispatched','unknown','reserved') OR (state='settled' AND cost_known=0)) THEN reserved_micro_usd ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN state='settled' AND cost_known=1 THEN cost_micro_usd ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN state='unknown' OR (state='settled' AND cost_known=0) THEN 1 ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN state IN ('settled','unknown','dispatched') AND reserved_micro_usd>0 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN state IN ('settled','unknown','dispatched') AND (SELECT backend FROM review_transcription_runs WHERE run_id=?1)='openrouter' THEN 1 ELSE 0 END),0),
                 COUNT(*)
          FROM review_transcription_windows WHERE run_id=?1",
         [run_id],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, u32>(2)?, r.get::<_, u32>(3)?, r.get::<_, u32>(4)?)),
     )?;
     let audio = load_session_audio(connection, project_id, &a.0)?;
+    let provider_errors = {
+        let mut statement = connection.prepare("SELECT segment_index,window_index,generation_id,result_json FROM review_transcription_windows WHERE run_id=?1 AND result_json IS NOT NULL ORDER BY segment_index,window_index")?;
+        let rows = statement.query_map([run_id], |r| {
+            Ok((
+                r.get::<_, u32>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut errors = Vec::new();
+        for row in rows {
+            let (segment_index, window_index, generation_id, json) = row?;
+            if let Ok(CachedWindow::Unusable {
+                unusable,
+                provider_error,
+            }) = serde_json::from_str(&json)
+            {
+                let (http_status, code, message) = match provider_error {
+                    Some(e) => (Some(e.http_status), e.code, e.message),
+                    None => (
+                        match unusable {
+                            NativeSttProtocolError::HttpStatus(status) => Some(status),
+                            _ => None,
+                        },
+                        None,
+                        format!(
+                            "OpenRouter response could not be used: {}.",
+                            unusable.code()
+                        ),
+                    ),
+                };
+                errors.push(ReviewTranscriptionProviderError {
+                    segment_index,
+                    window_index,
+                    protocol_code: unusable.code().into(),
+                    http_status,
+                    code,
+                    message,
+                    generation_id,
+                });
+            }
+        }
+        errors
+    };
     Ok(ReviewTranscriptionRun {
+        provider_errors,
         schema: REVIEW_TRANSCRIPT_SCHEMA,
         run_id: run_id.to_string(),
         project_id: project_id.to_string(),

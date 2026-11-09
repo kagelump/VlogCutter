@@ -147,6 +147,9 @@ pub struct WorkspaceUtterance {
     pub language: String,
     pub excluded: bool,
     pub movie_time: Option<MovieTimeEstimate>,
+    /// Known playback spans; may cover only the middle of this utterance.
+    /// Empty when a reviewer has explicitly corrected/cleared its locator.
+    pub movie_time_ranges: Vec<crate::review_sync::MovieTimeRange>,
     /// The shared synchronizer's complete result for this utterance's frames.
     pub sync: UtteranceSync,
     /// Picture locators from anchored/estimated slices (or a human movie-time
@@ -461,6 +464,11 @@ impl ReviewDiscussions {
                 machine.display_text.clone()
             };
             let human = latest("movieTime");
+            let movie_time_ranges = if human.is_none() {
+                sync.movie_time_ranges(context.run.sample_rate, &context.handoff)
+            } else {
+                Vec::new()
+            };
             let duration = context.handoff.target().movie.duration_seconds;
             let (movie_time, mut candidates) = match human {
                 // A human declaration is attributed as such, never as sync.
@@ -500,21 +508,26 @@ impl ReviewDiscussions {
                     // when that slice is anchored/estimated with exactly one
                     // candidate. Later unknown or conflicting slices stay in
                     // `sync` and are never smoothed over.
-                    let estimate = sync.slices.first().and_then(|slice| {
-                        let state = serde_json::to_value(slice.state).ok()?;
-                        let state = state.as_str()?;
-                        if !matches!(state, "anchored" | "estimated") || slice.candidates.len() != 1
-                        {
-                            return None;
-                        }
-                        let first = &slice.candidates[0];
-                        Some(MovieTimeEstimate {
-                            movie_seconds: (first.start_pts - movie.origin_pts as f64) / tps,
-                            uncertainty_seconds: first.uncertainty_ticks as f64 / tps,
-                            source: format!("sharedSync:{state}"),
-                            evidence_ids: first.evidence_ids.clone(),
-                        })
-                    });
+                    let estimate = sync
+                        .slices
+                        .first()
+                        .filter(|slice| slice.recording.start_sample == machine.start_frame)
+                        .and_then(|slice| {
+                            let state = serde_json::to_value(slice.state).ok()?;
+                            let state = state.as_str()?;
+                            if !matches!(state, "anchored" | "estimated")
+                                || slice.candidates.len() != 1
+                            {
+                                return None;
+                            }
+                            let first = &slice.candidates[0];
+                            Some(MovieTimeEstimate {
+                                movie_seconds: (first.start_pts - movie.origin_pts as f64) / tps,
+                                uncertainty_seconds: first.uncertainty_ticks as f64 / tps,
+                                source: format!("sharedSync:{state}"),
+                                evidence_ids: first.evidence_ids.clone(),
+                            })
+                        });
                     (estimate, candidates)
                 }
             };
@@ -548,6 +561,7 @@ impl ReviewDiscussions {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(machine.suppressed),
                 movie_time,
+                movie_time_ranges,
                 sync,
                 candidate_operation_ids: candidates,
                 reference_hint: hint,

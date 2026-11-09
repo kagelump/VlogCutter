@@ -20,6 +20,7 @@ const DISPLAY_LINES: usize = 200;
 pub struct LiveReviewLine {
     pub utterance: ReviewUtterance,
     pub movie_time: Option<MovieTimeEstimate>,
+    pub movie_time_ranges: Vec<crate::review_sync::MovieTimeRange>,
     pub asset_id: Option<String>,
     pub shot_number: Option<usize>,
 }
@@ -178,6 +179,7 @@ impl ReviewTranscripts {
                     })
                 });
                 LiveReviewLine {
+                    movie_time_ranges: sync.movie_time_ranges(audio.sample_rate, &handoff),
                     asset_id: cut.map(|(_, c)| c.asset_id.clone()),
                     shot_number: cut.map(|(i, _)| i + 1),
                     utterance,

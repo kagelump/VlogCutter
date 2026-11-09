@@ -45,6 +45,17 @@ Every utterance keeps its **recording clock** time.
   differ. `movieTime` is only a locator for the utterance **start**, present
   when the first slice is anchored or estimated with one candidate. Later
   unknown or conflicting parts stay visible and are never smoothed over.
+- `movieTimeRanges` projects safe, single-candidate anchored/estimated slices
+  into recording and movie seconds on their original clocks. Adjacent spans
+  coalesce only when both endpoints meet; unknown/conflicting gaps, seeks and
+  clock changes stay separate. A long ASR line may have known timing only in
+  its middle: the transcript shows a shot thumbnail from the first known span,
+  linked to that video position, with a hover hint that it is the first observed
+  playback in the line. Timing diagnostics remain in the workspace data rather
+  than visible text below each line. These spans never replace
+  the utterance-start locator used for exports or imply word-level timing.
+  An explicit human locator correction/clear takes precedence and hides these
+  automatic display ranges in the workspace.
 - `sync.status` is `pending` (no calibrated clock: nothing is synthesized from
   request start, packet arrival or receive time), `noAnchors`, `mapped` or
   `failed`.

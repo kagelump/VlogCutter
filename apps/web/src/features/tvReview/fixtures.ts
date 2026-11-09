@@ -68,7 +68,7 @@ export function workspace(overrides: Partial<ReviewWorkspace> = {}): ReviewWorks
     cuts: target.cuts.map(({ operationId, position, assetId, movieInSeconds, movieOutSeconds }) => ({ operationId, position, assetId, movieInSeconds, movieOutSeconds })),
     utterances: [{
       machine: utterance, text: utterance.text, displayText: utterance.displayText, speaker: "unknown", language: "en", excluded: false,
-      movieTime: null, sync: { state: "unknown", slices: [], uncoveredFrames: 0 }, candidateOperationIds: [], referenceHint: null, corrections: [],
+      movieTime: null, movieTimeRanges: [], sync: { state: "unknown", slices: [], uncoveredFrames: 0 }, candidateOperationIds: [], referenceHint: null, corrections: [],
     }],
     discussions: [],
     coverage: { audiovisualReviewAttested: false, note: "Audio only." },

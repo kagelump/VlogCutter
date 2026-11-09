@@ -32,6 +32,7 @@ fn error_response(request_id: &RequestId, error: ReviewTranscriptError) -> Respo
         ReviewTranscriptError::NotReady(_) | ReviewTranscriptError::Conflict => {
             StatusCode::CONFLICT
         }
+        ReviewTranscriptError::ModelsUnavailable => StatusCode::BAD_GATEWAY,
         ReviewTranscriptError::Infrastructure(_) | ReviewTranscriptError::Database(_) => {
             tracing::error!(request_id = %request_id.0, code = error.code(), "review transcription request failed");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -52,6 +53,22 @@ async fn blocking<T: Send + 'static>(
             "internal_error",
             StatusCode::INTERNAL_SERVER_ERROR,
         )),
+    }
+}
+
+pub(super) async fn models(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath(project_id): AxumPath<String>,
+) -> Response {
+    let transcripts = transcripts(&state);
+    match blocking(&request_id, move || {
+        transcripts.models(&project_id, &ModelDirSpeechRuntime::from_environment())
+    })
+    .await
+    {
+        Ok(items) => Json(serde_json::json!({"items":items})).into_response(),
+        Err(response) => response,
     }
 }
 
@@ -245,6 +262,10 @@ pub(super) async fn live_enable(
 pub(super) fn routes(state: &HttpState) -> Router<HttpState> {
     Router::new()
         .route(
+            "/api/v1/projects/{project_id}/review-transcription-models",
+            get(models),
+        )
+        .route(
             "/api/v1/projects/{project_id}/review-sessions/{session_id}/live-transcript",
             get(live_get).post(live_enable),
         )
@@ -283,18 +304,21 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
     let ok = |schema: &str| json!({"description":schema,"content":{"application/json":{"schema":{"$ref":format!("#/components/schemas/{schema}")}}}});
     let error = json!({"$ref":"#/components/responses/Error"});
     let paths = json!({
+        "/api/v1/projects/{projectId}/review-transcription-models": {
+            "get": {"operationId":"listReviewTranscriptionModels","description":"List eligible native transcription models from OpenRouter's current public catalog.","parameters":[project.clone()],"responses":{"200":ok("ReviewTranscriptionModels"),"502":error.clone()}}
+        },
         "/api/v1/projects/{projectId}/review-sessions/{sessionId}/live-transcript": {
             "get": {"operationId":"getLiveReviewTranscript","description":"Read the bounded provisional transcript tail and current movie matches. Never starts decoding.","parameters":[project.clone(),session.clone()],"responses":{"200":ok("LiveReviewTranscript"),"404":error.clone()}},
             "post": {"operationId":"enableLiveReviewTranscript","description":"Opt in to local multilingual Whisper Tiny live drafts and an automatic local full transcription after finalization. Never uploads to a cloud provider or downloads models.","parameters":[project.clone(),session.clone()],"responses":{"200":ok("LiveReviewTranscript"),"404":error.clone(),"409":error.clone()}}
         },
         "/api/v1/projects/{projectId}/review-sessions/{sessionId}/transcriptions": {
             "get": {"operationId":"listReviewTranscriptions","parameters":[project.clone(),session.clone()],"responses":{"200":ok("ReviewTranscriptionList"),"404":error.clone()}},
-            "post": {"operationId":"startReviewTranscription","description":"Create or reuse (by audio/provider/settings fingerprint) a durable transcription run. Cloud runs require explicit upload acknowledgement and a hard USD ceiling; no fallback.",
+            "post": {"operationId":"startReviewTranscription","description":"Start a transcription run. Explicit cloud retries create fresh attempts; concurrent submissions reuse active work. Cloud runs require explicit upload acknowledgement and a hard USD ceiling; no fallback.",
                 "parameters":[project.clone(),session.clone()],"requestBody":body.clone(),
                 "responses":{"200":ok("ReviewTranscriptionRun"),"400":error.clone(),"404":error.clone(),"409":error.clone()}}
         },
         "/api/v1/projects/{projectId}/review-sessions/{sessionId}/transcriptions/preflight": {
-            "post": {"operationId":"preflightReviewTranscription","description":"Readiness and worst-case cost; never sends audio or loads a model.",
+            "post": {"operationId":"preflightReviewTranscription","description":"Check recording, model and credential readiness; never sends audio or loads a speech model.",
                 "parameters":[project.clone(),session],"requestBody":body,"responses":{"200":ok("ReviewTranscriptionPreflight"),"400":error.clone(),"404":error.clone()}}
         },
         "/api/v1/projects/{projectId}/review-transcriptions/{runId}": {
@@ -311,9 +335,10 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
             "backend":{"type":"string","enum":["local","openrouter"]},
             "model":{"type":["string","null"]},
             "languageHint":{"type":["string","null"],"pattern":"^[a-z]{2}$"},
-            "authorizedMaxCostUsd":{"type":["number","null"],"exclusiveMinimum":0,"maximum":100},
-            "cloudUploadAcknowledged":{"type":"boolean"},
-            "zeroDataRetention":{"type":"boolean"}}},
+            "authorizedMaxCostUsd":{"type":["number","null"],"deprecated":true},
+            "cloudUploadAcknowledged":{"type":"boolean","deprecated":true},
+            "zeroDataRetention":{"type":"boolean","deprecated":true}}},
+        "ReviewTranscriptionModels": {"type":"object","required":["items"],"properties":{"items":{"type":"array","items":{"type":"object","required":["id","name"],"properties":{"id":{"type":"string"},"name":{"type":"string"}}}}}},
         "ReviewTranscriptionPreflight": open.clone(),
         "ReviewTranscriptionRun": open.clone(),
         "ReviewTranscriptionList": {"type":"object","required":["items"],"properties":{"items":{"type":"array","items":open}}}

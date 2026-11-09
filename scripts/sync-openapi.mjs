@@ -77,6 +77,7 @@ export const API_PATHS = {
   reviewSessionFinalize: "/api/v1/projects/{projectId}/review-sessions/{sessionId}/finalize",
   reviewSessionAudio: "/api/v1/projects/{projectId}/review-sessions/{sessionId}/audio.wav",
   liveReviewTranscript: "/api/v1/projects/{projectId}/review-sessions/{sessionId}/live-transcript",
+  reviewTranscriptionModels: "/api/v1/projects/{projectId}/review-transcription-models",
   reviewTranscriptions: "/api/v1/projects/{projectId}/review-sessions/{sessionId}/transcriptions",
   reviewTranscriptionPreflight: "/api/v1/projects/{projectId}/review-sessions/{sessionId}/transcriptions/preflight",
   reviewTranscription: "/api/v1/projects/{projectId}/review-transcriptions/{runId}",

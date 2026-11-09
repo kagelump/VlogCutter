@@ -81,6 +81,7 @@ pub const STABLE_ERROR_CODES: &[&str] = &[
     "review_transcription_budget_required",
     "review_transcription_cloud_not_authorized",
     "review_transcription_local_model_unavailable",
+    "review_transcription_models_unavailable",
     "review_transcription_no_audio",
     "review_transcription_not_ready",
     "review_transcription_provider_unavailable",

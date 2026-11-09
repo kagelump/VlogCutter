@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { ReviewUtterance, MovieTimeEstimate } from "@rcdvlog/project-client";
+import type { ReviewUtterance, MovieTimeEstimate, MovieTimeRange } from "@rcdvlog/project-client";
 import { formatStamp } from "../../lib/format";
 import styles from "./TvReview.module.css";
 
@@ -11,9 +11,10 @@ const FLAG_COPY: Record<string, string> = {
   nearRecordingGap: "near a gap",
 };
 
-export function UtteranceLine({ utterance, showRaw, movieTime, thumbnail, shotNumber, videoId, timingLoading }: {
+export function UtteranceLine({ utterance, showRaw, movieTime, movieTimeRanges, thumbnail, shotNumber, videoId }: {
   utterance: ReviewUtterance; showRaw: boolean; movieTime?: MovieTimeEstimate;
-  thumbnail?: string; shotNumber?: number; videoId?: string; timingLoading: boolean;
+  movieTimeRanges?: MovieTimeRange[];
+  thumbnail?: string; shotNumber?: number; videoId?: string;
 }) {
   return (
     <li className={styles.utterance} data-suppressed={utterance.suppressed || undefined}>
@@ -23,31 +24,31 @@ export function UtteranceLine({ utterance, showRaw, movieTime, thumbnail, shotNu
         {utterance.suppressed ? <em className={styles.muted}>Low quality: </em> : null}
         {showRaw ? utterance.text : utterance.displayText}
         {utterance.flags.length ? <small className={styles.flags}>{utterance.flags.map((flag) => FLAG_COPY[flag] ?? flag.replace("qualityGate:", "")).join(" · ")}</small> : null}
-        <VideoReference movieTime={movieTime} thumbnail={thumbnail} shotNumber={shotNumber} videoId={videoId} loading={timingLoading} />
+        <VideoReference movieTime={movieTime} ranges={movieTimeRanges} thumbnail={thumbnail} shotNumber={shotNumber} videoId={videoId} />
       </span>
     </li>
   );
 }
 
 
-function VideoReference({ movieTime, thumbnail, shotNumber, videoId, loading }: {
-  movieTime?: MovieTimeEstimate; thumbnail?: string; shotNumber?: number; videoId?: string; loading: boolean;
+function VideoReference({ movieTime, ranges, thumbnail, shotNumber, videoId }: {
+  movieTime?: MovieTimeEstimate; thumbnail?: string; shotNumber?: number; videoId?: string;
+  ranges?: MovieTimeRange[];
 }) {
-  if (!movieTime) return <small className={styles.muted}>{loading ? "Matching video time…" : "Video time unavailable"}</small>;
-  const label = `Video ${movieTime.source === "humanCorrection" ? "" : "≈ "}${formatStamp(movieTime.movieSeconds)}`;
-  return <span className={styles.videoReference}>
-    <span className={styles.videoTime} title={movieTime.source === "humanCorrection" ? "Video time set by a reviewer" : `Estimated video time at the start of this line (±${movieTime.uncertaintySeconds.toFixed(2)}s)`}>
-      {videoId ? <a href={`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&t=${Math.floor(movieTime.movieSeconds)}s`} target="_blank" rel="noopener noreferrer">{label}</a> : label}
-    </span>
-    {thumbnail ? <TranscriptThumbnail key={thumbnail} src={thumbnail} shotNumber={shotNumber} /> : null}
-  </span>;
+  if (!thumbnail) return null;
+  const seconds = movieTime?.movieSeconds ?? ranges?.[0]?.movieStartSeconds;
+  const href = videoId && seconds !== undefined && Number.isFinite(seconds) && seconds >= 0
+    ? `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&t=${Math.floor(seconds)}s` : undefined;
+  const title = seconds === undefined ? undefined : `Video ${formatStamp(seconds)}${!movieTime ? " · first observed playback in this line" : ""}`;
+  return <TranscriptThumbnail key={thumbnail} src={thumbnail} shotNumber={shotNumber} href={href} title={title} />;
 }
 
-function TranscriptThumbnail({ src, shotNumber }: { src: string; shotNumber?: number }) {
+function TranscriptThumbnail({ src, shotNumber, href, title }: { src: string; shotNumber?: number; href?: string; title?: string }) {
   const [failed, setFailed] = useState(false);
-  return <span className={styles.videoThumbnail}>
-    {failed ? <small className={styles.muted}>Thumbnail unavailable</small>
-      : <><img src={src} alt={`Shot ${shotNumber} thumbnail`} loading="lazy" decoding="async" onError={() => setFailed(true)} />
-        <small className={styles.muted}>Shot {shotNumber} thumbnail</small></>}
+  if (failed) return null;
+  const image = <img src={src} alt={shotNumber === undefined ? "Video thumbnail" : `Shot ${shotNumber} thumbnail`} loading="lazy" decoding="async" onError={() => setFailed(true)} />;
+  return <span className={styles.videoReference}>
+    {href ? <a className={styles.videoThumbnail} href={href} title={title} target="_blank" rel="noopener noreferrer">{image}</a>
+      : <span className={styles.videoThumbnail} title={title}>{image}</span>}
   </span>;
 }

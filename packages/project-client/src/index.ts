@@ -486,11 +486,13 @@ export interface LiveReviewTranscript {
   revision: number;
   finalRunId: string | null;
   errorCode: string | null;
-  lines: { utterance: ReviewUtterance; movieTime: MovieTimeEstimate | null; assetId: string | null; shotNumber: number | null }[];
+  lines: { utterance: ReviewUtterance; movieTime: MovieTimeEstimate | null; movieTimeRanges: MovieTimeRange[]; assetId: string | null; shotNumber: number | null }[];
 }
 
 export type ReviewTranscriptionBackend = "local" | "openrouter";
 export type ReviewTranscriptionState = "queued" | "running" | "completed" | "noSpeech" | "partial" | "failed" | "cancelled";
+
+export interface ReviewTranscriptionModel { id: string; name: string }
 
 export interface ReviewTranscriptionRequest {
   backend: ReviewTranscriptionBackend;
@@ -567,6 +569,7 @@ export interface ReviewTranscriptionRun {
   spend: { authorizedMaxUsd: number | null; reservedUsd: number; knownCostUsd: number; unknownCostWindows: number; dispatchedWindows: number; cachedWindows: number };
   diarization: { status: string; reason: string };
   limitations: string[];
+  providerErrors?: Array<{ segmentIndex: number; windowIndex: number; protocolCode: string; httpStatus: number | null; code: string | null; message: string; generationId: string | null }>;
 }
 
 // Editorial review workspace (#225). Mirrors rcdvlog-server-core::review_discussions.
@@ -575,6 +578,16 @@ export type DecisionAction = "accepted" | "declined" | "deferred";
 
 /** Utterance-start locator: a human declaration or the shared synchronizer's first slice. */
 export interface MovieTimeEstimate { movieSeconds: number; uncertaintySeconds: number; source: string; evidenceIds: string[] }
+
+/** Measured playback span, which may cover only part of an utterance. */
+export interface MovieTimeRange {
+  recordingStartSeconds: number;
+  recordingEndSeconds: number;
+  movieStartSeconds: number;
+  movieEndSeconds: number;
+  uncertaintySeconds: number;
+  evidenceIds: string[];
+}
 
 /** One slice of the shared synchronizer (`rcdvlog_core::tv_review_sync`) result. */
 export interface SyncSlice {
@@ -606,6 +619,7 @@ export interface WorkspaceUtterance {
   language: string;
   excluded: boolean;
   movieTime: MovieTimeEstimate | null;
+  movieTimeRanges: MovieTimeRange[];
   sync: UtteranceSync;
   candidateOperationIds: string[];
   referenceHint: string | null;
@@ -737,6 +751,7 @@ export interface BrowserProjectClient extends ProjectClient {
   reviewSessionAudioUrl(projectId: string, sessionId: string): string;
   getLiveReviewTranscript(projectId: string, sessionId: string): Promise<LiveReviewTranscript>;
   enableLiveReviewTranscript(projectId: string, sessionId: string): Promise<LiveReviewTranscript>;
+  listReviewTranscriptionModels(projectId: string): Promise<{ items: ReviewTranscriptionModel[] }>;
   preflightReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionPreflight>;
   startReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionRun>;
   listReviewTranscriptions(projectId: string, sessionId: string): Promise<{ items: ReviewTranscriptionRun[] }>;

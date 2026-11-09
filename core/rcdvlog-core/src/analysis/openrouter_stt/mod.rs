@@ -2,9 +2,9 @@
 //!
 //! This is a protocol/client leaf, not a production backend selection. It does
 //! not read catalogs, claim media, authorize spending, retry, fall back, or
-//! persist transcripts. A future accounting slice must stage every request
-//! through the shared reservation/dispatch/receipt machinery before this client
-//! is called.
+//! persist transcripts. Analysis stages registered-model requests through its
+//! accounting machinery. Review transcription can use a discovered native model
+//! and reports provider costs after execution.
 //!
 //! The wire contract here is deliberately not the chat-completions contract:
 //! `POST /api/v1/audio/transcriptions` with raw base64 WAV in `input_audio`,
@@ -43,12 +43,14 @@ const NATIVE_STT_BILLING_SEMANTICS: &str =
 
 mod client;
 mod decode;
+mod discovery;
 #[cfg(test)]
 mod native_packing_tests;
 #[cfg(test)]
 mod tests;
 pub use client::{NativeSttClientError, OpenRouterSttClient};
 pub use decode::*;
+pub use discovery::{NativeSttModelChoice, discover_native_stt_models};
 
 /// Narrow transport seam for one native-audio transmission.
 ///
@@ -324,6 +326,7 @@ pub struct NativeSttRequest {
     language: Option<String>,
     temperature: f64,
     provider_policy: NativeSttProviderPolicy,
+    discovered: bool,
 }
 
 impl NativeSttRequest {
@@ -340,13 +343,45 @@ impl NativeSttRequest {
             language,
             temperature,
             provider_policy,
+            discovered: false,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// For review transcription after the caller has checked OpenRouter's live
+    /// native-transcription catalog. This does not extend the analysis pricing registry.
+    pub fn for_discovered_model(model: String, language: Option<String>) -> Result<Self> {
+        ensure!(
+            model.len() <= 200
+                && model.split('/').count() == 2
+                && model.split('/').all(|part| !part.is_empty())
+                && model
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric()
+                        || matches!(c, b'/' | b'-' | b'_' | b'.' | b':')),
+            "invalid native transcription model ID"
+        );
+        let request = Self {
+            provider: OPENROUTER_STT_PROVIDER.into(),
+            model,
+            language,
+            temperature: 0.0,
+            provider_policy: NativeSttProviderPolicy::new(false, SttDataCollection::Deny),
+            discovered: true,
         };
         request.validate()?;
         Ok(request)
     }
 
     fn validate(&self) -> Result<&'static NativeSttModelSpec> {
-        let spec = resolve_native_stt_model(&self.provider, &self.model)?;
+        let spec = if self.discovered {
+            // The common bounded 16 kHz WAV/30 s wire contract; pricing remains
+            // unavailable through native_stt_request_cost_bound for discovered models.
+            &NATIVE_STT_MODELS[0]
+        } else {
+            resolve_native_stt_model(&self.provider, &self.model)?
+        };
         ensure!(
             spec.supported_input_formats.contains(&"wav"),
             "selected native STT model does not support WAV input"
@@ -360,6 +395,29 @@ impl NativeSttRequest {
         );
         self.provider_policy.validate()?;
         Ok(spec)
+    }
+
+    /// Review Whisper uses 20 ms timestamp tokens. Append only real zero-valued
+    /// samples up to that grid so quantized endpoints stay inside the sent WAV.
+    /// Registered analysis requests retain their exact original audio contract.
+    pub fn prepare_audio(
+        &self,
+        pcm: &[f32],
+        window: &PackedWindow,
+    ) -> Result<NativeSttAudioWindow> {
+        let grid_ms = if self.discovered
+            && [
+                "openai/whisper-1",
+                "openai/whisper-large-v3",
+                "openai/whisper-large-v3-turbo",
+            ]
+            .contains(&self.model.as_str())
+        {
+            20
+        } else {
+            1
+        };
+        NativeSttAudioWindow::from_pcm_on_grid(pcm, window, grid_ms)
     }
 
     pub fn provider(&self) -> &str {
@@ -405,6 +463,7 @@ pub struct NativeSttAudioWindow {
     wav_bytes: Vec<u8>,
     duration_ms: u32,
     sample_count: usize,
+    padding_ms: u32,
 }
 
 impl std::fmt::Debug for NativeSttAudioWindow {
@@ -421,10 +480,21 @@ impl NativeSttAudioWindow {
     /// Concatenates only the window's selected speech regions from supplied PCM,
     /// then encodes a genuine bounded 16 kHz mono PCM WAV.
     pub fn from_pcm(pcm: &[f32], window: &PackedWindow) -> Result<Self> {
-        let samples = concatenate_regions_bounded(pcm, window)?;
-        let duration_ms = window.speech_ms();
-        ensure!(duration_ms > 0, "speech window is empty");
+        Self::from_pcm_on_grid(pcm, window, 1)
+    }
+
+    fn from_pcm_on_grid(pcm: &[f32], window: &PackedWindow, grid_ms: u32) -> Result<Self> {
+        ensure!(
+            matches!(grid_ms, 1 | 20),
+            "unsupported speech timestamp grid"
+        );
+        let mut samples = concatenate_regions_bounded(pcm, window)?;
+        let speech_ms = window.speech_ms();
+        let duration_ms = speech_ms.div_ceil(grid_ms) * grid_ms;
+        let padding_ms = duration_ms - speech_ms;
+        ensure!(speech_ms > 0, "speech window is empty");
         ensure!(duration_ms <= WINDOW_MS, "speech window exceeds 30 seconds");
+        samples.resize(samples.len() + padding_ms as usize * 16, 0.0);
         let wav_bytes = encode_pcm16_wav(&samples)?;
         let sample_count = validate_wav_16k_mono(&wav_bytes)?;
         ensure!(
@@ -436,6 +506,7 @@ impl NativeSttAudioWindow {
             wav_bytes,
             duration_ms,
             sample_count,
+            padding_ms,
         })
     }
 
@@ -455,6 +526,10 @@ impl NativeSttAudioWindow {
         self.sample_count
     }
 
+    pub fn padding_ms(&self) -> u32 {
+        self.padding_ms
+    }
+
     fn validate_for(&self, spec: &NativeSttModelSpec) -> Result<()> {
         ensure!(self.duration_ms > 0, "speech window is empty");
         ensure!(
@@ -471,8 +546,10 @@ impl NativeSttAudioWindow {
             "speech WAV sample count does not match the bounded window"
         );
         ensure!(
-            self.window.speech_ms() == self.duration_ms,
-            "speech WAV duration does not match its packed window"
+            self.window.speech_ms().checked_add(self.padding_ms) == Some(self.duration_ms)
+                && self.padding_ms < 20
+                && self.sample_count == self.duration_ms as usize * 16,
+            "speech WAV duration does not match its packed window and explicit padding"
         );
         Ok(())
     }
@@ -490,6 +567,10 @@ pub fn native_stt_request_cost_bound(
     request: &NativeSttRequest,
     audio: &NativeSttAudioWindow,
 ) -> Result<AnalysisRequestCostBound> {
+    ensure!(
+        !request.discovered,
+        "discovered review models have no analysis cost-bound contract"
+    );
     let spec = request.validate()?;
     audio.validate_for(spec)?;
     let billable_seconds_max = spec.max_window_ms.div_ceil(1_000);
