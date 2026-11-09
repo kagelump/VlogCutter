@@ -254,3 +254,12 @@
 .videoThumbnail { display: grid; gap: 3px; width: 128px; max-width: 100%; }
 .videoThumbnail img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: var(--surface); border-radius: 4px; }
 .videoThumbnail small { font-size: var(--text-xs); }
+
+/* Keep playback and capture controls visible beside a bounded transcript. */
+.recordLayout { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-5); align-items: start; }
+.recordMain, .recordTranscript { min-width: 0; }
+.liveTranscript { max-height: 60vh; overflow-y: auto; overflow-anchor: none; }
+@media (min-width: 1050px) {
+  .recordLayout:has(.recordTranscript) { grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr); }
+  .recordMain { position: sticky; top: var(--space-4); }
+}

@@ -6966,6 +6966,49 @@ mod tests {
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap()
         };
+        let live_uri =
+            format!("/api/v1/projects/{project_id}/review-sessions/{recording}/live-transcript");
+        let unauth = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(&live_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+        let no_csrf = fixture
+            .app()
+            .oneshot(post(live_uri.clone(), serde_json::json!({}), None))
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+        let enabled = fixture
+            .app()
+            .oneshot(post(live_uri.clone(), serde_json::json!({}), Some(&csrf)))
+            .await
+            .unwrap();
+        assert_eq!(enabled.status(), StatusCode::OK);
+        assert_eq!(json(enabled).await["enabled"], true);
+        let read = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(&live_uri)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        let value = json(read).await;
+        assert_eq!(value["model"], "ggml-tiny.bin");
+        assert_eq!(value["state"], "live");
+        assert!(value["lines"].as_array().unwrap().is_empty());
+
         let unacknowledged = serde_json::json!({"backend": "openrouter", "model": "openai/whisper-1", "authorizedMaxCostUsd": 0.5, "cloudUploadAcknowledged": false});
         let no_csrf = fixture
             .app()

@@ -31,4 +31,5 @@ tracing.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+hound = "3.5"
 tempfile = "3.24"

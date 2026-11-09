@@ -473,6 +473,20 @@ export interface ReviewSessionDetail extends ReviewSessionSummary {
 export interface ReviewSessionPage { items: ReviewSessionSummary[]; nextBefore: number | null }
 
 // Review-session transcription (#224). Mirrors rcdvlog-server-core::review_transcripts.
+export interface LiveReviewTranscript {
+  enabled: boolean;
+  state: "disabled" | "live" | "refining" | "complete" | "failed" | "stopped";
+  model: string;
+  modelAvailable: boolean;
+  sync: ReviewSyncDescription;
+  processedSeconds: number;
+  receivedSeconds: number;
+  revision: number;
+  finalRunId: string | null;
+  errorCode: string | null;
+  lines: { utterance: ReviewUtterance; movieTime: MovieTimeEstimate | null; assetId: string | null; shotNumber: number | null }[];
+}
+
 export type ReviewTranscriptionBackend = "local" | "openrouter";
 export type ReviewTranscriptionState = "queued" | "running" | "completed" | "noSpeech" | "partial" | "failed" | "cancelled";
 
@@ -716,6 +730,8 @@ export interface BrowserProjectClient extends ProjectClient {
   finalizeReviewSession(projectId: string, sessionId: string, request: { finalFrameCount: number; endReason: RecordingEndReason }): Promise<ReviewSessionDetail>;
   deleteReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail>;
   reviewSessionAudioUrl(projectId: string, sessionId: string): string;
+  getLiveReviewTranscript(projectId: string, sessionId: string): Promise<LiveReviewTranscript>;
+  enableLiveReviewTranscript(projectId: string, sessionId: string): Promise<LiveReviewTranscript>;
   preflightReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionPreflight>;
   startReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionRun>;
   listReviewTranscriptions(projectId: string, sessionId: string): Promise<{ items: ReviewTranscriptionRun[] }>;

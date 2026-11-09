@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 18;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 19;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -129,6 +129,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         name: "attached_project_catalogs",
         source_identity: "server-control/0018-attached-project-catalogs/20261108",
         apply: create_attached_project_catalogs,
+    },
+    SqliteMigration {
+        id: 19,
+        name: "live_review_transcription",
+        source_identity: "server-control/0019-live-review-transcription/20261109",
+        apply: crate::review_transcripts::migrate_live,
     },
 ];
 
@@ -1242,6 +1248,48 @@ mod tests {
             ),
         ]))
         .unwrap()
+    }
+
+    #[test]
+    fn live_review_migration_upgrades_schema_eighteen_without_losing_existing_metadata() {
+        let root = TempDir::new().unwrap();
+        let config = config(&root);
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let path = config.data_dir.join(CONTROL_DATABASE_FILENAME);
+        let mut c = open_writable_connection(&path).unwrap();
+        run_sqlite_migrations(&mut c, &CONTROL_CATALOG_MIGRATIONS[..18]).unwrap();
+        c.execute("INSERT INTO operational_metadata(key,value,updated_at) VALUES('live-upgrade','kept','2026-11-09T00:00:00Z')", []).unwrap();
+        drop(c);
+        for _ in 0..2 {
+            let catalog =
+                ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics()).unwrap();
+            let c = open_read_only_connection(catalog.database_path()).unwrap();
+            assert_eq!(
+                catalog.inspect_migrations().unwrap().status,
+                MigrationHistoryStatus::Current
+            );
+            assert_eq!(
+                c.query_row(
+                    "SELECT value FROM operational_metadata WHERE key='live-upgrade'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "kept"
+            );
+            assert_eq!(
+                c.query_row("SELECT COUNT(*) FROM review_live_transcripts", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                c.query_row("SELECT COUNT(*) FROM review_live_utterances", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]

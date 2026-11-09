@@ -20,6 +20,10 @@ export function memoryVoice(overrides: Partial<VoiceDeps> = {}): VoiceDeps {
 /** Mount the real route table at `path` against a mocked client. Unlisted client I/O methods are absent; thumbnail URLs use the real builder. */
 export function renderApp(path: string, overrides: Partial<BrowserProjectClient> = {}, voice: VoiceDeps = memoryVoice()) {
   const client = {
+    getLiveReviewTranscript: vi.fn().mockResolvedValue({ enabled: false, state: "disabled", lines: [], model: "ggml-tiny.bin", modelAvailable: true, revision: 0, processedSeconds: 0, receivedSeconds: 0, errorCode: null, finalRunId: null }),
+    enableLiveReviewTranscript: vi.fn().mockResolvedValue({ enabled: true, state: "live", lines: [], model: "ggml-tiny.bin", modelAvailable: true, revision: 0, processedSeconds: 0, receivedSeconds: 0, errorCode: null, finalRunId: null }),
+    reviewSessionAudioUrl: (projectId: string, sessionId: string) => new HttpProjectClient().reviewSessionAudioUrl(projectId, sessionId),
+    reviewReportUrl: (projectId: string, runId: string) => new HttpProjectClient().reviewReportUrl(projectId, runId),
     projectAssetThumbnailUrl: (projectId: string, assetId: string) => new HttpProjectClient().projectAssetThumbnailUrl(projectId, assetId),
     getServerStatus: vi.fn().mockResolvedValue(readyStatus),
     getSession: vi.fn().mockResolvedValue({ authenticated: true, sessions: [] }),

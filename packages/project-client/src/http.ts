@@ -34,6 +34,7 @@ import {
   type ReviewTranscriptionPreflight,
   type ReviewTranscriptionRequest,
   type ReviewTranscriptionRun,
+  type LiveReviewTranscript,
   type ReviewTargetDetail,
   type ReviewTargetImportRequest,
   type HistoricalReviewTargetImportRequest,
@@ -233,6 +234,8 @@ export class HttpProjectClient implements BrowserProjectClient {
   async finalizeReviewSession(projectId: string, sessionId: string, request: { finalFrameCount: number; endReason: RecordingEndReason }): Promise<ReviewSessionDetail> { return this.request(sessionPath(API_PATHS.reviewSessionFinalize, projectId, sessionId), jsonPost(request)); }
   async deleteReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail> { return this.request(sessionPath(API_PATHS.reviewSession, projectId, sessionId), { method: "DELETE" }); }
   reviewSessionAudioUrl(projectId: string, sessionId: string): string { return `${this.baseUrl}${sessionPath(API_PATHS.reviewSessionAudio, projectId, sessionId)}`; }
+  async getLiveReviewTranscript(projectId: string, sessionId: string): Promise<LiveReviewTranscript> { return this.request(sessionPath(API_PATHS.liveReviewTranscript, projectId, sessionId)); }
+  async enableLiveReviewTranscript(projectId: string, sessionId: string): Promise<LiveReviewTranscript> { return this.request(sessionPath(API_PATHS.liveReviewTranscript, projectId, sessionId), jsonPost({})); }
   async preflightReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionPreflight> { return this.request(sessionPath(API_PATHS.reviewTranscriptionPreflight, projectId, sessionId), jsonPost(request)); }
   async startReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionRun> { return this.request(sessionPath(API_PATHS.reviewTranscriptions, projectId, sessionId), jsonPost(request)); }
   async listReviewTranscriptions(projectId: string, sessionId: string): Promise<{ items: ReviewTranscriptionRun[] }> { return this.request(sessionPath(API_PATHS.reviewTranscriptions, projectId, sessionId)); }

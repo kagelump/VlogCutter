@@ -296,7 +296,7 @@ pub struct ReviewTargetImportRequest {
     pub max_verification_age_seconds: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewTargetActor {
     pub actor_type: String,

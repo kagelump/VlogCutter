@@ -127,11 +127,11 @@ pub use review_targets::{
     ReviewTargets, VerificationFreshness,
 };
 pub use review_transcripts::{
-    ModelDirSpeechRuntime, REVIEW_TRANSCRIBE_JOB_TYPE, REVIEW_TRANSCRIPT_SCHEMA,
-    ReviewSpeechRuntime, ReviewTranscriptError, ReviewTranscriptionBackend,
-    ReviewTranscriptionJobHandler, ReviewTranscriptionPreflight, ReviewTranscriptionRequest,
-    ReviewTranscriptionRun, ReviewTranscriptionState, ReviewTranscripts, ReviewUtterance,
-    resample_to, script_and_display,
+    LIVE_REVIEW_MODEL, LiveReviewLine, LiveReviewTranscript, ModelDirSpeechRuntime,
+    REVIEW_TRANSCRIBE_JOB_TYPE, REVIEW_TRANSCRIPT_SCHEMA, ReviewSpeechRuntime,
+    ReviewTranscriptError, ReviewTranscriptionBackend, ReviewTranscriptionJobHandler,
+    ReviewTranscriptionPreflight, ReviewTranscriptionRequest, ReviewTranscriptionRun,
+    ReviewTranscriptionState, ReviewTranscripts, ReviewUtterance, resample_to, script_and_display,
 };
 pub use scan::{
     NewScanSchedule, RecoveryReport, ScanRun, ScanSchedule, ScanScheduleUpdate, ScanService,
