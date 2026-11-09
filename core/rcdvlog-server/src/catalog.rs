@@ -136,6 +136,12 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "server-control/0019-review-target-display-names/20261109",
         apply: crate::review_targets::migrate_display_names,
     },
+    SqliteMigration {
+        id: 20,
+        name: "live_review_transcription",
+        source_identity: "server-control/0020-live-review-transcription/20261109",
+        apply: crate::review_transcripts::migrate_live,
+    },
 ];
 
 /// Migration 8's backfill folds `media_search_index.filename_folded` and
@@ -235,6 +241,7 @@ pub struct ControlCatalog {
     database_path: PathBuf,
     node_id: NodeId,
     attached_project_roots: Vec<PathBuf>,
+    protected_media_roots: Vec<PathBuf>,
 }
 
 impl ControlCatalog {
@@ -252,6 +259,11 @@ impl ControlCatalog {
             database_path,
             node_id,
             attached_project_roots: config.attached_project_roots.clone(),
+            protected_media_roots: vec![
+                config.data_dir.clone(),
+                config.temp_dir.clone(),
+                config.backup_dir.clone(),
+            ],
         };
 
         // Durable retry rather than a one-shot "migration 8 just applied"
@@ -328,6 +340,7 @@ impl ControlCatalog {
                 .to_path_buf(),
             self.clone(),
             self.attached_project_roots.clone(),
+            self.protected_media_roots.clone(),
         )
     }
 
@@ -1248,6 +1261,48 @@ mod tests {
             ),
         ]))
         .unwrap()
+    }
+
+    #[test]
+    fn live_review_migration_upgrades_schema_eighteen_without_losing_existing_metadata() {
+        let root = TempDir::new().unwrap();
+        let config = config(&root);
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let path = config.data_dir.join(CONTROL_DATABASE_FILENAME);
+        let mut c = open_writable_connection(&path).unwrap();
+        run_sqlite_migrations(&mut c, &CONTROL_CATALOG_MIGRATIONS[..18]).unwrap();
+        c.execute("INSERT INTO operational_metadata(key,value,updated_at) VALUES('live-upgrade','kept','2026-11-09T00:00:00Z')", []).unwrap();
+        drop(c);
+        for _ in 0..2 {
+            let catalog =
+                ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics()).unwrap();
+            let c = open_read_only_connection(catalog.database_path()).unwrap();
+            assert_eq!(
+                catalog.inspect_migrations().unwrap().status,
+                MigrationHistoryStatus::Current
+            );
+            assert_eq!(
+                c.query_row(
+                    "SELECT value FROM operational_metadata WHERE key='live-upgrade'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "kept"
+            );
+            assert_eq!(
+                c.query_row("SELECT COUNT(*) FROM review_live_transcripts", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                c.query_row("SELECT COUNT(*) FROM review_live_utterances", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]

@@ -739,6 +739,10 @@
         ],
         "type": "string"
       },
+      "LiveReviewTranscript": {
+        "additionalProperties": true,
+        "type": "object"
+      },
       "MediaAvailability": {
         "properties": {
           "locations": {
@@ -1083,6 +1087,10 @@
                   "null"
                 ]
               },
+              "localProxyAvailable": {
+                "description": "An allowed current local proxy can be streamed through getProjectAssetProxy.",
+                "type": "boolean"
+              },
               "materializedRevision": {
                 "minimum": 0,
                 "type": "integer"
@@ -1130,6 +1138,7 @@
               "materializedRevision",
               "activeNoteRevisionId",
               "noteRevisionCount",
+              "localProxyAvailable",
               "proxy",
               "thumbnail",
               "originalAvailability",
@@ -2955,6 +2964,87 @@
         }
       }
     },
+    "/api/v1/projects/{projectId}/assets/{assetId}/proxy": {
+      "get": {
+        "description": "Authenticated supported proxy from an attached CLI catalog inside allowed roots; supports single byte ranges. Never streams originals.",
+        "operationId": "getProjectAssetProxy",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "assetId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Range",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-Range",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "If-None-Match",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "video/mp4": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Proxy MP4"
+          },
+          "206": {
+            "content": {
+              "video/mp4": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Proxy byte range"
+          },
+          "304": {
+            "description": "Not modified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "416": {
+            "description": "Range not satisfiable"
+          }
+        }
+      }
+    },
     "/api/v1/projects/{projectId}/assets/{assetId}/removed": {
       "post": {
         "operationId": "setReviewRemoved",
@@ -3778,6 +3868,85 @@
           },
           "400": {
             "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{projectId}/review-sessions/{sessionId}/live-transcript": {
+      "get": {
+        "description": "Read the bounded provisional transcript tail and current movie matches. Never starts decoding.",
+        "operationId": "getLiveReviewTranscript",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveReviewTranscript"
+                }
+              }
+            },
+            "description": "LiveReviewTranscript"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "description": "Opt in to local multilingual Whisper Tiny live drafts and an automatic local full transcription after finalization. Never uploads to a cloud provider or downloads models.",
+        "operationId": "enableLiveReviewTranscript",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "projectId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveReviewTranscript"
+                }
+              }
+            },
+            "description": "LiveReviewTranscript"
           },
           "404": {
             "$ref": "#/components/responses/Error"

@@ -2,7 +2,7 @@
 
 The companion server is an optional, private Linux node for the single-user VlogCutter workflow. It indexes read-only original-media mounts, owns a global content library and durable media jobs, hosts a Chrome review/admin application, and serves projects from either an operation-synchronized replica or an explicitly attached same-machine CLI catalog. The Mac remains usable when the server is offline.
 
-Current compatibility is application `0.1.0`, sync protocol `1.0`, baseline format `1`, project schema `66`, control schema `18`, and backup format `1`. The frozen sync JSON schemas in `docs/contracts/sync-*-v1.schema.json` ([contracts](../contracts/)) describe protocol v1; change code and introduce a new version instead of editing those files in place.
+Current compatibility is application `0.1.0`, sync protocol `1.0`, baseline format `1`, project schema `66`, control schema `19`, and backup format `1`. The frozen sync JSON schemas in `docs/contracts/sync-*-v1.schema.json` ([contracts](../contracts/)) describe protocol v1; change code and introduce a new version instead of editing those files in place.
 
 ## Start here
 

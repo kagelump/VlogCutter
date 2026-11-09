@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
-const RATE: u32 = 48_000;
+pub(crate) const RATE: u32 = 48_000;
 
 /// Energy VAD over 10 ms frames at 16 kHz: deterministic and model-free.
 fn energy_regions(pcm: &[f32]) -> Vec<SpeechRegion> {
@@ -136,6 +136,12 @@ impl FakeRuntime {
 }
 
 impl ReviewSpeechRuntime for FakeRuntime {
+    fn live_models_present(&self) -> bool {
+        self.models
+    }
+    fn live_engine(&self) -> anyhow::Result<Box<dyn SttEngine>> {
+        self.local_engine()
+    }
     fn local_models_present(&self) -> bool {
         self.models
     }
@@ -166,7 +172,7 @@ impl ReviewSpeechRuntime for FakeRuntime {
 }
 
 /// `seconds` of 48 kHz mono audio with 1 kHz tone bursts where `speech` says.
-fn tone(seconds: f64, speech: &[(f64, f64)]) -> Vec<i16> {
+pub(crate) fn tone(seconds: f64, speech: &[(f64, f64)]) -> Vec<i16> {
     (0..(seconds * f64::from(RATE)) as usize)
         .map(|i| {
             let t = i as f64 / f64::from(RATE);

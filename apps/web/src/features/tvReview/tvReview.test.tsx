@@ -348,3 +348,79 @@ test("renaming a cut updates its heading without replacing the target", async ()
   await waitFor(() => expect(client.renameReviewTarget).toHaveBeenCalledWith("p1", "rtarget_one", "RC7"));
   expect(await screen.findByRole("heading", { name: /^RC7/ })).toBeVisible();
 });
+
+const liveDraft = {
+  enabled: true, state: "live" as const, model: "ggml-tiny.bin", modelAvailable: true,
+  sync: workspace().sync, processedSeconds: 4, receivedSeconds: 6, revision: 1, finalRunId: null, errorCode: null,
+  lines: [{ utterance: { ...run().utterances[0], text: "Live provisional words", displayText: "Live provisional words" },
+    movieTime: { movieSeconds: 1.5, uncertaintySeconds: 0.25, source: "sharedSync:estimated", evidenceIds: ["pa", "pb"] },
+    assetId: "asset_repeated", shotNumber: 1 }],
+};
+
+test("a recording shows provisional words and video thumbnails before finalization", async () => {
+  const { queryClient } = renderApp("/projects/p1/reviews/rtarget_one/sessions/rsession_1", {
+    ...targetsClient, getReviewSession: vi.fn().mockResolvedValue({ ...session, state: "recording" }),
+    getLiveReviewTranscript: vi.fn().mockResolvedValue(liveDraft),
+  });
+  expect(await screen.findByText("Live provisional words")).toBeVisible();
+  expect(screen.getByText("Live draft")).toBeVisible();
+  expect(screen.getByRole("img", { name: "Shot 1 thumbnail" })).toHaveAttribute("src", "/api/v1/projects/p1/assets/asset_repeated/thumbnail");
+  queryClient.setQueryData(["project", "p1", "liveTranscript", "rsession_1"], { ...liveDraft, revision: 2, lines: [{ ...liveDraft.lines[0], utterance: { ...liveDraft.lines[0].utterance, displayText: "Revised live words" }, movieTime: null, assetId: null, shotNumber: null }] });
+  expect(await screen.findByText("Revised live words")).toBeVisible();
+  expect(screen.queryByText("Live provisional words")).toBeNull();
+  expect(screen.queryByRole("img", { name: "Shot 1 thumbnail" })).toBeNull();
+});
+
+test("the draft remains during refinement and is replaced when the full run completes", async () => {
+  const running = run({ state: "running", utterances: [] });
+  const { queryClient } = renderApp("/projects/p1/reviews/rtarget_one/sessions/rsession_1", {
+    ...targetsClient, getReviewSession: vi.fn().mockResolvedValue({ ...session, state: "completed" }),
+    listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [running] }),
+    getLiveReviewTranscript: vi.fn().mockResolvedValue({ ...liveDraft, state: "refining", finalRunId: running.runId }),
+    getReviewWorkspace: vi.fn().mockResolvedValue(workspace()),
+  });
+  expect(await screen.findByText("Live provisional words")).toBeVisible();
+  expect(screen.getByText("Refining")).toBeVisible();
+  queryClient.setQueryData(["project", "p1", "transcriptions", "rsession_1"], { items: [run()] });
+  expect(await screen.findByText("I think I like the frame")).toBeVisible();
+  expect(screen.queryByText("Live provisional words")).toBeNull();
+});
+
+test("failed full transcription retains the live draft and offers a retry", async () => {
+  renderApp("/projects/p1/reviews/rtarget_one/sessions/rsession_1", {
+    ...targetsClient, getReviewSession: vi.fn().mockResolvedValue({ ...session, state: "completed" }),
+    listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [run({ state: "failed", utterances: [], errorCode: "review_transcription_decode_failed" })] }),
+    getLiveReviewTranscript: vi.fn().mockResolvedValue({ ...liveDraft, state: "failed", errorCode: "review_transcription_decode_failed" }),
+  });
+  expect(await screen.findByText("Live provisional words")).toBeVisible();
+  expect(screen.getByText("Draft kept")).toBeVisible();
+  expect(screen.getByText("Transcribe again")).toBeVisible();
+});
+
+
+test("live transcription startup failure leaves microphone capture running and can retry", async () => {
+  const recorder = { session: { sessionId: "rsession_1" }, cue: vi.fn(), stop: vi.fn(), pageHidden: vi.fn() };
+  const enable = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(liveDraft);
+  renderApp("/projects/p1/reviews/rtarget_one/record", { ...targetsClient, enableLiveReviewTranscript: enable }, micDeps(recorder));
+  await userEvent.click(await screen.findByRole("button", { name: "Allow microphone" }));
+  await userEvent.click(screen.getByLabelText(/Everyone here knows/));
+  await userEvent.click(screen.getByRole("button", { name: "Record" }));
+  expect(await screen.findByText(/Live transcription couldn’t start/)).toBeVisible();
+  expect(recorder.stop).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByRole("button", { name: "Retry live transcription" }));
+  expect(await screen.findByText("Live provisional words")).toBeVisible();
+  expect(enable).toHaveBeenCalledTimes(2);
+});
+
+test("turning live transcription off records without enabling either automatic pass", async () => {
+  const recorder = { session: { sessionId: "rsession_1" }, cue: vi.fn(), stop: vi.fn(), pageHidden: vi.fn() };
+  const enable = vi.fn();
+  renderApp("/projects/p1/reviews/rtarget_one/record", { ...targetsClient, enableLiveReviewTranscript: enable }, micDeps(recorder));
+  await userEvent.click(await screen.findByRole("button", { name: "Allow microphone" }));
+  await userEvent.click(screen.getByLabelText(/Everyone here knows/));
+  await userEvent.click(screen.getByLabelText(/Show live transcription/));
+  await userEvent.click(screen.getByRole("button", { name: "Record" }));
+  expect(await screen.findByText(/^Recording/)).toBeVisible();
+  expect(enable).not.toHaveBeenCalled();
+  expect(screen.queryByLabelText("Recording transcript")).toBeNull();
+});
