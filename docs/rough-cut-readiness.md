@@ -96,7 +96,7 @@ exemptions: a wrong anchor fails atomically. Missing, contradictory or genuinely
 tied chronology is an actionable conflict, never a filename/rank guess or an
 automatic clock correction. Protected teaser groups, ordered story groups and
 narrowly scoped decisions are supplied through the revision-local
-`storyPolicy`; see [chronology-safe edit-plan placement](edit-plan-chronology.md).
+`storyPolicy`; see [chronology-safe edit-plan placement](edit-plan.md#chronology-safe-edit-plan-placement).
 
 Supported kinds are `trim`, `replace`, `insert`, `reorder`, `omit`, `audio` and
 `split`. Changes use explicit source seconds; split supplies
@@ -110,7 +110,7 @@ and audio validator used by activation, preview, export and delivery. A refused
 patch leaves no partial revision. Existing human constraints and the
 expected active revision remain authoritative. Unchanged IDs survive; inserted,
 split and replacement lineage is retained in the creation operation and result.
-Named alternatives use the existing [comparison commands](edit-plan-comparisons.md).
+Named alternatives use the existing [comparison commands](edit-plan-review.md#short-local-edit-comparisons).
 
 Inherited independent audio follows its owning cut, preserving source sync through
 prefix insertions and trims. An explicit `audio` or replacement payload uses the
@@ -141,11 +141,11 @@ decision can correct ambiguous legacy retention without rewriting history.
 constraints and plan still match. This permits feedback on what was actually
 viewed while preserving stale activation and real dependency invalidation.
 
-Use [review coverage](edit-plan-review-coverage.md) for separately recorded picture,
+Use [review coverage](edit-plan-review.md#audiovisual-review-coverage) for separately recorded picture,
 listening, methods, intervals and remaining review questions. Sparse frames,
 transcripts, technical decode and energy samples never fill a human listening gap.
-Use [bounded inspection](edit-plan-inspection.md) for endpoints and explicit
-fallback precision, and [delivery bundles](edit-plan-delivery.md) for verified local
+Use [bounded inspection](edit-plan-review.md#bounded-source-window-inspection) for endpoints and explicit
+fallback precision, and [delivery bundles](edit-plan-output.md#local-edit-plan-review-bundles) for verified local
 movie/mapping/coverage/contact artifacts.
 
 ## Render progress and audio audit planning

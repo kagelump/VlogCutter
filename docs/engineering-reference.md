@@ -92,7 +92,7 @@ Full recipes and measured tables: [docs/core-media-reference.md](core-media-refe
 
 ### Assets, ingest, chronology
 
-- `Asset` is defined canonically in `core/rcdvlog-core/src/lib.rs` and mirrored in `apps/desktop/src/types.ts`. Availability is computed on read: `originalAvailable` needs a node-local location whose sampled fingerprint was verified; `proxyAvailable` needs the stored proxy path to exist; thumbnails are returned only when the file exists.
+- `Asset` is defined canonically in `core/rcdvlog-core/src/types.rs` and mirrored in `apps/desktop/src/types.ts`. Availability is computed on read: `originalAvailable` needs a node-local location whose sampled fingerprint was verified; `proxyAvailable` needs the stored proxy path to exist; thumbnails are returned only when the file exists.
 - `AssetPatch` is a full annotation replacement (notes, labels, removed, rotation all required). React's `patchFor(asset)` sends the full current state; the CLI fetches the asset, merges optional flags, and sends the full patch. Preserve this on both sides.
 - Ingest scans recursively without following symlinks (`mp4 mov m4v mts m2ts avi`, case-insensitive). Identity is a sampled BLAKE3 fingerprint (size plus up to 1 MiB from start, middle, end), unique per `(project_id, fingerprint)`; re-ingest is idempotent. Originals stay at their paths. ExifTool failure degrades to other metadata and must not block ingest.
 - Chronology order is `best_time IS NULL, best_time, filename, id`; raw camera timestamp text is preserved. A clock event applies a fixed offset per camera from a lexical filename boundary and never mutates source metadata. The story ribbon spaces clips by ordinal position, not duration (68 px columns, `[`/`]` zoom, `C` centers); do not revert to a fit-all duration plot.
@@ -117,9 +117,9 @@ Full recipes and measured tables: [docs/core-media-reference.md](core-media-refe
 ### Clip analysis (opt-in cloud)
 
 - Reads proxies, never originals; sends a deterministic frame pack (recipe `framepack.2fps.skip400ms.max40.win3-8.sharp-bright-motion.dhash8-d5.v1`) plus an accepted transcript when current. Prompt `vlm.observe.v2` with bounded-schema and domain validation. The OpenRouter key comes from `OPENROUTER_API_KEY` or `~/.openrouter.key` and is never stored in a catalog. Qwen is the default with Gemini fallback.
-- Agent-run direct Gemini native-video/Flex experiments (not a product adapter): see [docs/gemini-video-experiments.md](gemini-video-experiments.md).
+- Agent-run direct Gemini native-video/Flex experiments are not a product adapter; see "Direct Gemini experiments" in [docs/native-video-review.md](native-video-review.md).
 - Output is a suggestion layer: human notes are never touched; label consolidation remaps only labels in the AI ownership table and commits typed operations; title/description use `set_clip_summary`, not `AssetPatch`. Analysis is stale when frame recipe, prompt version, representation, or proxy fingerprint changes.
-- Paid analysis is admitted only through a concrete `RunPolicy` ([docs/analysis-preflight.md](analysis-preflight.md)) with a separate authorization record and bounded pilot; frames-only requests never read or send transcripts, project vocabulary needs its own approval, unknown/interrupted usage is fail-closed, and any policy/source/schema/context change invalidates approval. Provider diagnostics persist stable categories only. The legacy runtime ceiling is not cross-process safe; do not claim concurrent safety until runtime wiring calls `analysis::accounting`.
+- Paid analysis is admitted only through a concrete `RunPolicy` ([docs/analysis.md](analysis.md)) with a separate authorization record and bounded pilot; frames-only requests never read or send transcripts, project vocabulary needs its own approval, unknown/interrupted usage is fail-closed, and any policy/source/schema/context change invalidates approval. Provider diagnostics persist stable categories only. The legacy runtime ceiling is not cross-process safe; do not claim concurrent safety until runtime wiring calls `analysis::accounting`.
 - Cancellation: batch callbacks return `ControlFlow`; `Break` stops new claims without abandoning paid requests, and every stage commits per clip. `moments` and `prepare` CLI adapters take explicit scope, are suggestions requiring review, and never change inclusion, human annotations, or chronology.
 
 ### Batch estimation, calibration, publishing, edit planning
@@ -256,8 +256,6 @@ For frontend interaction changes, use the Vite browser preview for focus, keyboa
 Scale acceptance runs against a large real corpus that is **not** named in this repository; point tooling at it with `RCDVLOG_ACCEPTANCE_MEDIA_ROOT`. Never hard-code its path in Git, an issue, or a commit message (it names somebody's private footage). It is source media, not a disposable test directory: confirm the volume is mounted and permission granted, enumerate read-only first, never write generated files into the source tree, use a catalog under the laptop-local projects root, start with a small subset, and report exact scan/import/failure counts while preserving partial work. It is periodic manual acceptance. Checklist and coverage: [docs/acceptance-fixture.md](acceptance-fixture.md).
 
 ## 14. Change recipes
-
-Step lists are in [docs/change-recipes.md](change-recipes.md). In short:
 
 - **New domain operation**: core types and validation with tests, thin Tauri command (registered), `types.ts`/`api.ts` mirror, UI with accessible keyboard/error states, CLI command with stable JSON, process-level integration test, docs.
 - **Long-running batch**: versioned task key, explicit worker count, `BatchEstimator` with persisted history, per-item progress and incremental commits, failures excluded from throughput, UI merges each result.

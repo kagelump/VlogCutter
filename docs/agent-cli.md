@@ -6,39 +6,6 @@
 
 This document describes the CLI as implemented today.
 
-### Bounded inspection review sessions
-
-Use `edit-plan review-session create|step|status|steps|cancel|finish` for a
-durable, locally bounded reviewer-requested inspection loop over existing
-source-inspection and trim-suggestion tools. It performs no provider calls and
-cannot record human decisions; see [source inspection](edit-plan-inspection.md)
-for input shapes, bounds, and freshness behavior.
-
-### Assembled context review
-
-Use `edit-plan excerpt` to render a contiguous whole-cut neighborhood, then
-`edit-plan context create|get|note` to assemble verified evidence, read it, and
-record an explicitly authored note. Context handles remain separate source
-inspections; notes flow through revision-bound feedback. See
-[whole-cut context excerpts and assembled review](edit-plan-context-review.md).
-
-### Short local comparisons
-
-Use `edit-plan compare create|status|cancel|prefer|choice|apply` for two to four
-named, bounded variants from the same project. Creation renders each whole-cut
-excerpt and writes a local sequential player; preference and optional draft
-application remain explicit human operations. See
-[short comparisons](edit-plan-comparisons.md) for scope, verification, receipts,
-and revision guards.
-
-### Selected audio integrity
-
-Use `edit-plan audio-audit create|get` for a bounded, local audit of original and renderer-selected audio presence plus sampled master/selected/rendered energy. A source-only presence audit explicitly uses `artifactId: null` and no samples; preview-backed samples require an artifact matching the same revision and exact excerpt scope. The report exposes whether rendered inputs still match. It is technical evidence, not human listening or editorial acceptance. See [selected audio integrity](selected-audio-integrity.md) for bounds and interpretation.
-
-### Native video review
-
-Use `native-video preflight|authorize|pilot|prepare|windows|run|status|wait|cancel|result|evidence-list|run-windows` for explicit bounded direct video review. Policy and window inputs are typed capped JSON files; local preparation and read-only planning are separate from provider execution. See [native video review](native-video-review.md) for the full contract and examples.
-
 The accepted product architecture pairs this CLI
 with a project-local *agent workspace*. The CLI now reports its own build and
 readiness, and can explicitly bind or verify the selected executable and
@@ -61,6 +28,43 @@ operation. Human- and agent-authored files are different: the planned
 Workspace binding does not generate or rewrite project instructions. Script
 revisions and workspace materialization remain planned. Everything below is
 implemented; anything marked planned is not.
+
+## Feature guides
+
+These command families have their own contract docs; the sections below cover the rest.
+
+#### Bounded inspection review sessions
+
+Use `edit-plan review-session create|step|status|steps|cancel|finish` for a
+durable, locally bounded reviewer-requested inspection loop over existing
+source-inspection and trim-suggestion tools. It performs no provider calls and
+cannot record human decisions; see [source inspection](edit-plan-review.md#bounded-source-window-inspection)
+for input shapes, bounds, and freshness behavior.
+
+#### Assembled context review
+
+Use `edit-plan excerpt` to render a contiguous whole-cut neighborhood, then
+`edit-plan context create|get|note` to assemble verified evidence, read it, and
+record an explicitly authored note. Context handles remain separate source
+inspections; notes flow through revision-bound feedback. See
+[whole-cut context excerpts and assembled review](edit-plan-review.md#whole-cut-context-excerpts).
+
+#### Short local comparisons
+
+Use `edit-plan compare create|status|cancel|prefer|choice|apply` for two to four
+named, bounded variants from the same project. Creation renders each whole-cut
+excerpt and writes a local sequential player; preference and optional draft
+application remain explicit human operations. See
+[short comparisons](edit-plan-review.md#short-local-edit-comparisons) for scope, verification, receipts,
+and revision guards.
+
+#### Selected audio integrity
+
+Use `edit-plan audio-audit create|get` for a bounded, local audit of original and renderer-selected audio presence plus sampled master/selected/rendered energy. A source-only presence audit explicitly uses `artifactId: null` and no samples; preview-backed samples require an artifact matching the same revision and exact excerpt scope. The report exposes whether rendered inputs still match. It is technical evidence, not human listening or editorial acceptance. See [selected audio integrity](selected-audio-integrity.md) for bounds and interpretation.
+
+#### Native video review
+
+Use `native-video preflight|authorize|pilot|prepare|windows|run|status|wait|cancel|result|evidence-list|run-windows` for explicit bounded direct video review. Policy and window inputs are typed capped JSON files; local preparation and read-only planning are separate from provider execution. See [native video review](native-video-review.md) for the full contract and examples.
 
 ## Build and catalog selection
 
@@ -880,7 +884,7 @@ resolved. Missing credentials fail before provider construction. Existing
 explicit `analyze missing`/desktop batch invocations materialize the same
 policy, authorization and pilot automatically before bulk work.
 
-See [`docs/analysis-preflight.md`](analysis-preflight.md) for the data model and
+See [`docs/analysis.md`](analysis.md) for the data model and
 limits. `moments plan/authorize/pilot/run` expose the same lifecycle for
 editorial moment discovery; `moments plan` includes the full `runPolicy`.
 
@@ -1108,7 +1112,7 @@ rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan feedback apply --p
 ```
 
 Feedback command JSON shapes, revision semantics, and safety limits are
-documented in [revision-bound edit-plan feedback](edit-plan-feedback.md).
+documented in [revision-bound edit-plan feedback](edit-plan-review.md#revision-bound-edit-plan-feedback).
 
 Optional chapter-wide intent and pacing selection (schema 56):
 
@@ -1122,7 +1126,7 @@ Preview/get are read-only; create records an inactive, normally validated draft.
 Input accepts current canonical moments or explicitly authored locators, bounded
 to 8 MiB. Complete beats, explicit movement fragments, human constraints,
 earned-runtime reports, place context and evidence cache identity are documented
-in [chapter-wide sequence selection](edit-plan-selection.md). Selection never
+in [chapter-wide sequence selection](edit-plan.md#chapter-wide-sequence-selection). Selection never
 calls a provider or certifies speech/pacing quality.
 
 
@@ -1147,7 +1151,7 @@ ordered groups and scoped chronology exceptions:
 Ordinary sparse insertion omits `anchor` and is placed by corrected source
 chronology. Explicit anchors and policy scopes remain checked by the same core
 validator used for activation, preview and delivery. See
-[chronology-safe edit-plan placement](edit-plan-chronology.md).
+[chronology-safe edit-plan placement](edit-plan.md#chronology-safe-edit-plan-placement).
 
 `scriptRevisionId` is optional. Unknown fields are rejected, including unsupported
 track/effect fields. Positions must equal zero-based array indices. Empty
@@ -1210,11 +1214,11 @@ cache misses. Each attempt still verifies current sources/tools, makes a fresh
 sound mix when needed, and decodes and validates the complete assembled movie.
 The managed segment store has no implicit cleanup or deletion API.
 
-See [preview artifacts](edit-plan-preview-artifacts.md) for the receipt fields,
+See [preview artifacts](edit-plan-output.md#edit-plan-preview-artifacts) for the receipt fields,
 clock semantics, verification boundary, and interpretation limits.
 
 Revision-bound review feedback is implemented in schema 55. See
-[revision-bound edit-plan feedback](edit-plan-feedback.md) for the portable
+[revision-bound edit-plan feedback](edit-plan-review.md#revision-bound-edit-plan-feedback) for the portable
 operation model and apply/retention rules.
 
 ### Independent source audio
@@ -1277,7 +1281,7 @@ acceptance under #128 is separate.
 
 `edit-plan inspect --input /absolute/inspection.json` explicitly generates or
 reuses local source-window evidence without activating or changing a plan.
-See [source inspection](edit-plan-inspection.md) for the JSON contract, exact
+See [source inspection](edit-plan-review.md#bounded-source-window-inspection) for the JSON contract, exact
 representation PTS requests, mapping precision, sound policy and limitations.
 
 ### Confirmed human source ranges and trim suggestions
@@ -1287,7 +1291,7 @@ representation PTS requests, mapping precision, sound policy and limitations.
 `edit-plan ranges revoke --asset <id> --constraint <id> --expected-revision <n>
 --rationale "human reason"` make explicit, revision-guarded human decisions.
 `edit-plan suggest-trim --input /absolute/trim.json` returns advisory clean/
-utterance ranges without accepting a trim. See [source range decisions](edit-plan-source-ranges.md)
+utterance ranges without accepting a trim. See [source range decisions](edit-plan.md#confirmed-human-source-ranges)
 for the JSON contract, picture/audio scope, authority and stale-evidence rules.
 
 ## YouTube publishing
@@ -1327,7 +1331,7 @@ requires an existing explicit catalog and uses the writable verification/host-le
 the complete full-preview artifact and returns a version-1 path-free metadata
 handoff in the normal success envelope, command `edit-plan.review-target-export`.
 It copies/uploads no media and writes no edit-plan or feedback operation.
-See [TV review handoff v1](tv-review-handoff.md) for the fixture, clock precision,
+See [TV review handoff v1](tv-review.md) for the fixture, clock precision,
 import trust/freshness boundary and canonical feedback reconciliation.
 
 `review-markers plan|export|detect` (no catalog) handles acoustic movie-time
@@ -1342,27 +1346,27 @@ movie-time anchors plus rejected candidates) and the same evidence as shared
 `syncAnchors` (`acousticTimecode`) with their `movieClock` and `captureClock`,
 ready for `tv-review sync-preview`. Commands: `review-markers.plan`,
 `review-markers.export`, `review-markers.detect`. See
-[acoustic markers](tv-review-acoustic-markers.md).
+[acoustic markers](tv-review-timing.md#acoustic-markers).
 
 Historical movie review: `edit-plan historical-review-target-export --artifact
 <id> [--name <cut-name>]` opens the explicit existing catalog read-only and returns the separate
 `HistoricalRenderedArtifactReview` v1 DTO. It checks fresh movie bytes and stored
 mapping/revision integrity; current source/constraint/renderability checks remain
-explicitly unresolved. See [historical review policy](tv-review-handoff.md#historical-rendered-artifact-review-separate-contract).
+explicitly unresolved. See [historical review policy](tv-review.md#historical-rendered-artifact-review-separate-contract).
 
 `edit-plan feedback record-once --input <JSON>` safely imports a stable external
 review item after a lost response; identical retries return the same canonical
 note, while changed content under that identity is a conflict. See
-[feedback import](edit-plan-feedback.md). Proposal, decision and apply remain
+[feedback import](edit-plan-review.md#revision-bound-edit-plan-feedback). Proposal, decision and apply remain
 separate explicit operations.
 
-`tv-review sync-preview --input <file>` performs bounded catalog-free recording-clock mapping without writes. See [shared timing contract](tv-review-sync.md).
+`tv-review sync-preview --input <file>` performs bounded catalog-free recording-clock mapping without writes. See [shared timing contract](tv-review-timing.md#shared-synchronizer).
 
-`tv-review soundtrack-reference` and `tv-review soundtrack-match` are bounded local final-mix diagnostics. See [soundtrack matching](tv-soundtrack-matching.md).
+`tv-review soundtrack-reference` and `tv-review soundtrack-match` are bounded local final-mix diagnostics. See [soundtrack matching](tv-review-timing.md#passive-soundtrack-matching).
 
-`tv-review source-audio-landmark-index|source-audio-landmark-match` build an immutable full-movie landmark index and run the experimental single-recording alignment. The opt-in `source-audio-pooled-mvp-v1` path adds `tv-review source-audio-session-report` (bounded, resumable, cancellable full-recording schedule producing a conservative segment/offset report) and `tv-review source-audio-map-query` (read-only mapping of a recording-time range through the shared mapper; unknown, conflicting and gap-crossing queries get no movie location). See [full-recording source-audio alignment](tv-source-audio-matching.md).
+`tv-review source-audio-landmark-index|source-audio-landmark-match` build an immutable full-movie landmark index and run the experimental single-recording alignment. The opt-in `source-audio-pooled-mvp-v1` path adds `tv-review source-audio-session-report` (bounded, resumable, cancellable full-recording schedule producing a conservative segment/offset report) and `tv-review source-audio-map-query` (read-only mapping of a recording-time range through the shared mapper; unknown, conflicting and gap-crossing queries get no movie location). See [full-recording source-audio alignment](tv-review-timing.md#full-recording-source-audio-alignment-experimental).
 
 `tv-review soundtrack-session-plan|soundtrack-session-run|soundtrack-session-evidence|soundtrack-session-sync`
 plans complete-reference searches, runs bounded resumable local batches and maps
 native utterance frames through the shared engine. Media/path bindings stay on
-the local media host. See [local session workflow](tv-review-local-session.md).
+the local media host. See [local session workflow](tv-review-timing.md#local-session-matching).

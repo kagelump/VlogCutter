@@ -2,7 +2,7 @@
 
 ## Assets and patches
 
-`Asset` is defined canonically in `core/rcdvlog-core/src/lib.rs` and mirrored in `apps/desktop/src/types.ts`. Availability is computed on read:
+`Asset` is defined canonically in `core/rcdvlog-core/src/types.rs` and mirrored in `apps/desktop/src/types.ts`. Availability is computed on read:
 
 - `originalAvailable`: at least one node-local location exists and its sampled
   fingerprint has been verified against the asset identity.
@@ -265,7 +265,7 @@ invalidates transcript binding. Preparation preserves originals, human
 annotations, orientation choices, and chronology; see `docs/agent-cli.md`.
 
 Paid analysis is admitted only through a concrete `RunPolicy` (see
-`docs/analysis-preflight.md`). The policy binds exact project-owned asset/source
+`docs/analysis.md`). The policy binds exact project-owned asset/source
 identities, provider/model allowlist and permitted fallbacks, frames/audio/
 transcript payload, explicitly approved project-vocabulary context, expected
 cost, requested ceiling, prompt/schema/recipe/tool versions and readiness.

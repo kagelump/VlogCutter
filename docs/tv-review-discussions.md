@@ -1,11 +1,11 @@
-# TV voice review: editorial discussions (#225)
+# TV review: editorial discussions
 
-The editorial review workspace turns a [review transcript](tv-review-transcription.md)
+The editorial review workspace turns a [review transcript](tv-review-recording.md#transcription)
 into grouped editorial discussions with explicit human decisions. It then
 exports exactly what the owning catalog's existing `edit-plan feedback`
 commands accept. It is **not** a second feedback owner. Canonical notes,
 proposals, decisions, mappings and `apply` all stay in the project catalog
-([revision-bound feedback](edit-plan-feedback.md)).
+([revision-bound feedback](edit-plan-review.md#revision-bound-edit-plan-feedback)).
 
 | | |
 | --- | --- |
@@ -18,7 +18,7 @@ proposals, decisions, mappings and `apply` all stay in the project catalog
 Every utterance keeps its **recording clock** time.
 
 - **Movie time** comes only from the shared synchronizer
-  (`rcdvlog_core::tv_review_sync`, #223; see [tv-review-sync.md](tv-review-sync.md)).
+  (`rcdvlog_core::tv_review_sync`; see [tv-review-timing.md](tv-review-timing.md)).
   `review_sync` assembles its `SyncRequest` from stored session evidence and
   never estimates anything itself:
   - **Capture clocks** come only from `review-capture-calibration.v1` clock
@@ -125,14 +125,14 @@ collects its speakers, languages and the union of its candidates.
 
 - **Identity:** project, revision, viewed artifact, target digest, session
   and run, plus `targetContract`. For `historicalRenderedArtifactReviewV1`
-  (#232) the rules add that the movie's current sources, constraints and
+  the rules add that the movie's current sources, constraints and
   renderability were not established and that the report grants no render,
   edit, activation, upload, source-trim or feedback-apply authority. See
-  [the server historical-review policy](tv-review-handoff.md#server-historical-review-policy).
+  [the server historical-review policy](tv-review.md#server-historical-review-policy).
 - **Sync status:** the shared synchronizer's status, policy, anchor and
   boundary counts and diagnostics; each quoted utterance carries its `sync`.
 - **Coverage statement:** `audiovisualReviewAttested: false`. A recording is
-  not a continuous-review attestation (#204).
+  not a continuous-review attestation.
 - **Discussions:** quotes with raw and display text, the machine text, the
   correction flag and both clocks, followed by every item.
 - **`unresolved`:** discussions without a confirmed cut.
@@ -168,43 +168,3 @@ collects its speakers, languages and the union of its candidates.
 
 The server never writes the project catalog.
 
-## Tests
-
-- **Rust core** (`review_discussions_tests.rs`, on a real #222 session and a
-  #224 run with a scripted engine):
-  - shared-synchronizer estimates between two calibrated cues, with the
-    unknown tail kept as its own slice and no extrapolation after the last
-    cue; a cue without calibration leaves everything pending
-  - (`review_sync_tests.rs`) a capture interruption between cues is never
-    interpolated; each clock epoch is its own capture clock; inconsistent
-    calibrations and cues from an uncalibrated epoch are not used
-  - append-only corrections, a "previous shot" neighbour candidate, and human-only speaker attribution
-  - the **two-reviewer retraction flow**: "keep it longer" → "no, keep the
-    duration, change the transition". The retraction is preserved,
-    retracted and inconsistent acceptances are refused, and a target is
-    required. The exported `record` deserializes into the core
-    `RecordReviewNoteRequest`.
-  - agents cannot decide or claim to be human
-  - single reconciliation receipts
-- **HTTP adapter:** device credentials can never assert human authorship.
-- **Vitest:** clocks, candidates and provisional agent items; a speaker
-  correction call; a refused acceptance explained by its code.
-- **Playwright** on a real disposable server, with a seeded scripted
-  transcript in English and Simplified Mandarin:
-  - Traditional display plus raw text
-  - speaker correction and grouping
-  - the retraction flow and the refused acceptances
-  - picking a target and a single accepted edit
-  - the agent report JSON, with one human-accepted `editop_split_a` note and
-    no export of the retracted item
-
-## Not verified
-
-- A round trip through a real owning catalog's `edit-plan feedback record`.
-  It needs a completed preview artifact, which the cloud environment cannot
-  render against private media. Only type compatibility is tested.
-- Real conversations, real-device calibration and TV timing accuracy, server-side
-  acoustic-marker or passive-soundtrack anchors for stored sessions, and
-  bounded raw-audio playback in the
-  workspace. The session page offers the full WAV download only.
-- Utterance-level grouping quality on real speech.

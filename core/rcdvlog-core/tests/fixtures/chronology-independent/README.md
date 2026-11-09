@@ -15,7 +15,7 @@ produced by:
 2. inserting `projects`, `assets`, and `clock_events` rows directly, and
 3. computing the old-model projections (`assets.best_time`,
    `assets.offset_seconds`) with the same rule the pre-migration production
-   code used (`recalculate_clock` in `src/operations.rs`): per camera, the
+   code used (`recalculate_clock` in `src/operations/materialize.rs`): per camera, the
    offset of the last clock event whose `start_filename <= asset.filename`,
    and `best_time = normalize_datetime(captured_at_raw, offset)`.
 
