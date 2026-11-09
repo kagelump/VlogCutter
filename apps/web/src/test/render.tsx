@@ -24,6 +24,7 @@ export function renderApp(path: string, overrides: Partial<BrowserProjectClient>
     enableLiveReviewTranscript: vi.fn().mockResolvedValue({ enabled: true, state: "live", lines: [], model: "ggml-tiny.bin", modelAvailable: true, revision: 0, processedSeconds: 0, receivedSeconds: 0, errorCode: null, finalRunId: null }),
     reviewSessionAudioUrl: (projectId: string, sessionId: string) => new HttpProjectClient().reviewSessionAudioUrl(projectId, sessionId),
     reviewReportUrl: (projectId: string, runId: string) => new HttpProjectClient().reviewReportUrl(projectId, runId),
+    projectAssetProxyUrl: (projectId: string, assetId: string) => new HttpProjectClient().projectAssetProxyUrl(projectId, assetId),
     projectAssetThumbnailUrl: (projectId: string, assetId: string) => new HttpProjectClient().projectAssetThumbnailUrl(projectId, assetId),
     getServerStatus: vi.fn().mockResolvedValue(readyStatus),
     getSession: vi.fn().mockResolvedValue({ authenticated: true, sessions: [] }),

@@ -199,6 +199,8 @@ pub struct ProjectReviewAsset {
     pub materialized_revision: u64,
     pub active_note_revision_id: Option<String>,
     pub note_revision_count: usize,
+    /// Supported proxy in an explicitly allowed same-machine cache.
+    pub local_proxy_available: bool,
     pub proxy: Option<ReviewRepresentation>,
     pub thumbnail: Option<ReviewRepresentation>,
     pub original_availability: Option<NodeAvailabilityState>,
@@ -217,6 +219,7 @@ pub struct ProjectReplicaManager {
     data_dir: PathBuf,
     control: ControlCatalog,
     attached_project_roots: Vec<PathBuf>,
+    protected_media_roots: Vec<PathBuf>,
 }
 
 impl ProjectReplicaManager {
@@ -224,11 +227,13 @@ impl ProjectReplicaManager {
         data_dir: PathBuf,
         control: ControlCatalog,
         attached_project_roots: Vec<PathBuf>,
+        protected_media_roots: Vec<PathBuf>,
     ) -> Self {
         Self {
             data_dir,
             control,
             attached_project_roots,
+            protected_media_roots,
         }
     }
 
@@ -516,6 +521,67 @@ impl ProjectReplicaManager {
         Ok(asset.thumbnail_path.map(PathBuf::from))
     }
 
+    /// A supported generated proxy from an attached CLI catalog. Never a source
+    /// file or a path supplied by a browser or synchronized replica.
+    pub fn asset_proxy_path(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+    ) -> Result<Option<PathBuf>, ProjectReplicaError> {
+        if !self.get(project_id)?.is_attached() {
+            return Ok(None);
+        }
+        let catalog = self.open_catalog(project_id)?;
+        let Ok(asset) = catalog.get_asset(asset_id) else {
+            return Ok(None);
+        };
+        if asset.project_id != project_id {
+            return Ok(None);
+        }
+        Ok(self.servable_local_proxy(&asset))
+    }
+
+    fn servable_local_proxy(&self, asset: &Asset) -> Option<PathBuf> {
+        // Raw v3 stores encoded frames without display rotation. Legacy baked
+        // proxies are equivalent only when no source rotation was baked in.
+        let supported = asset.proxy_representation
+            == Some(rcdvlog_core::ProxyRepresentation::RawV3)
+            || (asset.proxy_representation
+                == Some(rcdvlog_core::ProxyRepresentation::MetadataBakedV1)
+                && asset.metadata_rotation_degrees == 0);
+        if !asset.proxy_available || !supported {
+            return None;
+        }
+        let path = Path::new(asset.proxy_path.as_deref()?)
+            .canonicalize()
+            .ok()?;
+        if !inside_any_root(&path, &self.attached_project_roots) {
+            return None;
+        }
+        if self
+            .protected_media_roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .any(|root| path.starts_with(root))
+        {
+            return None;
+        }
+        if Path::new(&asset.path)
+            .canonicalize()
+            .is_ok_and(|original| original == path)
+        {
+            return None;
+        }
+        // Check the resolved target too: a .v3.mp4 symlink may point at a different format.
+        if path.extension().and_then(|ext| ext.to_str()) != Some("mp4")
+            || Some(rcdvlog_core::proxy_representation(&path)) != asset.proxy_representation
+        {
+            return None;
+        }
+        let metadata = fs::metadata(&path).ok()?;
+        (metadata.is_file() && metadata.len() > 0).then_some(path)
+    }
+
     /// Pages every registered project replica, with its current asset
     /// count, by the stable raw `project_id` order. The project count is
     /// bounded by admin-registered replicas (not by archive size), but this
@@ -682,7 +748,7 @@ impl ProjectReplicaManager {
             .into_iter()
             .filter(|conflict| conflict.aggregate_id == asset_id)
             .count();
-        let (proxy, thumbnail, original_availability) =
+        let (proxy, thumbnail, mut original_availability) =
             if let Some(media_object_id) = &asset.media_object_id {
                 (
                     self.current_review_representation(
@@ -709,7 +775,17 @@ impl ProjectReplicaManager {
             } else {
                 (None, None, None)
             };
+        let attached = self.get(project_id)?.is_attached();
+        let local_proxy_available = attached && self.servable_local_proxy(&asset).is_some();
+        if attached {
+            original_availability = Some(if asset.original_available {
+                NodeAvailabilityState::AccessibleHere
+            } else {
+                NodeAvailabilityState::TemporarilyUnavailable
+            });
+        }
         Ok(ProjectReviewAsset {
+            local_proxy_available,
             asset: ProjectAssetItem {
                 project_asset_id: asset.id,
                 filename: asset.filename,
@@ -2339,5 +2415,182 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION - 1);
+    }
+    #[test]
+    fn attached_proxy_availability_uses_the_cli_cache_without_a_media_library_link() {
+        let mut fixture = Fixture::new();
+        let root = TempDir::new().unwrap();
+        let envelope = baseline(&root);
+        let project_id = &envelope.payload.project.project_id;
+        let path = desktop_path(&root);
+        let original = root.path().join("original.mov");
+        let proxy = root.path().join("clip.v3.mp4");
+        fs::write(&original, b"12345").unwrap();
+        fs::write(&proxy, b"generated mp4").unwrap();
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute(
+            "UPDATE assets SET path=?1, proxy_path=?2 WHERE id='asset_desktop'",
+            params![original.to_str().unwrap(), proxy.to_str().unwrap()],
+        )
+        .unwrap();
+        fixture.manager.import_baseline(&envelope).unwrap();
+        assert!(
+            !fixture
+                .manager
+                .get_review_asset(project_id, "asset_desktop")
+                .unwrap()
+                .local_proxy_available
+        );
+        fixture
+            .manager
+            .attach_catalog(&path, &[root.path().to_path_buf()], None)
+            .unwrap();
+        let item = fixture
+            .manager
+            .get_review_asset(project_id, "asset_desktop")
+            .unwrap();
+        assert!(item.local_proxy_available);
+        assert!(item.asset.media_object_id.is_none());
+        assert!(item.proxy.is_none());
+        assert_eq!(
+            item.original_availability,
+            Some(NodeAvailabilityState::AccessibleHere)
+        );
+        let serialized = serde_json::to_string(&item).unwrap();
+        assert!(!serialized.contains(root.path().to_str().unwrap()));
+        assert_eq!(
+            fixture
+                .manager
+                .asset_proxy_path(project_id, "asset_desktop")
+                .unwrap(),
+            Some(proxy.canonicalize().unwrap())
+        );
+        // A reachable proxy remains playable when the original is offline.
+        fs::remove_file(&original).unwrap();
+        let item = fixture
+            .manager
+            .get_review_asset(project_id, "asset_desktop")
+            .unwrap();
+        assert!(item.local_proxy_available);
+        assert_eq!(
+            item.original_availability,
+            Some(NodeAvailabilityState::TemporarilyUnavailable)
+        );
+        let legacy = root.path().join("camera-normalized-v1.mp4");
+        fs::write(&legacy, b"normalized mp4").unwrap();
+        c.execute(
+            "UPDATE assets SET proxy_path=?1 WHERE id='asset_desktop'",
+            [legacy.to_str().unwrap()],
+        )
+        .unwrap();
+        assert!(
+            fixture
+                .manager
+                .get_review_asset(project_id, "asset_desktop")
+                .unwrap()
+                .local_proxy_available
+        );
+        c.execute(
+            "UPDATE assets SET metadata_rotation_degrees=90 WHERE id='asset_desktop'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !fixture
+                .manager
+                .get_review_asset(project_id, "asset_desktop")
+                .unwrap()
+                .local_proxy_available
+        );
+        c.execute(
+            "UPDATE assets SET metadata_rotation_degrees=0 WHERE id='asset_desktop'",
+            [],
+        )
+        .unwrap();
+        fixture.manager.attached_project_roots = vec![root.path().to_path_buf()];
+        for recorded in [
+            root.path().join("missing.v3.mp4"),
+            root.path().join("old.v2.mp4"),
+            root.path().join("empty.v3.mp4"),
+        ] {
+            if recorded.file_name().unwrap() != "missing.v3.mp4" {
+                fs::write(
+                    &recorded,
+                    if recorded.to_string_lossy().contains("empty") {
+                        &b""[..]
+                    } else {
+                        &b"old"[..]
+                    },
+                )
+                .unwrap();
+            }
+            c.execute(
+                "UPDATE assets SET proxy_path=?1 WHERE id='asset_desktop'",
+                [recorded.to_str().unwrap()],
+            )
+            .unwrap();
+            assert!(
+                !fixture
+                    .manager
+                    .get_review_asset(project_id, "asset_desktop")
+                    .unwrap()
+                    .local_proxy_available
+            );
+        }
+        let outside = fixture._root.path().join("outside.v3.mp4");
+        fs::write(&outside, b"outside").unwrap();
+        c.execute(
+            "UPDATE assets SET proxy_path=?1 WHERE id='asset_desktop'",
+            [outside.to_str().unwrap()],
+        )
+        .unwrap();
+        assert!(
+            fixture
+                .manager
+                .asset_proxy_path(project_id, "asset_desktop")
+                .unwrap()
+                .is_none()
+        );
+        #[cfg(unix)]
+        {
+            let link = root.path().join("escape.v3.mp4");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            c.execute(
+                "UPDATE assets SET proxy_path=?1 WHERE id='asset_desktop'",
+                [link.to_str().unwrap()],
+            )
+            .unwrap();
+            assert!(
+                fixture
+                    .manager
+                    .asset_proxy_path(project_id, "asset_desktop")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        // Even overlapping allowlists cannot expose server state, or the original itself.
+        fixture
+            .manager
+            .attached_project_roots
+            .push(fixture._root.path().to_path_buf());
+        let secret = fixture.manager.data_dir.join("private.v3.mp4");
+        fs::write(&secret, b"private").unwrap();
+        for (source, recorded) in [
+            (original.as_path(), secret.as_path()),
+            (proxy.as_path(), proxy.as_path()),
+        ] {
+            c.execute(
+                "UPDATE assets SET path=?1, proxy_path=?2 WHERE id='asset_desktop'",
+                params![source.to_str().unwrap(), recorded.to_str().unwrap()],
+            )
+            .unwrap();
+            assert!(
+                fixture
+                    .manager
+                    .asset_proxy_path(project_id, "asset_desktop")
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }

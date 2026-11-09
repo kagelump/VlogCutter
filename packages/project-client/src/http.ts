@@ -153,6 +153,10 @@ export class HttpProjectClient implements BrowserProjectClient {
     return this.request<ProjectReviewAsset>(reviewPath(API_PATHS.projectReviewAsset, projectId, assetId));
   }
 
+  projectAssetProxyUrl(projectId: string, assetId: string): string {
+    return `${this.baseUrl}${reviewPath(API_PATHS.projectAssetProxy, projectId, assetId)}`;
+  }
+
   projectAssetThumbnailUrl(projectId: string, assetId: string): string {
     return `${this.baseUrl}${reviewPath(API_PATHS.projectAssetThumbnail, projectId, assetId)}`;
   }

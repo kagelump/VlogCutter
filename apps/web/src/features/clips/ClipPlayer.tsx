@@ -35,7 +35,10 @@ export const ClipPlayer = forwardRef<PlayerHandle, { projectId: string; asset: P
 
   if (!asset) return <div className={styles.stage}>{loading ? <Loading center /> : null}</div>;
 
-  const proxyReady = asset.proxy?.state === "available" && asset.proxy.availableOnServer;
+  const serverProxyReady = asset.proxy?.state === "available" && asset.proxy.availableOnServer;
+  const proxyUrl = serverProxyReady ? mediaUrl(asset.proxy!.representationId)
+    : asset.localProxyAvailable ? client.projectAssetProxyUrl(projectId, asset.projectAssetId) : undefined;
+  const proxyReady = !!proxyUrl;
   // A server-made thumbnail when there is one, else the project's own (e.g. an attached CLI catalog's).
   const poster = asset.thumbnail?.state === "available" && asset.thumbnail.availableOnServer
     ? mediaUrl(asset.thumbnail.representationId)
@@ -46,11 +49,11 @@ export const ClipPlayer = forwardRef<PlayerHandle, { projectId: string; asset: P
     <div className={styles.stage}>
       {proxyReady ? (
         <video
-          key={asset.proxy!.representationId}
+          key={proxyUrl}
           ref={video}
           className={styles.video}
           data-rotation={rotation || undefined}
-          src={mediaUrl(asset.proxy!.representationId)}
+          src={proxyUrl}
           poster={poster}
           controls
           playsInline
@@ -80,7 +83,7 @@ function previewTitle(asset: ProjectReviewAsset) {
   const proxy = asset.proxy;
   if (proxy?.state === "queued" || proxy?.state === "running") return "Preview is being made";
   if (proxy?.state === "failed") return "Preview failed";
-  if (proxy?.state === "available" && !proxy.availableOnServer) return "Preview is on another Mac";
+  if (proxy?.state === "available" && !proxy.availableOnServer) return "Preview is on another device";
   return "No preview";
 }
 
@@ -91,10 +94,10 @@ function previewDetail(asset: ProjectReviewAsset) {
   if (proxy?.state === "available" && !proxy.availableOnServer) return "Transfer it from the paired Mac, or generate one where the original is available.";
   if (asset.mediaVerificationState === "mismatch") return "The original’s identity doesn’t match. Fix that before making a preview.";
   switch (asset.originalAvailability) {
-    case "accessible_here": return "The server can read the original. Request a preview from Admin → Jobs.";
+    case "accessible_here": return "The original is available on this server.";
     case "accessible_on_another_node": return "The original is only on a paired Mac. Generate the preview there.";
     case "temporarily_unavailable":
     case "missing_after_completed_observation": return "The original’s storage is offline. Reconnect it, then generate a preview.";
-    default: return "This server can’t reach the original, so no preview can be made here.";
+    default: return "The original’s availability has not been established.";
   }
 }

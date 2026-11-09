@@ -30,6 +30,7 @@ export const API_PATHS = {
   previewAddToProject: "/api/v1/projects/{projectId}/assets/add/preview",
   addToProject: "/api/v1/projects/{projectId}/assets/add",
   projectReviewAsset: "/api/v1/projects/{projectId}/assets/{assetId}/review",
+  projectAssetProxy: "/api/v1/projects/{projectId}/assets/{assetId}/proxy",
   projectAssetThumbnail: "/api/v1/projects/{projectId}/assets/{assetId}/thumbnail",
   createReviewNote: "/api/v1/projects/{projectId}/assets/{assetId}/notes",
   addReviewLabel: "/api/v1/projects/{projectId}/assets/{assetId}/labels/add",

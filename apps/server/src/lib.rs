@@ -772,6 +772,10 @@ pub fn router(state: HttpState) -> Router {
             get(project_asset_thumbnail).head(project_asset_thumbnail),
         )
         .route(
+            "/api/v1/projects/{project_id}/assets/{asset_id}/proxy",
+            get(project_asset_proxy).head(project_asset_proxy),
+        )
+        .route(
             "/api/v1/projects/{project_id}/assets/{asset_id}/notes",
             post(create_review_note),
         )
@@ -1099,6 +1103,27 @@ fn base_openapi_document() -> serde_json::Value {
                         { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } }
                     ],
                     "responses": { "200": { "$ref": "#/components/responses/ProjectReviewAsset" }, "401": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/api/v1/projects/{projectId}/assets/{assetId}/proxy": {
+                "get": {
+                    "operationId": "getProjectAssetProxy",
+                    "description": "Authenticated supported proxy from an attached CLI catalog inside allowed roots; supports single byte ranges. Never streams originals.",
+                    "parameters": [
+                        { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "Range", "in": "header", "schema": { "type": "string" } },
+                        { "name": "If-Range", "in": "header", "schema": { "type": "string" } },
+                        { "name": "If-None-Match", "in": "header", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Proxy MP4", "content": { "video/mp4": { "schema": { "type": "string", "format": "binary" } } } },
+                        "206": { "description": "Proxy byte range", "content": { "video/mp4": { "schema": { "type": "string", "format": "binary" } } } },
+                        "304": { "description": "Not modified" },
+                        "401": { "$ref": "#/components/responses/Error" },
+                        "404": { "$ref": "#/components/responses/Error" },
+                        "416": { "description": "Range not satisfiable" }
+                    }
                 }
             },
             "/api/v1/projects/{projectId}/assets/{assetId}/thumbnail": {
@@ -1498,10 +1523,11 @@ fn base_openapi_document() -> serde_json::Value {
                 "ProjectReviewAsset": {
                     "allOf": [
                         { "$ref": "#/components/schemas/ProjectAssetItem" },
-                        { "type": "object", "required": ["materializedRevision", "activeNoteRevisionId", "noteRevisionCount", "proxy", "thumbnail", "originalAvailability", "unresolvedConflictCount"], "properties": {
+                        { "type": "object", "required": ["materializedRevision", "activeNoteRevisionId", "noteRevisionCount", "localProxyAvailable", "proxy", "thumbnail", "originalAvailability", "unresolvedConflictCount"], "properties": {
                             "materializedRevision": { "type": "integer", "minimum": 0 },
                             "activeNoteRevisionId": { "type": ["string", "null"] },
                             "noteRevisionCount": { "type": "integer", "minimum": 0 },
+                            "localProxyAvailable": { "type": "boolean", "description": "An allowed current local proxy can be streamed through getProjectAssetProxy." },
                             "proxy": { "oneOf": [{ "$ref": "#/components/schemas/ReviewRepresentation" }, { "type": "null" }] },
                             "thumbnail": { "oneOf": [{ "$ref": "#/components/schemas/ReviewRepresentation" }, { "type": "null" }] },
                             "originalAvailability": { "oneOf": [{ "$ref": "#/components/schemas/NodeAvailabilityState" }, { "type": "null" }] },
@@ -2838,6 +2864,107 @@ async fn get_project_review_asset(
         Ok(asset) => (StatusCode::OK, Json(asset)).into_response(),
         Err(error) => project_command_error_response(&request_id, error),
     }
+}
+
+/// Streams only the current proxy recorded by an attached catalog. SQLite and
+/// path checks run off the async executor; the file is streamed in bounded chunks.
+async fn project_asset_proxy(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath((project_id, asset_id)): AxumPath<(String, String)>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let manager = state.foundation.catalog().project_replicas();
+    let lookup =
+        tokio::task::spawn_blocking(move || manager.asset_proxy_path(&project_id, &asset_id)).await;
+    let path = match lookup {
+        Ok(Ok(Some(path))) => path,
+        Ok(Ok(None)) => {
+            return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND);
+        }
+        Ok(Err(error)) => return project_command_error_response(&request_id, error),
+        Err(_) => {
+            return query_error_response(
+                &request_id,
+                "internal_error",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(_) => return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND),
+    };
+    let metadata = match file.metadata().await {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => metadata,
+        _ => return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND),
+    };
+    let length = metadata.len();
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let etag = format!("\"{length:x}-{modified:x}\"");
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| value == etag)
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, "private, max-age=0, must-revalidate")
+            .body(Body::empty())
+            .expect("valid proxy headers");
+    }
+    let range = if headers
+        .get(header::IF_RANGE)
+        .is_some_and(|value| value.to_str().ok() != Some(etag.as_str()))
+    {
+        None
+    } else {
+        headers.get(header::RANGE)
+    };
+    let selected = match parse_range(range, length) {
+        Ok(selected) => selected,
+        Err(()) => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{length}"))
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CACHE_CONTROL, "private, no-store")
+                .body(Body::empty())
+                .expect("valid range refusal");
+        }
+    };
+    let (start, end, status) = selected.map_or((0, length - 1, StatusCode::OK), |(start, end)| {
+        (start, end, StatusCode::PARTIAL_CONTENT)
+    });
+    let count = end - start + 1;
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::CONTENT_LENGTH, count.to_string())
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "private, max-age=0, must-revalidate");
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{length}"),
+        );
+    }
+    if method == Method::HEAD {
+        return builder.body(Body::empty()).expect("valid proxy headers");
+    }
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return query_error_response(&request_id, "not_found", StatusCode::NOT_FOUND);
+    }
+    builder
+        .body(Body::from_stream(ReaderStream::new(file.take(count))))
+        .expect("valid proxy stream")
 }
 
 /// Largest project-local thumbnail served; real ones are a few hundred KiB.
@@ -7056,5 +7183,179 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(json(listed).await["items"].as_array().unwrap().len(), 0);
+    }
+    #[tokio::test]
+    async fn attached_proxy_streams_seekable_mp4_and_never_exposes_originals_or_paths() {
+        let fixture = Fixture::new(false);
+        let token = device_auth_token(&fixture);
+        let work = fixture._root.path().join("projects/playback");
+        std::fs::create_dir_all(&work).unwrap();
+        let db = work.join("catalog.sqlite3");
+        let (_catalog, project) = cli_catalog(&db);
+        let proxy = work.join("asset_http.v3.mp4");
+        let bytes = include_bytes!("../tests/fixtures/proxy.v3.mp4");
+        std::fs::write(&proxy, bytes).unwrap();
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute(
+            "UPDATE assets SET proxy_path=?1 WHERE id='asset_http'",
+            [proxy.to_str().unwrap()],
+        )
+        .unwrap();
+        fixture
+            .foundation
+            .catalog()
+            .project_replicas()
+            .attach_catalog(
+                &db,
+                &fixture.foundation.config().attached_project_roots,
+                None,
+            )
+            .unwrap();
+        let uri = format!("/api/v1/projects/{project}/assets/asset_http/proxy");
+        let make =
+            |method: Method, path: &str, range: Option<&str>, conditional: Option<(&str, &str)>| {
+                let mut req = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"));
+                if let Some(range) = range {
+                    req = req.header(header::RANGE, range);
+                }
+                if let Some((key, value)) = conditional {
+                    req = req.header(key, value);
+                }
+                req.body(Body::empty()).unwrap()
+            };
+        let anonymous = fixture
+            .app()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let full = fixture
+            .app()
+            .oneshot(make(Method::GET, &uri, None, None))
+            .await
+            .unwrap();
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers()[header::CONTENT_TYPE], "video/mp4");
+        assert_eq!(full.headers()[header::ACCEPT_RANGES], "bytes");
+        assert!(
+            full.headers()[header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .starts_with("private")
+        );
+        let etag = full.headers()[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(
+            to_bytes(full.into_body(), bytes.len() + 1)
+                .await
+                .unwrap()
+                .as_ref(),
+            &bytes[..]
+        );
+        for (range, start, end) in [
+            ("bytes=4-15", 4, 15),
+            ("bytes=-7", bytes.len() - 7, bytes.len() - 1),
+            ("bytes=100-", 100, bytes.len() - 1),
+        ] {
+            let response = fixture
+                .app()
+                .oneshot(make(Method::GET, &uri, Some(range), None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                response.headers()[header::CONTENT_RANGE],
+                format!("bytes {start}-{end}/{}", bytes.len())
+            );
+            assert_eq!(
+                to_bytes(response.into_body(), bytes.len() + 1)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                &bytes[start..=end]
+            );
+        }
+        let head = fixture
+            .app()
+            .oneshot(make(Method::HEAD, &uri, Some("bytes=4-15"), None))
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(head.headers()[header::CONTENT_LENGTH], "12");
+        assert!(to_bytes(head.into_body(), 1).await.unwrap().is_empty());
+        let invalid = fixture
+            .app()
+            .oneshot(make(Method::GET, &uri, Some("bytes=999999999-"), None))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            invalid.headers()[header::CONTENT_RANGE],
+            format!("bytes */{}", bytes.len())
+        );
+        let cached = fixture
+            .app()
+            .oneshot(make(
+                Method::GET,
+                &uri,
+                None,
+                Some(("if-none-match", &etag)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+        let stale_range = fixture
+            .app()
+            .oneshot(make(
+                Method::GET,
+                &uri,
+                Some("bytes=4-15"),
+                Some(("if-range", "\"old\"")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale_range.status(), StatusCode::OK);
+        let wrong = fixture
+            .app()
+            .oneshot(make(
+                Method::GET,
+                "/api/v1/projects/other/assets/asset_http/proxy",
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+        let review = fixture
+            .app()
+            .oneshot(make(
+                Method::GET,
+                &format!("/api/v1/projects/{project}/assets/asset_http/review"),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let projection = json(review).await;
+        assert_eq!(projection["localProxyAvailable"], true);
+        assert_eq!(projection["proxy"], serde_json::Value::Null);
+        assert!(!projection.to_string().contains(work.to_str().unwrap()));
+        // Replacing or removing a proxy does not leave immutable stale cache metadata.
+        std::fs::write(&proxy, &bytes[..bytes.len() - 1]).unwrap();
+        let changed = fixture
+            .app()
+            .oneshot(make(Method::HEAD, &uri, None, None))
+            .await
+            .unwrap();
+        assert_ne!(changed.headers()[header::ETAG], etag.as_str());
+        std::fs::remove_file(&proxy).unwrap();
+        let missing = fixture
+            .app()
+            .oneshot(make(Method::GET, &uri, None, None))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 }
