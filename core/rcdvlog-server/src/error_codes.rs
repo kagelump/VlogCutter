@@ -1,6 +1,7 @@
 /// Stable error-code registry shared by the HTTP adapter and the machine-readable CLI.
 /// Adding a client-visible code requires adding it here and updating the contract tests.
 pub const STABLE_ERROR_CODES: &[&str] = &[
+    "attached_catalog_refused",
     "audit_write_failed",
     "backup_busy",
     "backup_canceled",
@@ -47,6 +48,7 @@ pub const STABLE_ERROR_CODES: &[&str] = &[
     "origin_mismatch",
     "pairing_already_used",
     "pairing_not_found_or_expired",
+    "project_attached",
     "project_replica_not_found",
     "project_replica_path_unsafe",
     "rate_limited",
@@ -54,6 +56,8 @@ pub const STABLE_ERROR_CODES: &[&str] = &[
     "review_conflicting_acceptance",
     "review_human_required",
     "review_item_retracted",
+    "review_live_model_unavailable",
+    "review_live_resource_busy",
     "review_reconciliation_conflict",
     "review_session_audio_unavailable",
     "review_session_busy",
@@ -119,6 +123,8 @@ mod tests {
             "mount_unavailable",
             "conflict",
             "retryable_job_failure",
+            "review_live_model_unavailable",
+            "review_live_resource_busy",
             "internal_error",
         ] {
             assert!(is_stable_error_code(required), "missing {required}");

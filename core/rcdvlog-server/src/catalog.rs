@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 17;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 20;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
@@ -124,6 +124,24 @@ pub const CONTROL_CATALOG_MIGRATIONS: &[SqliteMigration] = &[
         source_identity: "server-control/0017-tv-review-target-contract/20261102",
         apply: crate::review_targets::migrate_contract,
     },
+    SqliteMigration {
+        id: 18,
+        name: "attached_project_catalogs",
+        source_identity: "server-control/0018-attached-project-catalogs/20261108",
+        apply: create_attached_project_catalogs,
+    },
+    SqliteMigration {
+        id: 19,
+        name: "review_target_display_names",
+        source_identity: "server-control/0019-review-target-display-names/20261109",
+        apply: crate::review_targets::migrate_display_names,
+    },
+    SqliteMigration {
+        id: 20,
+        name: "live_review_transcription",
+        source_identity: "server-control/0020-live-review-transcription/20261109",
+        apply: crate::review_transcripts::migrate_live,
+    },
 ];
 
 /// Migration 8's backfill folds `media_search_index.filename_folded` and
@@ -222,6 +240,8 @@ impl Drop for ServerInstanceLock {
 pub struct ControlCatalog {
     database_path: PathBuf,
     node_id: NodeId,
+    attached_project_roots: Vec<PathBuf>,
+    protected_media_roots: Vec<PathBuf>,
 }
 
 impl ControlCatalog {
@@ -238,6 +258,12 @@ impl ControlCatalog {
         let catalog = Self {
             database_path,
             node_id,
+            attached_project_roots: config.attached_project_roots.clone(),
+            protected_media_roots: vec![
+                config.data_dir.clone(),
+                config.temp_dir.clone(),
+                config.backup_dir.clone(),
+            ],
         };
 
         // Durable retry rather than a one-shot "migration 8 just applied"
@@ -313,6 +339,8 @@ impl ControlCatalog {
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf(),
             self.clone(),
+            self.attached_project_roots.clone(),
+            self.protected_media_roots.clone(),
         )
     }
 
@@ -531,6 +559,17 @@ fn create_control_catalog_foundation(transaction: &Transaction<'_>) -> Result<()
         "#,
     )?;
     Ok(())
+}
+
+/// An attached project is served from a same-machine CLI catalog instead of a
+/// server replica. The absolute path is node-local and never synchronized.
+fn create_attached_project_catalogs(transaction: &Transaction<'_>) -> Result<()> {
+    add_column_if_missing(
+        transaction,
+        "project_registry",
+        "attached_catalog_path",
+        "TEXT",
+    )
 }
 
 fn create_project_replica_sync_registry(transaction: &Transaction<'_>) -> Result<()> {

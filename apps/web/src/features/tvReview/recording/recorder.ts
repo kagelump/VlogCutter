@@ -1,8 +1,7 @@
 // Browser capture orchestration for TV voice review (#222).
 //
 // getUserMedia (processing disabled) → AudioWorklet (sample-clock tagged) →
-// PcmChunker → durable outbox → ChunkUploader. The page never plays, controls
-// or observes YouTube; the manual cue is the reviewer's own declaration.
+// PcmChunker → durable outbox → ChunkUploader.
 import type { BrowserProjectClient, CreateReviewSessionRequest, RecordingEndReason, ReviewSessionDetail, ReviewTargetDetail } from "@rcdvlog/project-client";
 import { PcmChunker, chunkFramesFor, sha256Hex, type PcmChunk } from "./chunker";
 import { OutboxFullError, type ChunkOutbox, type OutboxEvent, type OutboxSession } from "./outbox";
@@ -81,6 +80,7 @@ export class VoiceRecording {
   private probeRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private probeRetries = 0;
   private writes: Promise<void> = Promise.resolve();
+  private playbackWrites: Promise<boolean>[] = [];
   private meta!: OutboxSession;
   private eventOrder = 0;
   session!: ReviewSessionDetail;
@@ -354,6 +354,20 @@ export class VoiceRecording {
     return stored;
   }
 
+  /** Store a player observation and a contemporaneous microphone-clock pairing. */
+  observePlayback(positionSeconds: number, state: number, rate: number, observedMs: number) {
+    if (this.finished || this.chunker.originFrame === null || this.context.state !== "running" || !Number.isFinite(positionSeconds) || positionSeconds < 0 || !Number.isFinite(rate)) return;
+    const frame = this.contextFrame();
+    const pairedMs = performance.now();
+    const write = this.queueEvent("clockSample", frame, {
+      clockEpoch: this.clockEpoch, method: "playerObservation",
+      uncertaintyMs: 2 * RENDER_QUANTUM_FRAMES / this.sampleRate * 1000,
+      playback: { schema: "youtube-player-observation.v1", positionSeconds, state, rate, observedPerformanceMs: observedMs },
+    }, null, pairedMs);
+    this.playbackWrites.push(write);
+    void write.then(() => { this.playbackWrites = this.playbackWrites.filter((item) => item !== write); });
+  }
+
   private async deviceLost() {
     if (this.finished) return;
     await this.queueEvent("deviceLost", this.chunker.capturedEndFrame, { clockEpoch: this.clockEpoch });
@@ -375,6 +389,7 @@ export class VoiceRecording {
       if (this.clockTimer) clearInterval(this.clockTimer);
       if (this.probeTimer) clearInterval(this.probeTimer);
       if (this.probeRetryTimer) clearTimeout(this.probeRetryTimer);
+      await Promise.all(this.playbackWrites);
       await this.sampleClock("stop");
       this.finished = true;
       // The worklet flushes its partial batch and then acknowledges the final

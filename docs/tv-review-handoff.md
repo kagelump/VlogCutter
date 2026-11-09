@@ -15,7 +15,7 @@ plan, adopt a live SQLite/WAL file, or invent absent edit-plan history in a repl
 
 ```bash
 rcdvlog --catalog /absolute/project/catalog.sqlite3 edit-plan review-target-export \
-  --artifact preview_id --youtube-video-id synthetic01 > handoff-envelope.json
+  --artifact preview_id --name RC7 --youtube-video-id synthetic01 > handoff-envelope.json
 ```
 
 `--youtube-video-id` is optional and accepts an 11-character URL-safe ID, never
@@ -340,3 +340,20 @@ The latter changed pixel normalization and cache identity while retaining the
 measured clock/mapping representation. Unknown renderer recipes are refused.
 This compatibility applies only to historical integrity review: fresh strict
 export still requires the current recipe and every existing verification guard.
+
+## Cut names
+
+Both review export commands accept `--name RC7`. The optional top-level
+`displayName` is presentation metadata outside `target` and its digest. Imports
+without it retain the revision-based fallback. A duplicate import keeps the
+existing name; use **Rename cut** on the review page to change or clear it.
+Names are trimmed and limited to 120 characters, with no control characters.
+
+The authenticated `PATCH /api/v1/projects/{projectId}/review-targets/{reviewTargetId}`
+accepts `{ "displayName": "RC7" }` or `{ "displayName": null }` to clear it.
+Browser writes require CSRF. Naming never creates a new target, renews a receipt,
+alters the movie/mapping/revision, or rebinds existing recordings. YouTube-derived
+targets inherit the original name. Control migration 19 adds a nullable column
+and preserves existing review snapshots. Updated readers accept legacy exports;
+older readers that reject unknown fields must be upgraded before importing a
+named export.

@@ -17,7 +17,7 @@ Surfaces, in priority order:
 ## Invariants
 
 - **Originals are immutable.** Never move, rename, rewrite, or delete source media. Generated outputs live in project-local caches or the server's derived root, never beside originals. Card import may copy into a create-only archive root and never overwrites anything.
-- **SQLite is canonical.** There is one catalog per project, and the server has its own control catalog. Nodes sync typed immutable operations and never share live SQLite/WAL files. Do not add a competing JSON store. Generated files (e.g. workspace projections) must never become a second write path.
+- **SQLite is canonical.** There is one catalog per project, and the server has its own control catalog. Different machines sync typed immutable operations and never share live SQLite/WAL files. A same-machine server may attach an explicitly allow-listed CLI catalog at the exact current schema; both processes use SQLite locking and the catalog's node identity, and sync is disabled for that attached project. Do not add a competing JSON store. Generated files (e.g. workspace projections) must never become a second write path.
 - **Rust owns domain logic.** `core/rcdvlog-core` (plus `rcdvlog-server` and `rcdvlog-sync`) own ingest, chronology, media, analysis, and edit planning. The CLI, HTTP handlers, and Tauri commands are thin adapters that call the same core methods.
 - **Server networking:** the raw backend stays loopback-only behind Caddy or Tailscale Serve HTTPS. Never enable Funnel. Never put credentials in URLs or argv.
 - **Schema changes** are forward migrations with an upgrade test. Never solve a migration by deleting a database, and never hand-edit SQLite to get product behavior; add a domain operation instead.

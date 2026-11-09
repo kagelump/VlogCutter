@@ -291,6 +291,8 @@ pub struct ProjectAssetItem {
     pub rotation_degrees: i32,
     pub labels: Vec<String>,
     pub active_note: Option<String>,
+    /// What the clip shows, from clip analysis; `None` when not described.
+    pub description: Option<String>,
     pub duration_seconds: f64,
     pub best_time: Option<String>,
 }

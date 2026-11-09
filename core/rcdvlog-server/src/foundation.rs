@@ -194,10 +194,10 @@ impl RuntimeFoundation {
                 true,
             ),
             inspect_control_integrity(self.catalog.database_path()),
-            inspect_project_replicas(self.catalog.database_path(), &self.config.data_dir),
+            inspect_project_replicas(self.catalog.database_path(), &self.config),
             inspect_expired_job_leases(self.catalog.database_path()),
             inspect_backup_freshness(self.catalog.database_path(), self.config.backup_interval),
-            inspect_hlc_clock_sanity(self.catalog.database_path(), &self.config.data_dir),
+            inspect_hlc_clock_sanity(self.catalog.database_path(), &self.config),
         ];
         for index in 0..self.config.allowed_original_mounts.len() {
             checks.push(degrade(inspect_external_directory(
@@ -375,30 +375,33 @@ fn inspect_control_integrity(path: &Path) -> ReadinessCheck {
     }
 }
 
-fn registered_replica_paths(control_path: &Path) -> rusqlite::Result<Vec<String>> {
+fn registered_replica_paths(control_path: &Path) -> rusqlite::Result<Vec<(String, bool)>> {
     let connection = read_only_sqlite(control_path)?;
     let mut statement = connection.prepare(
-        "SELECT replica_relative_path FROM project_registry WHERE state='registered' ORDER BY project_id LIMIT 32",
+        "SELECT COALESCE(attached_catalog_path, replica_relative_path), attached_catalog_path IS NOT NULL FROM project_registry WHERE state='registered' ORDER BY project_id LIMIT 32",
     )?;
     statement
-        .query_map([], |row| row.get(0))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()
 }
 
-fn inspect_project_replicas(control_path: &Path, data_root: &Path) -> ReadinessCheck {
+fn inspect_project_replicas(control_path: &Path, config: &ServerConfig) -> ReadinessCheck {
     let Ok(paths) = registered_replica_paths(control_path) else {
         return ReadinessCheck::error("project_replicas", "project_registry_unavailable");
     };
-    for relative in paths {
-        let relative = Path::new(&relative);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
-        {
+    for (recorded, attached) in paths {
+        let Some(path) = registered_catalog_path(&recorded, attached, config) else {
             return ReadinessCheck::warning("project_replicas", "project_replica_path_unsafe");
+        };
+        if attached
+            && !read_only_sqlite(&path).is_ok_and(|connection| {
+                rcdvlog_core::inspect_project_catalog_migrations(&connection).is_ok_and(
+                    |inspection| inspection.status == rcdvlog_core::MigrationHistoryStatus::Current,
+                )
+            })
+        {
+            return ReadinessCheck::warning("project_replicas", "attached_catalog_refused");
         }
-        let path = data_root.join(relative);
         if !path.is_file() {
             return ReadinessCheck::warning("project_replicas", "project_replica_missing");
         }
@@ -466,14 +469,39 @@ fn inspect_backup_freshness(control_path: &Path, interval: Duration) -> Readines
     }
 }
 
-fn inspect_hlc_clock_sanity(control_path: &Path, data_root: &Path) -> ReadinessCheck {
+fn registered_catalog_path(
+    recorded: &str,
+    attached: bool,
+    config: &ServerConfig,
+) -> Option<PathBuf> {
+    let path = Path::new(recorded);
+    if attached {
+        let path = path.canonicalize().ok()?;
+        (crate::inside_any_root(&path, &config.attached_project_roots)
+            && !path.starts_with(config.data_dir.canonicalize().ok()?))
+        .then_some(path)
+    } else {
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        Some(config.data_dir.join(path))
+    }
+}
+
+fn inspect_hlc_clock_sanity(control_path: &Path, config: &ServerConfig) -> ReadinessCheck {
     let Ok(paths) = registered_replica_paths(control_path) else {
         return ReadinessCheck::error("hlc_clock", "project_registry_unavailable");
     };
     let now = chrono::Utc::now().timestamp_millis();
     let future_limit = now.saturating_add(rcdvlog_core::MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS);
-    for relative in paths {
-        let path = data_root.join(relative);
+    for (recorded, attached) in paths {
+        let Some(path) = registered_catalog_path(&recorded, attached, config) else {
+            continue;
+        };
         let highest = read_only_sqlite(&path).and_then(|connection| {
             connection.query_row(
                 "SELECT COALESCE(MAX(wall_millis),0) FROM operation_hlc_state",
@@ -511,7 +539,7 @@ fn ensure_owned_directory(path: &Path, field: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_local_database_filesystem(path: &Path) -> Result<()> {
+pub(crate) fn ensure_local_database_filesystem(path: &Path) -> Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -538,7 +566,7 @@ fn ensure_local_database_filesystem(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn ensure_local_database_filesystem(_path: &Path) -> Result<()> {
+pub(crate) fn ensure_local_database_filesystem(_path: &Path) -> Result<()> {
     // Portable APIs cannot reliably distinguish local storage from every network or FUSE mount.
     // Compose supplies a plain Docker-local volume; non-Linux operators must keep dataDir local.
     Ok(())
@@ -751,5 +779,44 @@ mod tests {
             check.name == "derived_directory"
                 && check.code.as_deref() == Some("directory_not_writable")
         }));
+    }
+    #[test]
+    fn readiness_inspects_the_active_attached_catalog_instead_of_a_missing_replica() {
+        let root = TempDir::new().unwrap();
+        let work = root.path().join("working");
+        fs::create_dir_all(&work).unwrap();
+        let mut config = configured(&root, false);
+        config.attached_project_roots = vec![work.clone()];
+        let foundation = RuntimeFoundation::initialize(config.clone()).unwrap();
+        let path = work.join("catalog.sqlite3");
+        let catalog = rcdvlog_core::Catalog::open(&path).unwrap();
+        catalog.set_local_node_id("node_cli").unwrap();
+        let project = catalog.create_project("Shared").unwrap();
+        foundation
+            .catalog()
+            .project_replicas()
+            .attach_catalog(&path, &[work], None)
+            .unwrap();
+        assert_eq!(
+            inspect_project_replicas(foundation.catalog().database_path(), &config).status,
+            CheckStatus::Ok
+        );
+        assert!(foundation.readiness().is_ready());
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute("INSERT INTO operation_hlc_state(node_id, wall_millis, counter) VALUES('node_cli', ?1, 0) ON CONFLICT(node_id) DO UPDATE SET wall_millis=excluded.wall_millis", [chrono::Utc::now().timestamp_millis() + rcdvlog_core::MAX_REMOTE_HLC_FUTURE_SKEW_MILLIS + 60_000]).unwrap();
+        assert_eq!(
+            inspect_hlc_clock_sanity(foundation.catalog().database_path(), &config)
+                .code
+                .as_deref(),
+            Some("clock_skew_detected")
+        );
+        config.attached_project_roots.clear();
+        assert_eq!(
+            inspect_project_replicas(foundation.catalog().database_path(), &config)
+                .code
+                .as_deref(),
+            Some("project_replica_path_unsafe")
+        );
+        assert_eq!(catalog.list_projects().unwrap()[0].id, project.id);
     }
 }

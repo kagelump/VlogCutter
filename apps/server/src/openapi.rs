@@ -165,6 +165,44 @@ pub(super) fn base_openapi_document() -> serde_json::Value {
                     "responses": { "200": { "$ref": "#/components/responses/ProjectReviewAsset" }, "401": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" } }
                 }
             },
+            "/api/v1/projects/{projectId}/assets/{assetId}/proxy": {
+                "get": {
+                    "operationId": "getProjectAssetProxy",
+                    "description": "Authenticated supported proxy from an attached CLI catalog inside allowed roots; supports single byte ranges. Never streams originals.",
+                    "parameters": [
+                        { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "Range", "in": "header", "schema": { "type": "string" } },
+                        { "name": "If-Range", "in": "header", "schema": { "type": "string" } },
+                        { "name": "If-None-Match", "in": "header", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Proxy MP4", "content": { "video/mp4": { "schema": { "type": "string", "format": "binary" } } } },
+                        "206": { "description": "Proxy byte range", "content": { "video/mp4": { "schema": { "type": "string", "format": "binary" } } } },
+                        "304": { "description": "Not modified" },
+                        "401": { "$ref": "#/components/responses/Error" },
+                        "404": { "$ref": "#/components/responses/Error" },
+                        "416": { "description": "Range not satisfiable" }
+                    }
+                }
+            },
+            "/api/v1/projects/{projectId}/assets/{assetId}/thumbnail": {
+                "get": {
+                    "operationId": "getProjectAssetThumbnail",
+                    "description": "The JPEG thumbnail the project's catalog records for the asset, served only when it is a same-machine file inside RCDVLOG_ATTACHED_PROJECT_ROOTS.",
+                    "parameters": [
+                        { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "assetId", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "JPEG thumbnail", "content": { "image/jpeg": { "schema": { "type": "string", "format": "binary" } } } },
+                        "304": { "description": "Not modified" },
+                        "401": { "$ref": "#/components/responses/Error" },
+                        "404": { "$ref": "#/components/responses/Error" },
+                        "503": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
             "/api/v1/projects/{projectId}/assets/{assetId}/notes": {
                 "post": { "operationId": "createReviewNote", "parameters": [
                     { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string" } },
@@ -457,7 +495,7 @@ pub(super) fn base_openapi_document() -> serde_json::Value {
                 },
                 "ProjectAssetItem": {
                     "type": "object",
-                    "required": ["projectAssetId", "filename", "camera", "mediaObjectId", "mediaVerificationState", "removed", "rotationDegrees", "labels", "activeNote", "durationSeconds", "bestTime"],
+                    "required": ["projectAssetId", "filename", "camera", "mediaObjectId", "mediaVerificationState", "removed", "rotationDegrees", "labels", "activeNote", "description", "durationSeconds", "bestTime"],
                     "properties": {
                         "projectAssetId": { "type": "string" },
                         "filename": { "type": "string" },
@@ -468,6 +506,7 @@ pub(super) fn base_openapi_document() -> serde_json::Value {
                         "rotationDegrees": { "type": "integer" },
                         "labels": { "type": "array", "items": { "type": "string" } },
                         "activeNote": { "type": ["string", "null"] },
+                        "description": { "type": ["string", "null"], "description": "What the clip shows, from clip analysis." },
                         "durationSeconds": { "type": "number" },
                         "bestTime": { "type": ["string", "null"], "format": "date-time" }
                     }
@@ -544,10 +583,11 @@ pub(super) fn base_openapi_document() -> serde_json::Value {
                 "ProjectReviewAsset": {
                     "allOf": [
                         { "$ref": "#/components/schemas/ProjectAssetItem" },
-                        { "type": "object", "required": ["materializedRevision", "activeNoteRevisionId", "noteRevisionCount", "proxy", "thumbnail", "originalAvailability", "unresolvedConflictCount"], "properties": {
+                        { "type": "object", "required": ["materializedRevision", "activeNoteRevisionId", "noteRevisionCount", "localProxyAvailable", "proxy", "thumbnail", "originalAvailability", "unresolvedConflictCount"], "properties": {
                             "materializedRevision": { "type": "integer", "minimum": 0 },
                             "activeNoteRevisionId": { "type": ["string", "null"] },
                             "noteRevisionCount": { "type": "integer", "minimum": 0 },
+                            "localProxyAvailable": { "type": "boolean", "description": "An allowed current local proxy can be streamed through getProjectAssetProxy." },
                             "proxy": { "oneOf": [{ "$ref": "#/components/schemas/ReviewRepresentation" }, { "type": "null" }] },
                             "thumbnail": { "oneOf": [{ "$ref": "#/components/schemas/ReviewRepresentation" }, { "type": "null" }] },
                             "originalAvailability": { "oneOf": [{ "$ref": "#/components/schemas/NodeAvailabilityState" }, { "type": "null" }] },

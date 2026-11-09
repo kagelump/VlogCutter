@@ -34,6 +34,7 @@ import {
   type ReviewTranscriptionPreflight,
   type ReviewTranscriptionRequest,
   type ReviewTranscriptionRun,
+  type LiveReviewTranscript,
   type ReviewTargetDetail,
   type ReviewTargetImportRequest,
   type HistoricalReviewTargetImportRequest,
@@ -152,6 +153,14 @@ export class HttpProjectClient implements BrowserProjectClient {
     return this.request<ProjectReviewAsset>(reviewPath(API_PATHS.projectReviewAsset, projectId, assetId));
   }
 
+  projectAssetProxyUrl(projectId: string, assetId: string): string {
+    return `${this.baseUrl}${reviewPath(API_PATHS.projectAssetProxy, projectId, assetId)}`;
+  }
+
+  projectAssetThumbnailUrl(projectId: string, assetId: string): string {
+    return `${this.baseUrl}${reviewPath(API_PATHS.projectAssetThumbnail, projectId, assetId)}`;
+  }
+
   async createReviewNote(projectId: string, assetId: string, text: string, baseRevision: number): Promise<ReviewMutationResult> {
     return this.request<ReviewMutationResult>(reviewPath(API_PATHS.createReviewNote, projectId, assetId), jsonPost({ text, baseRevision }));
   }
@@ -215,6 +224,7 @@ export class HttpProjectClient implements BrowserProjectClient {
   async preflightHistoricalReviewTarget(projectId: string, request: HistoricalReviewTargetImportRequest): Promise<ReviewTargetPreflight> { return this.request(pathParam(API_PATHS.historicalReviewTargetPreflight, "projectId", projectId), jsonPost(request)); }
   async importHistoricalReviewTarget(projectId: string, request: HistoricalReviewTargetImportRequest): Promise<ReviewTargetImportResult> { return this.request(pathParam(API_PATHS.historicalReviewTargetImport, "projectId", projectId), jsonPost(request)); }
   async getReviewTarget(projectId: string, reviewTargetId: string): Promise<ReviewTargetDetail> { return this.request(reviewTargetPath(API_PATHS.reviewTarget, projectId, reviewTargetId)); }
+  async renameReviewTarget(projectId: string, reviewTargetId: string, displayName: string | null): Promise<ReviewTargetDetail> { return this.request(reviewTargetPath(API_PATHS.reviewTarget, projectId, reviewTargetId), { ...jsonPost({ displayName }), method: "PATCH" }); }
   async declareReviewTargetYoutube(projectId: string, reviewTargetId: string, youtubeVideoId: string | null): Promise<ReviewTargetImportResult> { return this.request(reviewTargetPath(API_PATHS.reviewTargetYoutube, projectId, reviewTargetId), jsonPost({ youtubeVideoId })); }
   async getReviewTargetCandidates(projectId: string, reviewTargetId: string, startSeconds: number, endSeconds: number): Promise<ReviewTargetCandidates> { return this.request(`${reviewTargetPath(API_PATHS.reviewTargetCandidates, projectId, reviewTargetId)}${queryString({ startSeconds, endSeconds })}`); }
   async listReviewSessions(projectId: string, reviewTargetId?: string, limit = 50, before?: number): Promise<ReviewSessionPage> { return this.request(`${pathParam(API_PATHS.reviewSessions, "projectId", projectId)}${queryString({ reviewTargetId, limit, before })}`); }
@@ -229,6 +239,8 @@ export class HttpProjectClient implements BrowserProjectClient {
   async finalizeReviewSession(projectId: string, sessionId: string, request: { finalFrameCount: number; endReason: RecordingEndReason }): Promise<ReviewSessionDetail> { return this.request(sessionPath(API_PATHS.reviewSessionFinalize, projectId, sessionId), jsonPost(request)); }
   async deleteReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail> { return this.request(sessionPath(API_PATHS.reviewSession, projectId, sessionId), { method: "DELETE" }); }
   reviewSessionAudioUrl(projectId: string, sessionId: string): string { return `${this.baseUrl}${sessionPath(API_PATHS.reviewSessionAudio, projectId, sessionId)}`; }
+  async getLiveReviewTranscript(projectId: string, sessionId: string): Promise<LiveReviewTranscript> { return this.request(sessionPath(API_PATHS.liveReviewTranscript, projectId, sessionId)); }
+  async enableLiveReviewTranscript(projectId: string, sessionId: string): Promise<LiveReviewTranscript> { return this.request(sessionPath(API_PATHS.liveReviewTranscript, projectId, sessionId), jsonPost({})); }
   async preflightReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionPreflight> { return this.request(sessionPath(API_PATHS.reviewTranscriptionPreflight, projectId, sessionId), jsonPost(request)); }
   async startReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionRun> { return this.request(sessionPath(API_PATHS.reviewTranscriptions, projectId, sessionId), jsonPost(request)); }
   async listReviewTranscriptions(projectId: string, sessionId: string): Promise<{ items: ReviewTranscriptionRun[] }> { return this.request(sessionPath(API_PATHS.reviewTranscriptions, projectId, sessionId)); }

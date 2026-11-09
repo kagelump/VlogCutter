@@ -226,6 +226,7 @@ impl SessionSync {
         };
         let mut anchors = Vec::new();
         let mut boundaries = Vec::new();
+        let mut previous_playback: BTreeMap<String, (u64, f64)> = BTreeMap::new();
         for event in &events {
             let epoch = event
                 .detail
@@ -233,6 +234,127 @@ impl SessionSync {
                 .and_then(|d| d.get("clockEpoch"))
                 .and_then(|v| v.as_u64());
             match event.kind.as_str() {
+                "clockSample"
+                    if event
+                        .detail
+                        .as_ref()
+                        .and_then(|d| d.get("method"))
+                        .and_then(|v| v.as_str())
+                        == Some("playerObservation") =>
+                {
+                    let Some(clock) = clocks.iter().find(|c| Some(c.epoch) == epoch) else {
+                        continue;
+                    };
+                    let c = &clock.clock;
+                    if !(c.first_sample..=c.last_sample).contains(&event.audio_frame) {
+                        continue;
+                    }
+                    // Missing or malformed player fields must not bridge valid anchors.
+                    let boundary_index = boundaries.len();
+                    boundaries.push(SyncBoundary {
+                        evidence_id: event.event_id.clone(),
+                        clock_id: c.clock_id.clone(),
+                        sample_index: event.audio_frame,
+                        kind: SyncBoundaryKind::Resync,
+                    });
+                    let Some(d) = event.detail.as_ref() else {
+                        continue;
+                    };
+                    let Some(p) = d.get("playback") else { continue };
+                    let (
+                        Some(position),
+                        Some(state),
+                        Some(rate),
+                        Some(observed_ms),
+                        Some(paired_ms),
+                        Some(uncertainty_ms),
+                    ) = (
+                        p.get("positionSeconds").and_then(|v| v.as_f64()),
+                        p.get("state").and_then(|v| v.as_i64()),
+                        p.get("rate").and_then(|v| v.as_f64()),
+                        p.get("observedPerformanceMs").and_then(|v| v.as_f64()),
+                        event.performance_ms,
+                        d.get("uncertaintyMs").and_then(|v| v.as_f64()),
+                    )
+                    else {
+                        continue;
+                    };
+                    let pairing_lag_ms = paired_ms - observed_ms;
+                    let monotonic_ns = c.monotonic_origin_ns as f64
+                        + event.audio_frame as f64 / f64::from(sample_rate) * 1e9;
+                    let paired_ns = (paired_ms - clock.performance_epoch_ms) * 1e6;
+                    if p.get("schema").and_then(|v| v.as_str())
+                        != Some("youtube-player-observation.v1")
+                        || !position.is_finite()
+                        || !(0.0..=movie.duration_seconds).contains(&position)
+                        || !rate.is_finite()
+                        || rate <= 0.0
+                        || !matches!(state, -1 | 0 | 1 | 2 | 3 | 5)
+                        || !uncertainty_ms.is_finite()
+                        || !(0.0..=1000.0).contains(&uncertainty_ms)
+                        || !pairing_lag_ms.is_finite()
+                        || !(-1.0..=250.0).contains(&pairing_lag_ms)
+                        || !(c.first_sample..=c.last_sample).contains(&event.audio_frame)
+                        || (paired_ns - monotonic_ns).abs()
+                            > c.monotonic_tolerance_ns as f64 + (uncertainty_ms + 10.0) * 1e6
+                    {
+                        diagnostics.push(format!(
+                            "player observation {}: invalid timing; not used",
+                            event.event_id
+                        ));
+                        previous_playback.remove(&c.clock_id);
+                        continue;
+                    }
+                    boundaries.truncate(boundary_index);
+                    // The shared policy estimates continuous 1x playback only.
+                    // Pause, buffering, other rates and observed jumps split it.
+                    let jump =
+                        previous_playback
+                            .get(&c.clock_id)
+                            .is_some_and(|(sample, seconds)| {
+                                event.audio_frame < *sample
+                                    || ((position - seconds)
+                                        - event.audio_frame.saturating_sub(*sample) as f64
+                                            / f64::from(sample_rate))
+                                    .abs()
+                                        > 0.25
+                            });
+                    if state != 1 || (rate - 1.0).abs() > 1e-6 || jump {
+                        boundaries.push(SyncBoundary {
+                            evidence_id: event.event_id.clone(),
+                            clock_id: c.clock_id.clone(),
+                            sample_index: event.audio_frame,
+                            kind: if jump {
+                                SyncBoundaryKind::Seek
+                            } else {
+                                SyncBoundaryKind::Pause
+                            },
+                        });
+                    }
+                    previous_playback.remove(&c.clock_id);
+                    if state != 1 || (rate - 1.0).abs() > 1e-6 {
+                        continue;
+                    }
+                    previous_playback.insert(c.clock_id.clone(), (event.audio_frame, position));
+                    anchors.push(SyncAnchor {
+                        evidence_id: event.event_id.clone(),
+                        capture: CapturePosition {
+                            clock_id: c.clock_id.clone(),
+                            sample_index: event.audio_frame,
+                            monotonic_ns: monotonic_ns.round() as u64,
+                        },
+                        movie_pts: movie.origin_pts + (position * tps).round() as i64,
+                        source: SyncAnchorSource::PlayerObservation,
+                        confidence: 0.9,
+                        // Player-clock reads do not prove exact displayed frames.
+                        movie_uncertainty_ticks: (0.25 * tps).ceil() as u64,
+                        capture_uncertainty_samples: ((c.monotonic_tolerance_ns as f64 / 1e9
+                            + (uncertainty_ms + pairing_lag_ms.abs()) / 1000.0)
+                            * f64::from(sample_rate))
+                        .ceil() as u32,
+                        candidate_group_id: None,
+                    });
+                }
                 "manualSyncCue" => {
                     let Some(declared) = event.declared_movie_seconds else {
                         continue;
@@ -319,7 +441,7 @@ impl SessionSync {
         } else {
             (
                 "mapped",
-                "Movie time comes from the shared synchronizer over your cues. Intervals far from an anchor, across a capture interruption or between inconsistent anchors stay unknown or conflicting and get no cut candidates.",
+                "Movie time comes from the shared synchronizer over recorded cues and calibrated player observations. Intervals far from an anchor, across a capture interruption or between inconsistent anchors stay unknown or conflicting and get no cut candidates.",
             )
         };
         let request = (!capture_clocks.is_empty()).then(|| SyncRequest {

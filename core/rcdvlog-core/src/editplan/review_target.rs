@@ -37,6 +37,9 @@ impl ReviewTargetError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReviewTargetHandoff {
+    /// Display metadata only; excluded from the immutable snapshot digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub schema_version: u32,
     /// BLAKE3 of the versioned typed snapshot, excluding the renewable verification.
     pub target_digest: String,
@@ -100,6 +103,18 @@ pub struct ReviewTargetVerification {
     pub fully_decoded: bool,
 }
 
+pub(super) fn validate_display_name(name: Option<&str>) -> Result<()> {
+    if let Some(name) = name {
+        ensure!(
+            !name.trim().is_empty()
+                && name.chars().count() <= 120
+                && !name.chars().any(char::is_control),
+            "invalid input: cut name must contain 1–120 characters without control characters"
+        );
+    }
+    Ok(())
+}
+
 fn opaque(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 255
@@ -118,6 +133,12 @@ fn safe_integer(value: i64) -> bool {
 }
 
 impl ReviewTargetHandoff {
+    pub fn with_display_name(mut self, name: Option<String>) -> Result<Self> {
+        validate_display_name(name.as_deref())?;
+        self.display_name = name.map(|name| name.trim().to_string());
+        Ok(self)
+    }
+
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.len() <= REVIEW_TARGET_MAX_BYTES,
@@ -138,6 +159,7 @@ impl ReviewTargetHandoff {
     /// Structural/integrity validation only. A checksum cannot authenticate its issuer,
     /// establish current file availability, or verify what a TV is playing.
     pub fn validate(&self) -> Result<()> {
+        validate_display_name(self.display_name.as_deref())?;
         ensure!(
             self.schema_version == REVIEW_TARGET_SCHEMA_VERSION,
             ReviewTargetError::UnsupportedVersion
@@ -388,6 +410,7 @@ impl Catalog {
             cancel,
         )?;
         let handoff = ReviewTargetHandoff {
+            display_name: None,
             schema_version: REVIEW_TARGET_SCHEMA_VERSION,
             target_digest: ReviewTargetHandoff::snapshot_digest(&target)?,
             target,

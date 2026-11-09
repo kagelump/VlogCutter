@@ -75,7 +75,9 @@ pub use analysis::moments;
 /// strict native transport; it does not expose the source-asset transcript store.
 pub mod review_speech {
     pub use crate::analysis::coverage::{needs_resplit, resplit};
-    pub use crate::analysis::engine::{SttEngine, VAD_MODEL, WHISPER_MODEL, shared_model_dir};
+    pub use crate::analysis::engine::{
+        ModelAsset, SttEngine, VAD_MODEL, WHISPER_MODEL, install_model, shared_model_dir,
+    };
     pub use crate::analysis::openrouter::resolve_api_key;
     pub use crate::analysis::openrouter_stt::{
         NATIVE_STT_MODELS, NativeSttAudioWindow, NativeSttCallResult, NativeSttCost,

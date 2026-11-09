@@ -1,14 +1,15 @@
 # Companion server
 
-The companion server is an optional, private Linux node for the single-user VlogCutter workflow. It indexes read-only original-media mounts, owns a global content library and durable media jobs, hosts a Chrome review/admin application, and maintains one operation-synchronized replica for each adopted desktop project. The Mac remains usable when the server is offline.
+The companion server is an optional, private Linux node for the single-user VlogCutter workflow. It indexes read-only original-media mounts, owns a global content library and durable media jobs, hosts a Chrome review/admin application, and serves projects from either an operation-synchronized replica or an explicitly attached same-machine CLI catalog. The Mac remains usable when the server is offline.
 
-Current compatibility is application `0.1.0`, sync protocol `1.0`, baseline format `1`, project schema `8`, control schema `12`, and backup format `1`. The frozen sync JSON schemas in `docs/contracts/sync-*-v1.schema.json` ([contracts](../contracts/)) describe protocol v1; change code and introduce a new version instead of editing those files in place.
+Current compatibility is application `0.1.0`, sync protocol `1.0`, baseline format `1`, project schema `66`, control schema `19`, and backup format `1`. The frozen sync JSON schemas in `docs/contracts/sync-*-v1.schema.json` ([contracts](../contracts/)) describe protocol v1; change code and introduce a new version instead of editing those files in place.
 
 ## Start here
 
 - [Ubuntu and Docker Compose deployment](deployment.md)
 - [HTTPS, bootstrap, pairing, and credential security](security.md)
 - [Storage roots, scans, and the global library](storage-and-library.md)
+- [Same-machine CLI catalogs and thumbnails](attached-projects.md)
 - [Project adoption, synchronization, and conflicts](sync.md)
 - [Jobs, representations, and streaming](jobs-and-media.md)
 - [Backups and recovery](backup-and-recovery.md)
@@ -20,7 +21,7 @@ Current compatibility is application `0.1.0`, sync protocol `1.0`, baseline form
 
 ## Ownership boundaries
 
-The desktop project catalog remains canonical for portable project operations and local annotations. The server stores a separate local-SSD control catalog plus local-SSD project replicas. SQLite database files, WAL files, absolute mount paths, and original-media bytes are never synchronized. Synchronization exchanges bounded, versioned operations and path-free observations/manifests over authenticated HTTPS.
+The desktop project catalog remains canonical for portable project operations and local annotations. The server stores a separate local-SSD control catalog plus local-SSD project replicas. An opt-in [attached project](attached-projects.md) instead uses the same local catalog as the CLI, with no migration by the server and no sync for that project. SQLite database files, WAL files, absolute mount paths, and original-media bytes are never synchronized. Synchronization exchanges bounded, versioned operations and path-free observations/manifests over authenticated HTTPS.
 
 Original scan roots are immutable and bind-mounted read-only. Derived representations and backups use separate writable roots. The planned travel-ingest archive is a future, distinct create-only writable logical root; it does not weaken the current original-root rule.
 

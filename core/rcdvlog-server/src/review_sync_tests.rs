@@ -133,3 +133,99 @@ fn inconsistent_calibration_or_a_cue_from_an_uncalibrated_epoch_is_not_used() {
             .all(|u| u.candidate_operation_ids.is_empty())
     );
 }
+
+fn player_event(f: &Fixture, id: &str, seconds: f64, position: f64, state: i64, rate: f64) {
+    f.catalog.review_sessions(0).record_event(PROJECT, &f.session_id, &ReviewSessionEventRequest {
+        event_id: id.into(), kind: ReviewSessionEventKind::ClockSample,
+        audio_frame: (seconds * 48_000.0).round() as u64,
+        performance_ms: Some(seconds * 1000.0), declared_movie_seconds: None,
+        detail: Some(serde_json::json!({ "clockEpoch": 0, "method": "playerObservation", "uncertaintyMs": 6.0,
+            "playback": { "schema": "youtube-player-observation.v1", "positionSeconds": position, "state": state, "rate": rate, "observedPerformanceMs": seconds * 1000.0 }
+        })),
+    }, now()).unwrap();
+}
+
+#[test]
+fn calibrated_player_observations_use_shared_mapping_without_extrapolation() {
+    let f = fixture(false, true);
+    calibration_event(&f, "calibration", 0, 0);
+    player_event(&f, "player_a", 0.5, 0.0, 1, 1.0);
+    player_event(&f, "player_b", 5.5, 5.0, 1, 1.0);
+    let w = workspace(&f);
+    assert_eq!(w.sync.anchors, 2);
+    let first = &w.utterances[0];
+    let time = first.movie_time.as_ref().unwrap();
+    assert!((time.movie_seconds - 0.5).abs() < 0.01);
+    assert_eq!(time.evidence_ids, vec!["player_a", "player_b"]);
+    assert!(time.uncertainty_seconds >= 0.25);
+    assert_eq!(w.sync.policy.max_extrapolation_seconds, 0.0);
+    assert_eq!(first.sync.slices.last().unwrap().state, SyncState::Unknown);
+    assert!(w.utterances[1..].iter().all(|u| u.movie_time.is_none()));
+}
+
+#[test]
+fn player_observations_without_calibration_do_not_invent_movie_time() {
+    let f = fixture(false, true);
+    player_event(&f, "player_a", 0.5, 0.0, 1, 1.0);
+    player_event(&f, "player_b", 5.5, 5.0, 1, 1.0);
+    let w = workspace(&f);
+    assert_eq!(w.sync.status, "pending");
+    assert!(w.utterances.iter().all(|u| u.movie_time.is_none()));
+}
+
+#[test]
+fn player_pause_seek_and_other_rates_are_not_bridged() {
+    for (state, rate, position) in [(2, 1.0, 2.0), (3, 1.0, 2.0), (1, 2.0, 2.0), (1, 1.0, 4.0)] {
+        let f = fixture(false, true);
+        calibration_event(&f, "calibration", 0, 0);
+        player_event(&f, "player_a", 0.5, 0.0, 1, 1.0);
+        player_event(&f, "transition", 2.5, position, state, rate);
+        player_event(&f, "player_b", 5.5, 5.0, 1, 1.0);
+        let w = workspace(&f);
+        assert!(w.sync.boundaries > 0);
+        assert!(
+            w.utterances[0].movie_time.is_none(),
+            "{state} {rate} {position}"
+        );
+    }
+}
+
+#[test]
+fn stale_player_clock_pairing_is_rejected() {
+    let f = fixture(false, true);
+    calibration_event(&f, "calibration", 0, 0);
+    event(
+        &f,
+        "stale_player",
+        ReviewSessionEventKind::ClockSample,
+        48_000,
+        serde_json::json!({"clockEpoch":0,"method":"playerObservation","uncertaintyMs":6,
+          "playback":{"schema":"youtube-player-observation.v1","positionSeconds":1,"state":1,"rate":1,"observedPerformanceMs":1}}),
+    );
+    let w = workspace(&f);
+    assert_eq!(w.sync.anchors, 0);
+    assert!(
+        w.sync
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("invalid timing"))
+    );
+}
+
+#[test]
+fn malformed_player_observation_breaks_interpolation() {
+    let f = fixture(false, true);
+    calibration_event(&f, "calibration", 0, 0);
+    player_event(&f, "player_a", 0.5, 0.0, 1, 1.0);
+    event(
+        &f,
+        "malformed",
+        ReviewSessionEventKind::ClockSample,
+        120_000,
+        serde_json::json!({"clockEpoch":0,"method":"playerObservation","uncertaintyMs":6,"playback":{}}),
+    );
+    player_event(&f, "player_b", 5.5, 5.0, 1, 1.0);
+    let w = workspace(&f);
+    assert!(w.sync.boundaries > 0);
+    assert!(w.utterances[0].movie_time.is_none());
+}

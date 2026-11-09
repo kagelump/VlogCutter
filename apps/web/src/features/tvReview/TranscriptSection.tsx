@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ReviewSessionState, ReviewTranscriptionRequest, ReviewTranscriptionRun, ReviewUtterance } from "@rcdvlog/project-client";
+import type { ReviewSessionState, ReviewTranscriptionRequest, ReviewTranscriptionRun } from "@rcdvlog/project-client";
 import { keys, useClient } from "../../app/client";
 import { describeCode, describeError } from "../../lib/errors";
 import { formatDateTime, formatStamp, plural } from "../../lib/format";
 import { Badge, Button, Checkbox, Disclosure, Field, Loading, Notice, Panel, Segmented, type Tone } from "../../ui";
+import { LiveTranscriptPanel, useLiveTranscript } from "./LiveTranscript";
+import { UtteranceLine } from "./TranscriptLine";
 import styles from "./TvReview.module.css";
 
 const STATE: Record<ReviewTranscriptionRun["state"], { label: string; tone: Tone }> = {
@@ -17,14 +19,6 @@ const STATE: Record<ReviewTranscriptionRun["state"], { label: string; tone: Tone
   cancelled: { label: "Cancelled", tone: "neutral" },
 };
 
-const FLAG_COPY: Record<string, string> = {
-  lowConfidence: "low confidence",
-  probabilityEvidenceUnavailable: "no confidence data",
-  unexpectedLanguage: "unexpected language",
-  languageUnknown: "language unknown",
-  nearRecordingGap: "near a gap",
-};
-
 export function TranscriptSection({ projectId, sessionId, sessionState, onOpenReview, pollMs = 2_000 }: {
   projectId: string;
   sessionId: string;
@@ -34,10 +28,11 @@ export function TranscriptSection({ projectId, sessionId, sessionState, onOpenRe
 }) {
   const client = useClient();
   const queryClient = useQueryClient();
+  const live = useLiveTranscript(projectId, sessionId, pollMs);
   const runs = useQuery({
     queryKey: keys.transcriptions(projectId, sessionId),
     queryFn: () => client.listReviewTranscriptions(projectId, sessionId),
-    refetchInterval: (query) => query.state.data?.items.some((run) => run.state === "queued" || run.state === "running") ? pollMs : false,
+    refetchInterval: (query) => live.data?.enabled && ["live", "refining"].includes(live.data.state) || query.state.data?.items.some((run) => run.state === "queued" || run.state === "running") ? pollMs : false,
   });
   const items = runs.data?.items ?? [];
   const active = items.find((run) => run.state === "queued" || run.state === "running");
@@ -53,17 +48,21 @@ export function TranscriptSection({ projectId, sessionId, sessionState, onOpenRe
   });
   const finalized = sessionState === "completed" || sessionState === "incomplete";
 
+  const draft = live.data?.enabled && live.data.state !== "stopped" && shown?.state !== "completed" && shown?.state !== "noSpeech"
+    ? <LiveTranscriptPanel data={live.data} projectId={projectId} recording={!finalized} /> : null;
   if (!finalized) {
+    if (draft) return draft;
     return <Panel title="Transcript"><p className={styles.muted}>Available once the recording has finished uploading.</p></Panel>;
   }
 
   const hasTranscript = Boolean(shown?.utterances.length);
   return (
     <>
+      {draft}
       {runs.isPending ? <Loading /> : null}
       {shown ? (
         <Panel
-          title="Transcript"
+          title={draft ? "Full transcription" : "Transcript"}
           description={`${shown.provider} · ${shown.model} · ${formatDateTime(shown.createdAt)}`}
           actions={<div className={styles.inlineActions}>
             <Badge tone={STATE[shown.state].tone}>{STATE[shown.state].label}</Badge>
@@ -100,6 +99,21 @@ export function TranscriptSection({ projectId, sessionId, sessionState, onOpenRe
 }
 
 function RunBody({ run }: { run: ReviewTranscriptionRun }) {
+  const client = useClient();
+  const workspace = useQuery({
+    queryKey: keys.workspace(run.projectId, run.runId),
+    queryFn: () => client.getReviewWorkspace(run.projectId, run.runId),
+    enabled: run.utterances.length > 0,
+    refetchInterval: run.state === "running" ? 2_000 : false,
+  });
+  const target = useQuery({
+    queryKey: keys.target(run.projectId, run.reviewTargetId),
+    queryFn: () => client.getReviewTarget(run.projectId, run.reviewTargetId),
+    enabled: run.utterances.length > 0,
+  });
+  const context = workspace.data?.runId === run.runId && workspace.data.sessionId === run.sessionId
+    && workspace.data.revisionId === run.revisionId ? workspace.data : undefined;
+  const timedLines = new Map(context?.utterances.map((line) => [line.machine.utteranceId, line.movieTime]));
   const [showRaw, setShowRaw] = useState(false);
   const projected = run.utterances.some((utterance) => utterance.displayProjection && utterance.displayText !== utterance.text);
   const failedSegments = run.segments.filter((segment) => segment.state === "failed");
@@ -125,25 +139,21 @@ function RunBody({ run }: { run: ReviewTranscriptionRun }) {
             {projected ? <Checkbox checked={showRaw} onChange={setShowRaw}>Show original script</Checkbox> : null}
           </div>
           <ol className={styles.utterances}>
-            {run.utterances.map((utterance) => <UtteranceLine key={utterance.utteranceId} utterance={utterance} showRaw={showRaw} />)}
+            {run.utterances.map((utterance) => {
+              const movieTime = timedLines.get(utterance.utteranceId);
+              const seconds = movieTime?.movieSeconds;
+              const cut = seconds !== undefined && Number.isFinite(seconds) && seconds >= 0
+                ? context?.cuts.find((shot) => shot.movieInSeconds <= seconds && seconds < shot.movieOutSeconds) : undefined;
+              return <UtteranceLine key={utterance.utteranceId} utterance={utterance} showRaw={showRaw}
+                movieTime={movieTime && Number.isFinite(movieTime.movieSeconds) && movieTime.movieSeconds >= 0 ? movieTime : undefined}
+                thumbnail={cut ? client.projectAssetThumbnailUrl(run.projectId, cut.assetId) : undefined}
+                shotNumber={cut ? cut.position + 1 : undefined}
+                videoId={target.data?.youtube.videoId ?? undefined} timingLoading={workspace.isPending} />;
+            })}
           </ol>
         </>
       ) : null}
     </div>
-  );
-}
-
-function UtteranceLine({ utterance, showRaw }: { utterance: ReviewUtterance; showRaw: boolean }) {
-  return (
-    <li className={styles.utterance} data-suppressed={utterance.suppressed || undefined}>
-      <span className={styles.stamp}>{formatStamp(utterance.startSeconds)}</span>
-      <span className={styles.speaker}>{utterance.speaker === "unknown" ? "?" : utterance.speaker}</span>
-      <span className={styles.utteranceText} lang={utterance.language === "zh" ? "zh-Hant" : utterance.language || undefined}>
-        {utterance.suppressed ? <em className={styles.muted}>Low quality: </em> : null}
-        {showRaw ? utterance.text : utterance.displayText}
-        {utterance.flags.length ? <small className={styles.flags}>{utterance.flags.map((flag) => FLAG_COPY[flag] ?? flag.replace("qualityGate:", "")).join(" · ")}</small> : null}
-      </span>
-    </li>
   );
 }
 

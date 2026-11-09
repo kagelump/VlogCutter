@@ -33,6 +33,16 @@ pub struct ProjectReplica {
     pub registered_at: String,
     pub updated_at: String,
     pub reused_existing: bool,
+    /// Absolute path of a same-machine CLI catalog served directly instead of a
+    /// replica. Node-local: never serialized into API or sync payloads.
+    #[serde(skip)]
+    pub attached_catalog_path: Option<PathBuf>,
+}
+
+impl ProjectReplica {
+    pub fn is_attached(&self) -> bool {
+        self.attached_catalog_path.is_some()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -45,6 +55,10 @@ pub enum ProjectReplicaError {
     NotFound { project_id: String },
     #[error("project replica path is outside the server data directory")]
     UnsafeReplicaPath,
+    #[error("project {project_id} is attached to a local catalog and does not sync")]
+    Attached { project_id: String },
+    #[error("cannot attach catalog: {0}")]
+    AttachRefused(String),
     #[error(transparent)]
     Sync(#[from] SyncError),
     #[error(transparent)]
@@ -64,6 +78,8 @@ impl ProjectReplicaError {
             Self::DifferentBaseline { .. } => "baseline_different",
             Self::NotFound { .. } => "project_replica_not_found",
             Self::UnsafeReplicaPath => "project_replica_path_unsafe",
+            Self::Attached { .. } => "project_attached",
+            Self::AttachRefused(_) => "attached_catalog_refused",
             Self::Sync(error) => error.code(),
             Self::Storage(_) => "storage_library_error",
             Self::Infrastructure(_) | Self::Database(_) | Self::Io(_) => "internal_error",
@@ -183,6 +199,8 @@ pub struct ProjectReviewAsset {
     pub materialized_revision: u64,
     pub active_note_revision_id: Option<String>,
     pub note_revision_count: usize,
+    /// Supported proxy in an explicitly allowed same-machine cache.
+    pub local_proxy_available: bool,
     pub proxy: Option<ReviewRepresentation>,
     pub thumbnail: Option<ReviewRepresentation>,
     pub original_availability: Option<NodeAvailabilityState>,
@@ -200,11 +218,23 @@ pub struct ReviewMutationResult {
 pub struct ProjectReplicaManager {
     data_dir: PathBuf,
     control: ControlCatalog,
+    attached_project_roots: Vec<PathBuf>,
+    protected_media_roots: Vec<PathBuf>,
 }
 
 impl ProjectReplicaManager {
-    pub(crate) fn new(data_dir: PathBuf, control: ControlCatalog) -> Self {
-        Self { data_dir, control }
+    pub(crate) fn new(
+        data_dir: PathBuf,
+        control: ControlCatalog,
+        attached_project_roots: Vec<PathBuf>,
+        protected_media_roots: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            data_dir,
+            control,
+            attached_project_roots,
+            protected_media_roots,
+        }
     }
 
     /// Validates and describes an import without creating a replica or changing
@@ -256,6 +286,11 @@ impl ProjectReplicaManager {
             ));
         }
         if let Some(mut existing) = self.get_optional(project_id)? {
+            if existing.is_attached() {
+                return Err(ProjectReplicaError::Attached {
+                    project_id: project_id.clone(),
+                });
+            }
             if existing.baseline_digest != envelope.digest {
                 return Err(ProjectReplicaError::DifferentBaseline {
                     project_id: project_id.clone(),
@@ -341,8 +376,210 @@ impl ProjectReplicaManager {
 
     pub fn open_catalog(&self, project_id: &str) -> Result<Catalog, ProjectReplicaError> {
         let replica = self.get(project_id)?;
+        if let Some(path) = &replica.attached_catalog_path {
+            // A CLI catalog is only ever opened at exactly the schema this build
+            // supports, so the server never migrates the CLI's working data.
+            let path = path
+                .canonicalize()
+                .map_err(|_| ProjectReplicaError::AttachRefused("catalog file not found".into()))?;
+            if !inside_any_root(&path, &self.attached_project_roots)
+                || path.starts_with(self.data_dir.canonicalize()?)
+            {
+                return Err(ProjectReplicaError::AttachRefused(
+                    "catalog is no longer inside an allowed project root".into(),
+                ));
+            }
+            require_current_project_schema(&path)?;
+            return Catalog::open_shared_existing(path)
+                .map_err(ProjectReplicaError::Infrastructure);
+        }
         let path = self.resolve_relative_path(&replica.replica_relative_path)?;
         Catalog::open_existing(path).map_err(ProjectReplicaError::Infrastructure)
+    }
+
+    /// Serves `project_id` from a same-machine CLI catalog instead of a replica.
+    ///
+    /// The catalog must resolve inside one of `allowed_roots`, outside the
+    /// server's own data directory, and be at exactly the current project
+    /// schema. An existing replica of the same project is re-pointed and its
+    /// file kept, so review targets and sessions keyed by the project ID stay
+    /// attached and [`Self::detach_catalog`] can return to it.
+    pub fn attach_catalog(
+        &self,
+        catalog_path: &Path,
+        allowed_roots: &[PathBuf],
+        project_id: Option<&str>,
+    ) -> Result<ProjectReplica, ProjectReplicaError> {
+        let refuse = |reason: &str| ProjectReplicaError::AttachRefused(reason.to_string());
+        let path = catalog_path
+            .canonicalize()
+            .map_err(|_| refuse("catalog file not found"))?;
+        if !path.is_file() {
+            return Err(refuse("catalog path is not a file"));
+        }
+        if !inside_any_root(&path, allowed_roots)
+            || !inside_any_root(&path, &self.attached_project_roots)
+        {
+            return Err(refuse(
+                "catalog is not inside RCDVLOG_ATTACHED_PROJECT_ROOTS",
+            ));
+        }
+        if let Ok(data_dir) = self.data_dir.canonicalize()
+            && path.starts_with(&data_dir)
+        {
+            return Err(refuse("catalog is inside the server data directory"));
+        }
+        crate::foundation::ensure_local_database_filesystem(&path)
+            .map_err(|_| refuse("catalog must reside on a local filesystem"))?;
+        require_current_project_schema(&path)?;
+        let catalog =
+            Catalog::open_read_only_existing(&path).map_err(ProjectReplicaError::Infrastructure)?;
+        let projects = catalog
+            .list_projects()
+            .map_err(ProjectReplicaError::Infrastructure)?;
+        let project = match project_id {
+            Some(id) => projects
+                .into_iter()
+                .find(|project| project.id == id)
+                .ok_or_else(|| refuse("catalog does not contain the requested project"))?,
+            None if projects.len() == 1 => projects.into_iter().next().expect("one project"),
+            None => {
+                return Err(refuse(
+                    "catalog contains several projects; pass --project-id",
+                ));
+            }
+        };
+        let origin_node_id = catalog
+            .local_node_id()
+            .map_err(ProjectReplicaError::Infrastructure)?;
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| refuse("catalog path is not valid UTF-8"))?
+            .to_string();
+
+        let now = now();
+        let connection = open_writable_connection(self.control.database_path())
+            .map_err(ProjectReplicaError::Infrastructure)?;
+        let updated = connection.execute(
+            "UPDATE project_registry SET attached_catalog_path=?2, state='registered', updated_at=?3 WHERE project_id=?1",
+            params![project.id, path_text, now],
+        )?;
+        if updated == 0 {
+            connection.execute(
+                "INSERT INTO project_registry(project_id, replica_relative_path, state, registered_at, created_at, updated_at, origin_node_id, server_node_id, attached_catalog_path) VALUES (?1, ?2, 'registered', ?3, ?3, ?3, ?4, ?5, ?6)",
+                params![
+                    project.id,
+                    attached_placeholder_path(&project.id),
+                    now,
+                    origin_node_id,
+                    self.control.node_id().as_str(),
+                    path_text,
+                ],
+            )?;
+        }
+        self.get(&project.id)
+    }
+
+    /// Returns an attached project to its replica. Refused when the project
+    /// was attached without one, since that would leave it with no data.
+    pub fn detach_catalog(&self, project_id: &str) -> Result<ProjectReplica, ProjectReplicaError> {
+        let replica = self.get(project_id)?;
+        if !replica.is_attached() {
+            return Err(ProjectReplicaError::AttachRefused(
+                "project is not attached".to_string(),
+            ));
+        }
+        let replica_path = self.resolve_relative_path(&replica.replica_relative_path)?;
+        if !replica_path.is_file() {
+            return Err(ProjectReplicaError::AttachRefused(
+                "project has no replica to return to; attach another catalog instead".to_string(),
+            ));
+        }
+        let connection = open_writable_connection(self.control.database_path())
+            .map_err(ProjectReplicaError::Infrastructure)?;
+        connection.execute(
+            "UPDATE project_registry SET attached_catalog_path=NULL, updated_at=?2 WHERE project_id=?1",
+            params![project_id, now()],
+        )?;
+        self.get(project_id)
+    }
+
+    /// The thumbnail file the project's catalog records for one of its assets.
+    /// The caller decides whether this node may serve that path.
+    pub fn asset_thumbnail_path(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+    ) -> Result<Option<PathBuf>, ProjectReplicaError> {
+        let catalog = self.open_catalog(project_id)?;
+        let Ok(asset) = catalog.get_asset(asset_id) else {
+            return Ok(None);
+        };
+        if asset.project_id != project_id {
+            return Ok(None);
+        }
+        Ok(asset.thumbnail_path.map(PathBuf::from))
+    }
+
+    /// A supported generated proxy from an attached CLI catalog. Never a source
+    /// file or a path supplied by a browser or synchronized replica.
+    pub fn asset_proxy_path(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+    ) -> Result<Option<PathBuf>, ProjectReplicaError> {
+        if !self.get(project_id)?.is_attached() {
+            return Ok(None);
+        }
+        let catalog = self.open_catalog(project_id)?;
+        let Ok(asset) = catalog.get_asset(asset_id) else {
+            return Ok(None);
+        };
+        if asset.project_id != project_id {
+            return Ok(None);
+        }
+        Ok(self.servable_local_proxy(&asset))
+    }
+
+    fn servable_local_proxy(&self, asset: &Asset) -> Option<PathBuf> {
+        // Raw v3 stores encoded frames without display rotation. Legacy baked
+        // proxies are equivalent only when no source rotation was baked in.
+        let supported = asset.proxy_representation
+            == Some(rcdvlog_core::ProxyRepresentation::RawV3)
+            || (asset.proxy_representation
+                == Some(rcdvlog_core::ProxyRepresentation::MetadataBakedV1)
+                && asset.metadata_rotation_degrees == 0);
+        if !asset.proxy_available || !supported {
+            return None;
+        }
+        let path = Path::new(asset.proxy_path.as_deref()?)
+            .canonicalize()
+            .ok()?;
+        if !inside_any_root(&path, &self.attached_project_roots) {
+            return None;
+        }
+        if self
+            .protected_media_roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .any(|root| path.starts_with(root))
+        {
+            return None;
+        }
+        if Path::new(&asset.path)
+            .canonicalize()
+            .is_ok_and(|original| original == path)
+        {
+            return None;
+        }
+        // Check the resolved target too: a .v3.mp4 symlink may point at a different format.
+        if path.extension().and_then(|ext| ext.to_str()) != Some("mp4")
+            || Some(rcdvlog_core::proxy_representation(&path)) != asset.proxy_representation
+        {
+            return None;
+        }
+        let metadata = fs::metadata(&path).ok()?;
+        (metadata.is_file() && metadata.len() > 0).then_some(path)
     }
 
     /// Pages every registered project replica, with its current asset
@@ -511,7 +748,7 @@ impl ProjectReplicaManager {
             .into_iter()
             .filter(|conflict| conflict.aggregate_id == asset_id)
             .count();
-        let (proxy, thumbnail, original_availability) =
+        let (proxy, thumbnail, mut original_availability) =
             if let Some(media_object_id) = &asset.media_object_id {
                 (
                     self.current_review_representation(
@@ -538,7 +775,17 @@ impl ProjectReplicaManager {
             } else {
                 (None, None, None)
             };
+        let attached = self.get(project_id)?.is_attached();
+        let local_proxy_available = attached && self.servable_local_proxy(&asset).is_some();
+        if attached {
+            original_availability = Some(if asset.original_available {
+                NodeAvailabilityState::AccessibleHere
+            } else {
+                NodeAvailabilityState::TemporarilyUnavailable
+            });
+        }
         Ok(ProjectReviewAsset {
+            local_proxy_available,
             asset: ProjectAssetItem {
                 project_asset_id: asset.id,
                 filename: asset.filename,
@@ -549,6 +796,7 @@ impl ProjectReplicaManager {
                 rotation_degrees: i32::from(asset.rotation_degrees),
                 labels: asset.labels,
                 active_note: (!asset.notes.is_empty()).then_some(asset.notes),
+                description: (!asset.description.trim().is_empty()).then_some(asset.description),
                 duration_seconds: asset.duration_seconds,
                 best_time: asset.best_time,
             },
@@ -917,6 +1165,11 @@ impl ProjectReplicaManager {
         project_id: &str,
         request: &ReconcileRequest,
     ) -> Result<ReconcileResponse, ProjectReplicaError> {
+        if self.get(project_id)?.is_attached() {
+            return Err(ProjectReplicaError::Attached {
+                project_id: project_id.to_string(),
+            });
+        }
         let catalog = self.open_catalog(project_id)?;
         let mut response = reconcile(
             &catalog,
@@ -1082,7 +1335,7 @@ impl ProjectReplicaManager {
             .map_err(ProjectReplicaError::Infrastructure)?;
         connection
             .query_row(
-                "SELECT project_id, replica_relative_path, state, COALESCE(baseline_version, 0), COALESCE(baseline_digest, ''), origin_node_id, COALESCE(server_node_id, ''), registered_at, updated_at FROM project_registry WHERE project_id=?1",
+                "SELECT project_id, replica_relative_path, state, COALESCE(baseline_version, 0), COALESCE(baseline_digest, ''), origin_node_id, COALESCE(server_node_id, ''), registered_at, updated_at, attached_catalog_path FROM project_registry WHERE project_id=?1",
                 [project_id],
                 |row| {
                     Ok(ProjectReplica {
@@ -1096,6 +1349,7 @@ impl ProjectReplicaManager {
                         registered_at: row.get(7)?,
                         updated_at: row.get(8)?,
                         reused_existing: false,
+                        attached_catalog_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
                     })
                 },
             )
@@ -1146,6 +1400,37 @@ fn deterministic_server_asset_id(
     let digest = blake3::hash(format!("{project_id}\0{}", media_object_id.as_str()).as_bytes());
     ProjectAssetId::parse(format!("asset_server_{}", &digest.to_hex()[..32]))
         .expect("a hex digest always forms a valid project asset ID")
+}
+
+/// A unique, never-created registry path for a project attached without a replica.
+fn attached_placeholder_path(project_id: &str) -> String {
+    format!(
+        "attached/{}.sqlite3",
+        blake3::hash(project_id.as_bytes()).to_hex()
+    )
+}
+
+/// Whether `path` (already canonical) lies inside one of `roots`. Roots that do
+/// not exist on this node match nothing.
+pub fn inside_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| path.starts_with(root))
+}
+
+fn require_current_project_schema(path: &Path) -> Result<(), ProjectReplicaError> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let inspection = rcdvlog_core::inspect_project_catalog_migrations(&connection)
+        .map_err(ProjectReplicaError::Infrastructure)?;
+    if inspection.status != rcdvlog_core::MigrationHistoryStatus::Current {
+        return Err(ProjectReplicaError::AttachRefused(format!(
+            "catalog schema is {} but this server supports exactly {}",
+            inspection.current_version, inspection.latest_supported_version
+        )));
+    }
+    Ok(())
 }
 
 fn replica_relative_path(project_id: &str) -> String {

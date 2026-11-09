@@ -9,7 +9,11 @@ use rcdvlog_server_core::{
 fn main() -> Result<()> {
     let config = ServerConfig::from_environment()?;
     let control = ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics())?;
-    let mac_catalog_path = config.data_dir.join("web-e2e-mac.sqlite3");
+    let mac_catalog_path = config
+        .attached_project_roots
+        .first()
+        .unwrap_or(&config.data_dir)
+        .join("web-e2e-mac.sqlite3");
     let mac = Catalog::open(&mac_catalog_path)?;
     mac.set_local_node_id("node_web_e2e_mac")?;
     let project = mac.create_project("Chrome concurrency fixture")?;
@@ -36,6 +40,23 @@ fn main() -> Result<()> {
     )?;
     let baseline = BaselineEnvelope::export_catalog(&mac, &project.id)?;
     control.project_replicas().import_baseline(&baseline)?;
+    if !config.attached_project_roots.is_empty() {
+        let proxy = mac_catalog_path
+            .parent()
+            .unwrap()
+            .join("asset_web_e2e.v3.mp4");
+        std::fs::write(&proxy, include_bytes!("../tests/fixtures/proxy.v3.mp4"))?;
+        // Fixture-only local cache registration; production never creates or modifies originals.
+        rusqlite::Connection::open(&mac_catalog_path)?.execute(
+            "UPDATE assets SET proxy_path=?1 WHERE id='asset_web_e2e'",
+            [proxy.to_str().unwrap()],
+        )?;
+        control.project_replicas().attach_catalog(
+            &mac_catalog_path,
+            &config.attached_project_roots,
+            Some(&project.id),
+        )?;
+    }
     // A synthetic, path-free TV review target for the seeded project (#221),
     // digested by the shared Rust digest and freshly "verified" so the Chrome
     // suite can import it through the real server. No movie exists.
@@ -64,6 +85,7 @@ fn main() -> Result<()> {
         target.revision_id = "editrev_historical".into();
         target.viewed_artifact_id = "preview_historical".into();
         let review = rcdvlog_server_core::HistoricalRenderedArtifactReview {
+            display_name: None,
             schema_version: 1,
             purpose: rcdvlog_server_core::HistoricalReviewPurpose::HistoricalRenderedArtifactReview,
             target_digest: ReviewTargetHandoff::snapshot_digest(&target)?,

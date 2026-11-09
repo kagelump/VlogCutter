@@ -22,6 +22,8 @@ impl Fixture {
         let derived = root.path().join("derived");
         let backup = root.path().join("backup");
         let originals = root.path().join("originals");
+        let attached = root.path().join("projects");
+        std::fs::create_dir_all(&attached).unwrap();
         std::fs::create_dir_all(&derived).unwrap();
         std::fs::create_dir_all(&backup).unwrap();
         std::fs::create_dir_all(&originals).unwrap();
@@ -43,6 +45,10 @@ impl Fixture {
             (
                 "RCDVLOG_ALLOWED_ORIGINAL_MOUNTS".to_string(),
                 originals.display().to_string(),
+            ),
+            (
+                "RCDVLOG_ATTACHED_PROJECT_ROOTS".to_string(),
+                attached.display().to_string(),
             ),
             ("RCDVLOG_FFMPEG".to_string(), tool.to_string()),
             ("RCDVLOG_FFPROBE".to_string(), tool.to_string()),
@@ -294,7 +300,13 @@ fn browser_auth(fixture: &Fixture) -> (String, String, String) {
 }
 
 fn baseline_envelope(root: &TempDir) -> BaselineEnvelope {
-    let catalog = Catalog::open(root.path().join("desktop.sqlite3")).unwrap();
+    let (catalog, project_id) = cli_catalog(&root.path().join("desktop.sqlite3"));
+    BaselineEnvelope::export(&catalog, &project_id, vec![], vec![]).unwrap()
+}
+
+/// A CLI project catalog at `path` with one asset, `asset_http`.
+fn cli_catalog(path: &std::path::Path) -> (Catalog, String) {
+    let catalog = Catalog::open(path).unwrap();
     catalog.set_local_node_id("node_mac").unwrap();
     let project = catalog.create_project("HTTP Trip").unwrap();
     catalog
@@ -320,7 +332,189 @@ fn baseline_envelope(root: &TempDir) -> BaselineEnvelope {
             },
         )
         .unwrap();
-    BaselineEnvelope::export(&catalog, &project.id, vec![], vec![]).unwrap()
+    (catalog, project.id)
+}
+
+#[tokio::test]
+async fn attached_projects_serve_the_cli_catalog_and_its_thumbnails_only_from_allowed_roots() {
+    let fixture = Fixture::new(false);
+    let token = device_auth_token(&fixture);
+    let root = fixture._root.path().to_path_buf();
+    let work = root.join("projects/work");
+    std::fs::create_dir_all(work.join("cache/thumbnails/asset_http")).unwrap();
+    let catalog_path = work.join("catalog.sqlite3");
+    let (catalog, project_id) = cli_catalog(&catalog_path);
+    let thumbnail = work.join("cache/thumbnails/asset_http/q1.v2.jpg");
+    std::fs::write(&thumbnail, b"\xff\xd8jpeg-bytes").unwrap();
+    let record_thumbnail = |path: &std::path::Path| {
+        let connection = rusqlite::Connection::open(&catalog_path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM asset_thumbnails WHERE asset_id='asset_http'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO asset_thumbnails(asset_id, quality, path, created_at) VALUES ('asset_http', 1, ?1, '2026-11-08T00:00:00Z')",
+                [path.display().to_string()],
+            )
+            .unwrap();
+    };
+    record_thumbnail(&thumbnail);
+    rusqlite::Connection::open(&catalog_path)
+        .unwrap()
+        .execute(
+            "UPDATE assets SET description='Penguins on blue ice' WHERE id='asset_http'",
+            [],
+        )
+        .unwrap();
+    fixture
+        .foundation
+        .catalog()
+        .project_replicas()
+        .attach_catalog(
+            &catalog_path,
+            &fixture.foundation.config().attached_project_roots,
+            None,
+        )
+        .unwrap();
+
+    let request = |method: Method, uri: String, etag: Option<&str>| {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if let Some(etag) = etag {
+            builder = builder.header(header::IF_NONE_MATCH, etag);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+    let thumbnail_uri = format!("/api/v1/projects/{project_id}/assets/asset_http/thumbnail");
+
+    let anonymous = fixture
+        .app()
+        .oneshot(
+            Request::builder()
+                .uri(&thumbnail_uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let wrong_project = fixture
+        .app()
+        .oneshot(request(
+            Method::GET,
+            "/api/v1/projects/not_this_project/assets/asset_http/thumbnail".into(),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_project.status(), StatusCode::NOT_FOUND);
+
+    let served = fixture
+        .app()
+        .oneshot(request(Method::GET, thumbnail_uri.clone(), None))
+        .await
+        .unwrap();
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(served.headers()[header::CONTENT_TYPE], "image/jpeg");
+    let etag = served.headers()[header::ETAG].to_str().unwrap().to_string();
+    assert_eq!(
+        to_bytes(served.into_body(), 64).await.unwrap(),
+        &b"\xff\xd8jpeg-bytes"[..]
+    );
+    let unchanged = fixture
+        .app()
+        .oneshot(request(Method::GET, thumbnail_uri.clone(), Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+    let head = fixture
+        .app()
+        .oneshot(request(Method::HEAD, thumbnail_uri.clone(), None))
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert!(to_bytes(head.into_body(), 64).await.unwrap().is_empty());
+
+    // Recorded paths outside the allowed roots, into the server's own data, or
+    // not JPEG are never read, however the catalog records them.
+    let outside = root.join("outside.jpg");
+    std::fs::write(&outside, b"secret").unwrap();
+    let escape = work.join("cache/thumbnails/asset_http/escape.jpg");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &escape).unwrap();
+    let control = fixture.foundation.config().data_dir.join("control.sqlite3");
+    let not_jpeg = work.join("cache/thumbnails/asset_http/q1.png");
+    std::fs::write(&not_jpeg, b"png").unwrap();
+    for refused in [
+        outside.as_path(),
+        escape.as_path(),
+        control.as_path(),
+        not_jpeg.as_path(),
+    ] {
+        record_thumbnail(refused);
+        let response = fixture
+            .app()
+            .oneshot(request(Method::GET, thumbnail_uri.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{}",
+            refused.display()
+        );
+    }
+
+    let assets = fixture
+        .app()
+        .oneshot(request(
+            Method::GET,
+            format!("/api/v1/projects/{project_id}/assets"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(assets.status(), StatusCode::OK);
+    assert_eq!(
+        json(assets).await["items"][0]["description"],
+        "Penguins on blue ice"
+    );
+
+    // Sync never writes into an attached catalog.
+    let envelope = BaselineEnvelope::export(&catalog, &project_id, vec![], vec![]).unwrap();
+    let import = fixture
+        .app()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/internal/projects/baseline/import")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(serde_json::to_vec(&envelope).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(import.status(), StatusCode::CONFLICT);
+    assert_eq!(json(import).await["code"], "project_attached");
+    let reconcile = fixture.app().oneshot(
+        Request::builder().method(Method::POST)
+            .uri(format!("/api/v1/internal/projects/{project_id}/reconcile"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                "protocolVersion": {"minimumMajor": 1, "minimumMinor": 0, "maximumMajor": 1, "maximumMinor": 0},
+                "projectSchemaVersion": rcdvlog_server_core::PROJECT_CATALOG_SCHEMA_VERSION,
+                "projectId": project_id, "serverNodeId": fixture.foundation.catalog().node_id().as_str(),
+                "operationCursors": {}, "operations": [], "observations": [], "representationManifests": [], "maximumResponseOperations": 10
+            })).unwrap())).unwrap()).await.unwrap();
+    assert_eq!(reconcile.status(), StatusCode::CONFLICT);
+    assert_eq!(json(reconcile).await["code"], "project_attached");
 }
 
 #[tokio::test]
@@ -593,6 +787,22 @@ async fn serves_built_web_assets_with_spa_and_cache_policy() {
         .unwrap();
     assert_eq!(index.status(), StatusCode::OK);
     assert_eq!(index.headers()[header::CACHE_CONTROL], "no-cache");
+    // The IFrame API loads external scripts and creates a YouTube frame.
+    // Keep these permissions explicit while retaining the same-origin API
+    // boundary and the ban on embedding our app inside another site.
+    assert_eq!(
+        index.headers()["content-security-policy"],
+        "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'; script-src 'self' https://www.youtube.com https://s.ytimg.com; frame-src https://www.youtube.com"
+    );
+    assert_eq!(
+        index.headers()["referrer-policy"],
+        "strict-origin-when-cross-origin"
+    );
+    assert_eq!(index.headers()["x-frame-options"], "DENY");
+    assert_eq!(
+        index.headers()["permissions-policy"],
+        "camera=(), microphone=(self), geolocation=()"
+    );
     assert_eq!(
         to_bytes(index.into_body(), 1024).await.unwrap(),
         "<main>web shell</main>"
@@ -1801,6 +2011,63 @@ async fn review_target_routes_are_authenticated_csrf_guarded_and_never_overwrite
         .unwrap();
     assert_eq!(json(again).await["outcome"], "reused");
 
+    let patch_name = |body: Value, csrf_header: Option<&str>| {
+        let mut builder = Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("{base}/{id}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::COOKIE, &cookie);
+        if let Some(csrf) = csrf_header {
+            builder = builder.header("x-csrf-token", csrf);
+        }
+        builder
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let denied = fixture
+        .app()
+        .oneshot(patch_name(serde_json::json!({"displayName":"RC7"}), None))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    for invalid in [
+        serde_json::json!({}),
+        serde_json::json!({"displayName":42}),
+        serde_json::json!({"displayName":""}),
+        serde_json::json!({"displayName":"RC7\n"}),
+    ] {
+        let response = fixture
+            .app()
+            .oneshot(patch_name(invalid, Some(&csrf)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let renamed = fixture
+        .app()
+        .oneshot(patch_name(
+            serde_json::json!({"displayName":" RC7 "}),
+            Some(&csrf),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(renamed.status(), StatusCode::OK);
+    let renamed = json(renamed).await;
+    assert_eq!(renamed["displayName"], "RC7");
+    assert_eq!(renamed["reviewTargetId"], target["reviewTargetId"]);
+    assert_eq!(renamed["targetDigest"], target["targetDigest"]);
+    assert_eq!(renamed["observations"], target["observations"]);
+    let cleared = fixture
+        .app()
+        .oneshot(patch_name(
+            serde_json::json!({"displayName":null}),
+            Some(&csrf),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert_eq!(json(cleared).await["displayName"], Value::Null);
+
     let mut conflicting = request.clone();
     conflicting["handoff"]["target"]["movie"]["blake3"] = Value::String("d".repeat(64));
     let mut typed: rcdvlog_server_core::ReviewTargetSnapshot =
@@ -2422,6 +2689,49 @@ async fn review_transcription_routes_refuse_unauthorized_cloud_dispatch() {
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     };
+    let live_uri =
+        format!("/api/v1/projects/{project_id}/review-sessions/{recording}/live-transcript");
+    let unauth = fixture
+        .app()
+        .oneshot(
+            Request::builder()
+                .uri(&live_uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    let no_csrf = fixture
+        .app()
+        .oneshot(post(live_uri.clone(), serde_json::json!({}), None))
+        .await
+        .unwrap();
+    assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+    let enabled = fixture
+        .app()
+        .oneshot(post(live_uri.clone(), serde_json::json!({}), Some(&csrf)))
+        .await
+        .unwrap();
+    assert_eq!(enabled.status(), StatusCode::OK);
+    assert_eq!(json(enabled).await["enabled"], true);
+    let read = fixture
+        .app()
+        .oneshot(
+            Request::builder()
+                .uri(&live_uri)
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let value = json(read).await;
+    assert_eq!(value["model"], "ggml-tiny.bin");
+    assert_eq!(value["state"], "live");
+    assert!(value["lines"].as_array().unwrap().is_empty());
+
     let unacknowledged = serde_json::json!({"backend": "openrouter", "model": "openai/whisper-1", "authorizedMaxCostUsd": 0.5, "cloudUploadAcknowledged": false});
     let no_csrf = fixture
         .app()
@@ -2469,4 +2779,178 @@ async fn review_transcription_routes_refuse_unauthorized_cloud_dispatch() {
         .await
         .unwrap();
     assert_eq!(json(listed).await["items"].as_array().unwrap().len(), 0);
+}
+#[tokio::test]
+async fn attached_proxy_streams_seekable_mp4_and_never_exposes_originals_or_paths() {
+    let fixture = Fixture::new(false);
+    let token = device_auth_token(&fixture);
+    let work = fixture._root.path().join("projects/playback");
+    std::fs::create_dir_all(&work).unwrap();
+    let db = work.join("catalog.sqlite3");
+    let (_catalog, project) = cli_catalog(&db);
+    let proxy = work.join("asset_http.v3.mp4");
+    let bytes = include_bytes!("../tests/fixtures/proxy.v3.mp4");
+    std::fs::write(&proxy, bytes).unwrap();
+    let c = rusqlite::Connection::open(&db).unwrap();
+    c.execute(
+        "UPDATE assets SET proxy_path=?1 WHERE id='asset_http'",
+        [proxy.to_str().unwrap()],
+    )
+    .unwrap();
+    fixture
+        .foundation
+        .catalog()
+        .project_replicas()
+        .attach_catalog(
+            &db,
+            &fixture.foundation.config().attached_project_roots,
+            None,
+        )
+        .unwrap();
+    let uri = format!("/api/v1/projects/{project}/assets/asset_http/proxy");
+    let make =
+        |method: Method, path: &str, range: Option<&str>, conditional: Option<(&str, &str)>| {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"));
+            if let Some(range) = range {
+                req = req.header(header::RANGE, range);
+            }
+            if let Some((key, value)) = conditional {
+                req = req.header(key, value);
+            }
+            req.body(Body::empty()).unwrap()
+        };
+    let anonymous = fixture
+        .app()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let full = fixture
+        .app()
+        .oneshot(make(Method::GET, &uri, None, None))
+        .await
+        .unwrap();
+    assert_eq!(full.status(), StatusCode::OK);
+    assert_eq!(full.headers()[header::CONTENT_TYPE], "video/mp4");
+    assert_eq!(full.headers()[header::ACCEPT_RANGES], "bytes");
+    assert!(
+        full.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .starts_with("private")
+    );
+    let etag = full.headers()[header::ETAG].to_str().unwrap().to_string();
+    assert_eq!(
+        to_bytes(full.into_body(), bytes.len() + 1)
+            .await
+            .unwrap()
+            .as_ref(),
+        &bytes[..]
+    );
+    for (range, start, end) in [
+        ("bytes=4-15", 4, 15),
+        ("bytes=-7", bytes.len() - 7, bytes.len() - 1),
+        ("bytes=100-", 100, bytes.len() - 1),
+    ] {
+        let response = fixture
+            .app()
+            .oneshot(make(Method::GET, &uri, Some(range), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[header::CONTENT_RANGE],
+            format!("bytes {start}-{end}/{}", bytes.len())
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), bytes.len() + 1)
+                .await
+                .unwrap()
+                .as_ref(),
+            &bytes[start..=end]
+        );
+    }
+    let head = fixture
+        .app()
+        .oneshot(make(Method::HEAD, &uri, Some("bytes=4-15"), None))
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(head.headers()[header::CONTENT_LENGTH], "12");
+    assert!(to_bytes(head.into_body(), 1).await.unwrap().is_empty());
+    let invalid = fixture
+        .app()
+        .oneshot(make(Method::GET, &uri, Some("bytes=999999999-"), None))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        invalid.headers()[header::CONTENT_RANGE],
+        format!("bytes */{}", bytes.len())
+    );
+    let cached = fixture
+        .app()
+        .oneshot(make(
+            Method::GET,
+            &uri,
+            None,
+            Some(("if-none-match", &etag)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+    let stale_range = fixture
+        .app()
+        .oneshot(make(
+            Method::GET,
+            &uri,
+            Some("bytes=4-15"),
+            Some(("if-range", "\"old\"")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale_range.status(), StatusCode::OK);
+    let wrong = fixture
+        .app()
+        .oneshot(make(
+            Method::GET,
+            "/api/v1/projects/other/assets/asset_http/proxy",
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+    let review = fixture
+        .app()
+        .oneshot(make(
+            Method::GET,
+            &format!("/api/v1/projects/{project}/assets/asset_http/review"),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let projection = json(review).await;
+    assert_eq!(projection["localProxyAvailable"], true);
+    assert_eq!(projection["proxy"], serde_json::Value::Null);
+    assert!(!projection.to_string().contains(work.to_str().unwrap()));
+    // Replacing or removing a proxy does not leave immutable stale cache metadata.
+    std::fs::write(&proxy, &bytes[..bytes.len() - 1]).unwrap();
+    let changed = fixture
+        .app()
+        .oneshot(make(Method::HEAD, &uri, None, None))
+        .await
+        .unwrap();
+    assert_ne!(changed.headers()[header::ETAG], etag.as_str());
+    std::fs::remove_file(&proxy).unwrap();
+    let missing = fixture
+        .app()
+        .oneshot(make(Method::GET, &uri, None, None))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }

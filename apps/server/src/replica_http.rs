@@ -140,7 +140,9 @@ pub(super) fn project_replica_error(request_id: String, error: ProjectReplicaErr
         ProjectReplicaError::InvalidBaseline(_)
         | ProjectReplicaError::UnsafeReplicaPath
         | ProjectReplicaError::Sync(_) => StatusCode::BAD_REQUEST,
-        ProjectReplicaError::DifferentBaseline { .. } => StatusCode::CONFLICT,
+        ProjectReplicaError::DifferentBaseline { .. }
+        | ProjectReplicaError::Attached { .. }
+        | ProjectReplicaError::AttachRefused(_) => StatusCode::CONFLICT,
         ProjectReplicaError::NotFound { .. } => StatusCode::NOT_FOUND,
         ProjectReplicaError::Storage(_)
         | ProjectReplicaError::Infrastructure(_)

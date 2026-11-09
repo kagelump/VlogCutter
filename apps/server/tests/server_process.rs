@@ -148,3 +148,52 @@ fn static_backup_inspection_does_not_touch_the_live_data_directory() {
     assert_eq!(before, blake3::hash(&fs::read(&sentinel).unwrap()));
     assert!(!data_dir.join("control.sqlite3").exists());
 }
+
+#[test]
+fn attached_project_admin_emits_json_and_stable_refusals() {
+    let root = tempdir().unwrap();
+    let data = root.path().join("state");
+    let work = root.path().join("working project");
+    fs::create_dir_all(&work).unwrap();
+    let path = work.join("catalog.sqlite3");
+    let catalog = rcdvlog_server_core::Catalog::open(&path).unwrap();
+    catalog.set_local_node_id("node_cli").unwrap();
+    let project = catalog.create_project("Shared working project").unwrap();
+    let attach = || {
+        let mut command = configured_command(&data);
+        command
+            .env("RCDVLOG_ATTACHED_PROJECT_ROOTS", &work)
+            .args(["admin", "projects", "attach", "--catalog"])
+            .arg(&path);
+        command
+    };
+    let refused = attach()
+        .env("RCDVLOG_ATTACHED_PROJECT_ROOTS", "")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "attached_catalog_refused");
+    for _ in 0..2 {
+        let output = attach().output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["result"]["attached"], true);
+        assert_eq!(value["result"]["projectId"], project.id);
+    }
+    let detach = configured_command(&data)
+        .args(["admin", "projects", "detach", "--project-id", &project.id])
+        .output()
+        .unwrap();
+    assert!(!detach.status.success());
+    assert!(detach.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&detach.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "attached_catalog_refused");
+}

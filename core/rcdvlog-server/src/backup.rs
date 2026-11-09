@@ -510,10 +510,7 @@ impl BackupManager {
                 if canceled() {
                     return Err(BackupError::Canceled);
                 }
-                let source = resolve_data_relative(
-                    &self.config.data_dir,
-                    &registered.replica_relative_path,
-                )?;
+                let source = registered.source_path(&self.config)?;
                 if !source.is_file() {
                     return Err(BackupError::Verification(format!(
                         "registered project {} has no replica",
@@ -671,12 +668,28 @@ impl BackupManager {
             let control_path = staging.join("control.sqlite3");
             let mut connection = open_writable_connection(&control_path)?;
             run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS)?;
+            let attached_projects: BTreeSet<String> = registered_projects(&control_path)?
+                .into_iter()
+                .filter(|project| project.attached_catalog_path.is_some())
+                .map(|project| project.project_id)
+                .collect();
+            // A restore must never reconnect to, or mutate, the original CLI catalogs.
+            connection.execute("UPDATE project_registry SET attached_catalog_path=NULL", [])?;
             drop(connection);
 
             let mut sequence_recovery_projects = Vec::new();
             for project in &manifest.projects {
                 let replica_path = safe_manifest_path(&staging, &project.replica_relative_path)?;
                 let catalog = Catalog::open_existing(&replica_path)?;
+                if attached_projects.contains(&project.project_id) {
+                    // This is the isolated staging COPY, never the live CLI catalog.
+                    // Preserve immutable operations and their allocators, but make
+                    // new replica writes use the server identity and recovery guard.
+                    open_writable_connection(&replica_path)?.execute(
+                        "INSERT INTO catalog_identity(singleton_id, node_id, created_at) VALUES(1, ?1, ?2) ON CONFLICT(singleton_id) DO UPDATE SET node_id=excluded.node_id",
+                        params![project.server_node_id, timestamp()],
+                    )?;
+                }
                 if let Some(peer) = project.origin_node_id.as_deref() {
                     let watermark = project
                         .origin_sequence_watermarks
@@ -738,8 +751,7 @@ impl BackupManager {
         }
         let mut recovery = Vec::new();
         for registered in registered_projects(self.control.database_path())? {
-            let replica =
-                resolve_data_relative(&self.config.data_dir, &registered.replica_relative_path)?;
+            let replica = registered.source_path(&self.config)?;
             let status = if !replica.is_file() {
                 "missing"
             } else if verify_sqlite_integrity(&replica).is_err() {
@@ -868,24 +880,33 @@ struct RegisteredProject {
     replica_relative_path: String,
     origin_node_id: Option<String>,
     server_node_id: String,
+    attached_catalog_path: Option<PathBuf>,
+}
+
+impl RegisteredProject {
+    fn source_path(&self, config: &ServerConfig) -> Result<PathBuf, BackupError> {
+        if let Some(path) = &self.attached_catalog_path {
+            let path = path.canonicalize()?;
+            if !crate::inside_any_root(&path, &config.attached_project_roots)
+                || path.starts_with(config.data_dir.canonicalize()?)
+            {
+                return Err(BackupError::Verification(
+                    "attached catalog is outside allowed project roots".into(),
+                ));
+            }
+            Ok(path)
+        } else {
+            resolve_data_relative(&config.data_dir, &self.replica_relative_path)
+        }
+    }
 }
 
 fn estimated_backup_bytes(config: &ServerConfig) -> Result<u64, BackupError> {
     let control = config.data_dir.join("control.sqlite3");
     let mut total = fs::metadata(control).map(|value| value.len()).unwrap_or(1);
-    if let Ok(connection) = open_read_only_connection(&config.data_dir.join("control.sqlite3")) {
-        let mut statement = connection.prepare(
-            "SELECT replica_relative_path FROM project_registry WHERE state='registered'",
-        )?;
-        let paths = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for relative in paths {
-            if let Ok(path) = safe_manifest_path(&config.data_dir, &relative) {
-                total =
-                    total.saturating_add(fs::metadata(path).map(|value| value.len()).unwrap_or(0));
-            }
-        }
+    for project in registered_projects(&config.data_dir.join("control.sqlite3"))? {
+        let path = project.source_path(config)?;
+        total = total.saturating_add(fs::metadata(path).map(|value| value.len()).unwrap_or(0));
     }
     Ok(total.max(1))
 }
@@ -893,7 +914,7 @@ fn estimated_backup_bytes(config: &ServerConfig) -> Result<u64, BackupError> {
 fn registered_projects(control_path: &Path) -> Result<Vec<RegisteredProject>, BackupError> {
     let connection = open_read_only_connection(control_path)?;
     let mut statement = connection.prepare(
-        "SELECT project_id,replica_relative_path,origin_node_id,server_node_id FROM project_registry WHERE state='registered' ORDER BY project_id",
+        "SELECT project_id,replica_relative_path,origin_node_id,server_node_id,attached_catalog_path FROM project_registry WHERE state='registered' ORDER BY project_id",
     )?;
     Ok(statement
         .query_map([], |row| {
@@ -902,6 +923,7 @@ fn registered_projects(control_path: &Path) -> Result<Vec<RegisteredProject>, Ba
                 replica_relative_path: row.get(1)?,
                 origin_node_id: row.get(2)?,
                 server_node_id: row.get(3)?,
+                attached_catalog_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1862,5 +1884,95 @@ mod tests {
         assert!(result.is_ok());
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(committed.load(Ordering::Relaxed) > 0);
+    }
+    #[test]
+    fn attached_backup_uses_live_catalog_and_restore_never_reconnects_the_original() {
+        for existing_replica in [false, true] {
+            let mut fixture = Fixture::new();
+            let work = fixture.root.path().join("cli");
+            fs::create_dir_all(&work).unwrap();
+            fixture.config.attached_project_roots = vec![work.clone()];
+            fixture.control = ControlCatalog::open_or_create(
+                &fixture.config.data_dir,
+                &fixture.config.diagnostics(),
+            )
+            .unwrap();
+            let path = work.join("catalog.sqlite3");
+            let source = Catalog::open(&path).unwrap();
+            source.set_local_node_id("node_cli").unwrap();
+            let project_id = if existing_replica {
+                // Seed a same-ID catalog using SQLite's backup API, not live file copies.
+                let old = fixture
+                    .config
+                    .data_dir
+                    .join("projects/fixture/catalog.sqlite3");
+                drop(source);
+                backup_database_bounded(&old, &path, &|| false).unwrap();
+                fixture.project_id.clone()
+            } else {
+                source.create_project("CLI working project").unwrap().id
+            };
+            let source = Catalog::open_existing(&path).unwrap();
+            source
+                .add_portable_project_asset(&project_id, portable_asset("attached_only"))
+                .unwrap();
+            fixture
+                .control
+                .project_replicas()
+                .attach_catalog(
+                    &path,
+                    &fixture.config.attached_project_roots,
+                    Some(&project_id),
+                )
+                .unwrap();
+            let result = fixture
+                .manager()
+                .create_restore_point(
+                    if existing_replica {
+                        "attached-existing"
+                    } else {
+                        "attached-new"
+                    },
+                    || false,
+                )
+                .unwrap();
+            let published = fixture
+                .config
+                .backup_dir
+                .join(&result.published_relative_path);
+            assert!(
+                fixture
+                    .manager()
+                    .inspect_restore_point(&published)
+                    .unwrap()
+                    .valid
+            );
+            let restored = fixture.root.path().join("restored");
+            fixture
+                .manager()
+                .restore_to_new_data_root(&published, &restored)
+                .unwrap();
+            let control =
+                ControlCatalog::open_or_create(&restored, &fixture.config.diagnostics()).unwrap();
+            let registry = control.project_replicas().get(&project_id).unwrap();
+            assert!(!registry.is_attached());
+            let restored_catalog = control
+                .project_replicas()
+                .open_catalog(&project_id)
+                .unwrap();
+            assert!(restored_catalog.get_asset("attached_only").is_ok());
+            assert!(restored_catalog.database_path().starts_with(&restored));
+            assert_eq!(
+                restored_catalog.local_node_id().unwrap().as_deref(),
+                Some(control.node_id().as_str())
+            );
+            // Recovery still prevents allocation until the peer's sequence is reconciled.
+            assert!(
+                restored_catalog
+                    .create_note_revision("attached_only", "restored copy only")
+                    .is_err()
+            );
+            assert!(source.get_asset("attached_only").unwrap().notes.is_empty());
+        }
     }
 }

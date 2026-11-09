@@ -26,6 +26,48 @@ fn config(root: &TempDir) -> ServerConfig {
 }
 
 #[test]
+fn live_review_migration_upgrades_schema_eighteen_without_losing_existing_metadata() {
+    let root = TempDir::new().unwrap();
+    let config = config(&root);
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    let path = config.data_dir.join(CONTROL_DATABASE_FILENAME);
+    let mut c = open_writable_connection(&path).unwrap();
+    run_sqlite_migrations(&mut c, &CONTROL_CATALOG_MIGRATIONS[..18]).unwrap();
+    c.execute("INSERT INTO operational_metadata(key,value,updated_at) VALUES('live-upgrade','kept','2026-11-09T00:00:00Z')", []).unwrap();
+    drop(c);
+    for _ in 0..2 {
+        let catalog =
+            ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics()).unwrap();
+        let c = open_read_only_connection(catalog.database_path()).unwrap();
+        assert_eq!(
+            catalog.inspect_migrations().unwrap().status,
+            MigrationHistoryStatus::Current
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT value FROM operational_metadata WHERE key='live-upgrade'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "kept"
+        );
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM review_live_transcripts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM review_live_utterances", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
 fn callback_migration_upgrades_schema_ten_and_reopens_without_losing_jobs() {
     let root = TempDir::new().unwrap();
     let config = config(&root);
@@ -866,4 +908,25 @@ fn a_second_open_does_not_rebuild_the_index_again() {
 
 fn database_path_for(config: &ServerConfig) -> PathBuf {
     config.data_dir.join(CONTROL_DATABASE_FILENAME)
+}
+#[test]
+fn attached_catalog_migration_preserves_schema_seventeen_projects() {
+    let root = TempDir::new().unwrap();
+    let config = config(&root);
+    let path = config.data_dir.join(CONTROL_DATABASE_FILENAME);
+    let mut connection = open_writable_connection(&path).unwrap();
+    run_sqlite_migrations(&mut connection, &CONTROL_CATALOG_MIGRATIONS[..17]).unwrap();
+    connection.execute("INSERT INTO project_registry(project_id,replica_relative_path,state,registered_at,created_at,updated_at) VALUES('kept','projects/kept.sqlite3','registered','t','t','t')", []).unwrap();
+    drop(connection);
+    for _ in 0..2 {
+        let control =
+            ControlCatalog::open_or_create(&config.data_dir, &config.diagnostics()).unwrap();
+        let project = control.project_replicas().get("kept").unwrap();
+        assert_eq!(project.replica_relative_path, "projects/kept.sqlite3");
+        assert!(!project.is_attached());
+        assert_eq!(
+            control.inspect_migrations().unwrap().status,
+            MigrationHistoryStatus::Current
+        );
+    }
 }

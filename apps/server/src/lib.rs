@@ -169,6 +169,14 @@ pub fn router(state: HttpState) -> Router {
             get(get_project_review_asset),
         )
         .route(
+            "/api/v1/projects/{project_id}/assets/{asset_id}/thumbnail",
+            get(project_asset_thumbnail).head(project_asset_thumbnail),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/assets/{asset_id}/proxy",
+            get(project_asset_proxy).head(project_asset_proxy),
+        )
+        .route(
             "/api/v1/projects/{project_id}/assets/{asset_id}/notes",
             post(create_review_note),
         )
@@ -288,7 +296,7 @@ pub fn router(state: HttpState) -> Router {
         )
         .route(
             "/api/v1/projects/{project_id}/review-targets/{review_target_id}",
-            get(review_target_http::get),
+            get(review_target_http::get).patch(review_target_http::set_display_name),
         )
         .route(
             "/api/v1/projects/{project_id}/review-targets/{review_target_id}/youtube",

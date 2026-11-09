@@ -254,12 +254,13 @@ pub(super) async fn security_headers(request: Request<Body>, next: Next) -> Resp
     );
     headers.insert(
         header::HeaderName::from_static("referrer-policy"),
-        HeaderValue::from_static("same-origin"),
+        // YouTube embeds require the cross-origin Referer to identify this app.
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
     headers.insert(
         header::HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(
-            "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'",
+            "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'; script-src 'self' https://www.youtube.com https://s.ytimg.com; frame-src https://www.youtube.com",
         ),
     );
     headers.insert(

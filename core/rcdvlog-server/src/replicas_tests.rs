@@ -22,6 +22,10 @@ impl Fixture {
         let config = ServerConfig::from_values(BTreeMap::from([
             ("RCDVLOG_DATA_DIR".to_string(), data.display().to_string()),
             (
+                "RCDVLOG_ATTACHED_PROJECT_ROOTS".to_string(),
+                std::env::temp_dir().display().to_string(),
+            ),
+            (
                 "RCDVLOG_DERIVED_DIR".to_string(),
                 derived.display().to_string(),
             ),
@@ -655,4 +659,450 @@ fn project_asset_search_over_labels_matches_json_substrings_including_false_posi
         !page.items[0].labels.iter().any(|label| label == "red"),
         "no label actually equals the search term - this is the accepted false positive"
     );
+}
+
+fn desktop_path(root: &TempDir) -> PathBuf {
+    root.path().join("desktop.sqlite3").canonicalize().unwrap()
+}
+
+#[test]
+fn attach_serves_the_cli_catalog_in_place_of_its_replica_and_detach_returns() {
+    let fixture = Fixture::new();
+    let source_root = TempDir::new().unwrap();
+    let envelope = baseline(&source_root);
+    let project_id = envelope.payload.project.project_id.clone();
+    fixture.manager.import_baseline(&envelope).unwrap();
+    // Work the CLI did after the replica was made never reached it.
+    Catalog::open_existing(desktop_path(&source_root))
+        .unwrap()
+        .create_note_revision("asset_desktop", "made in the CLI")
+        .unwrap();
+    let note = |manager: &ProjectReplicaManager| {
+        manager
+            .open_catalog(&project_id)
+            .unwrap()
+            .get_asset("asset_desktop")
+            .unwrap()
+            .notes
+    };
+    assert_eq!(note(&fixture.manager), "");
+
+    let attached = fixture
+        .manager
+        .attach_catalog(
+            &desktop_path(&source_root),
+            &[source_root.path().to_path_buf()],
+            None,
+        )
+        .unwrap();
+    assert!(attached.is_attached());
+    assert_eq!(attached.project_id, project_id);
+    assert_eq!(note(&fixture.manager), "made in the CLI");
+    assert_eq!(
+        fixture.manager.list_projects(10, None).unwrap().items.len(),
+        1
+    );
+    // Sync never writes into an attached catalog.
+    assert!(matches!(
+        fixture.manager.import_baseline(&envelope),
+        Err(ProjectReplicaError::Attached { .. })
+    ));
+    // The node-local path never leaves the server in a serialized replica.
+    assert!(
+        !serde_json::to_string(&attached)
+            .unwrap()
+            .contains("desktop.sqlite3")
+    );
+
+    let detached = fixture.manager.detach_catalog(&project_id).unwrap();
+    assert!(!detached.is_attached());
+    assert_eq!(note(&fixture.manager), "");
+}
+
+#[test]
+fn attach_without_a_replica_registers_the_project_but_cannot_detach() {
+    let fixture = Fixture::new();
+    let source_root = TempDir::new().unwrap();
+    let envelope = baseline(&source_root);
+    let attached = fixture
+        .manager
+        .attach_catalog(
+            &desktop_path(&source_root),
+            &[source_root.path().to_path_buf()],
+            None,
+        )
+        .unwrap();
+    assert_eq!(attached.project_id, envelope.payload.project.project_id);
+    assert_eq!(attached.origin_node_id.as_deref(), Some("node_mac"));
+    let page = fixture.manager.list_projects(10, None).unwrap();
+    assert_eq!(page.items[0].asset_count, 1);
+    assert!(matches!(
+        fixture.manager.detach_catalog(&attached.project_id),
+        Err(ProjectReplicaError::AttachRefused(_))
+    ));
+}
+
+#[test]
+fn attach_refuses_catalogs_outside_the_allowed_roots() {
+    let fixture = Fixture::new();
+    let source_root = TempDir::new().unwrap();
+    baseline(&source_root);
+    let elsewhere = TempDir::new().unwrap();
+    for roots in [vec![], vec![elsewhere.path().to_path_buf()]] {
+        assert!(matches!(
+            fixture
+                .manager
+                .attach_catalog(&desktop_path(&source_root), &roots, None),
+            Err(ProjectReplicaError::AttachRefused(_))
+        ));
+    }
+    assert!(matches!(
+        fixture.manager.attach_catalog(
+            &source_root.path().join("missing.sqlite3"),
+            &[source_root.path().to_path_buf()],
+            None
+        ),
+        Err(ProjectReplicaError::AttachRefused(_))
+    ));
+    assert!(
+        fixture
+            .manager
+            .list_projects(10, None)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_server_never_migrates_an_attached_catalog() {
+    let fixture = Fixture::new();
+    let source_root = TempDir::new().unwrap();
+    baseline(&source_root);
+    let path = desktop_path(&source_root);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "DELETE FROM schema_migrations WHERE migration_id = (SELECT MAX(migration_id) FROM schema_migrations)",
+            [],
+        )
+        .unwrap();
+    let before: i64 = connection
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let error = fixture
+        .manager
+        .attach_catalog(&path, &[source_root.path().to_path_buf()], None)
+        .unwrap_err();
+    assert!(
+        matches!(error, ProjectReplicaError::AttachRefused(ref reason) if reason.contains("schema"))
+    );
+    let after: i64 = connection
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn asset_thumbnail_path_is_what_the_attached_catalog_records() {
+    let fixture = Fixture::new();
+    let source_root = TempDir::new().unwrap();
+    let envelope = baseline(&source_root);
+    let project_id = envelope.payload.project.project_id.clone();
+    let thumbnail = source_root
+        .path()
+        .join("cache/thumbnails/asset_desktop/q1.v2.jpg");
+    fs::create_dir_all(thumbnail.parent().unwrap()).unwrap();
+    fs::write(&thumbnail, b"jpeg").unwrap();
+    rusqlite::Connection::open(desktop_path(&source_root))
+        .unwrap()
+        .execute(
+            "INSERT INTO asset_thumbnails(asset_id, quality, path, created_at) VALUES ('asset_desktop', 1, ?1, '2026-11-08T00:00:00Z')",
+            [thumbnail.display().to_string()],
+        )
+        .unwrap();
+    fixture
+        .manager
+        .attach_catalog(
+            &desktop_path(&source_root),
+            &[source_root.path().to_path_buf()],
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .manager
+            .asset_thumbnail_path(&project_id, "asset_desktop")
+            .unwrap(),
+        Some(thumbnail)
+    );
+    assert_eq!(
+        fixture
+            .manager
+            .asset_thumbnail_path(&project_id, "asset_missing")
+            .unwrap(),
+        None
+    );
+}
+#[test]
+fn attached_catalog_accepts_concurrent_cli_and_server_operations_without_changing_node_identity() {
+    let fixture = Fixture::new();
+    let root = TempDir::new().unwrap();
+    let envelope = baseline(&root);
+    let project_id = envelope.payload.project.project_id;
+    fixture
+        .manager
+        .attach_catalog(&desktop_path(&root), &[root.path().to_path_buf()], None)
+        .unwrap();
+    let cli = Catalog::open_shared_existing(desktop_path(&root)).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let cli_barrier = barrier.clone();
+    let writer = std::thread::spawn(move || {
+        cli_barrier.wait();
+        for index in 0..12 {
+            cli.add_label("asset_desktop", &format!("cli-{index}"))
+                .unwrap();
+        }
+    });
+    barrier.wait();
+    for index in 0..12 {
+        fixture
+            .manager
+            .add_review_label(&project_id, "asset_desktop", &format!("web-{index}"), 0)
+            .unwrap();
+    }
+    writer.join().unwrap();
+    let cli = Catalog::open_read_only_existing(desktop_path(&root)).unwrap();
+    let labels = cli.get_asset("asset_desktop").unwrap().labels;
+    assert_eq!(labels.len(), 24);
+    for index in 0..12 {
+        assert!(labels.contains(&format!("cli-{index}")));
+        assert!(labels.contains(&format!("web-{index}")));
+    }
+    assert_eq!(cli.local_node_id().unwrap().as_deref(), Some("node_mac"));
+    assert_eq!(
+        fixture
+            .manager
+            .get_review_asset(&project_id, "asset_desktop")
+            .unwrap()
+            .asset
+            .labels,
+        labels
+    );
+}
+
+#[test]
+fn attached_access_rechecks_allowlist_and_schema_after_registration() {
+    let mut fixture = Fixture::new();
+    let root = TempDir::new().unwrap();
+    let envelope = baseline(&root);
+    let project_id = envelope.payload.project.project_id;
+    let path = desktop_path(&root);
+    fixture
+        .manager
+        .attach_catalog(&path, &[root.path().to_path_buf()], None)
+        .unwrap();
+    fixture.manager.attached_project_roots.clear();
+    assert!(matches!(
+        fixture.manager.open_catalog(&project_id),
+        Err(ProjectReplicaError::AttachRefused(_))
+    ));
+    fixture
+        .manager
+        .attached_project_roots
+        .push(root.path().to_path_buf());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute("DELETE FROM schema_migrations WHERE migration_id=(SELECT MAX(migration_id) FROM schema_migrations)", []).unwrap();
+    assert!(matches!(
+        fixture.manager.open_catalog(&project_id),
+        Err(ProjectReplicaError::AttachRefused(_))
+    ));
+    assert!(Catalog::open_shared_existing(&path).is_err());
+    let count: u32 = connection
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, rcdvlog_core::PROJECT_CATALOG_SCHEMA_VERSION - 1);
+}
+#[test]
+fn attached_proxy_availability_uses_the_cli_cache_without_a_media_library_link() {
+    let mut fixture = Fixture::new();
+    let root = TempDir::new().unwrap();
+    let envelope = baseline(&root);
+    let project_id = &envelope.payload.project.project_id;
+    let path = desktop_path(&root);
+    let original = root.path().join("original.mov");
+    let proxy = root.path().join("clip.v3.mp4");
+    fs::write(&original, b"12345").unwrap();
+    fs::write(&proxy, b"generated mp4").unwrap();
+    let c = rusqlite::Connection::open(&path).unwrap();
+    c.execute(
+        "UPDATE assets SET path=?1, proxy_path=?2 WHERE id='asset_desktop'",
+        params![original.to_str().unwrap(), proxy.to_str().unwrap()],
+    )
+    .unwrap();
+    fixture.manager.import_baseline(&envelope).unwrap();
+    assert!(
+        !fixture
+            .manager
+            .get_review_asset(project_id, "asset_desktop")
+            .unwrap()
+            .local_proxy_available
+    );
+    fixture
+        .manager
+        .attach_catalog(&path, &[root.path().to_path_buf()], None)
+        .unwrap();
+    let item = fixture
+        .manager
+        .get_review_asset(project_id, "asset_desktop")
+        .unwrap();
+    assert!(item.local_proxy_available);
+    assert!(item.asset.media_object_id.is_none());
+    assert!(item.proxy.is_none());
+    assert_eq!(
+        item.original_availability,
+        Some(NodeAvailabilityState::AccessibleHere)
+    );
+    let serialized = serde_json::to_string(&item).unwrap();
+    assert!(!serialized.contains(root.path().to_str().unwrap()));
+    assert_eq!(
+        fixture
+            .manager
+            .asset_proxy_path(project_id, "asset_desktop")
+            .unwrap(),
+        Some(proxy.canonicalize().unwrap())
+    );
+    // A reachable proxy remains playable when the original is offline.
+    fs::remove_file(&original).unwrap();
+    let item = fixture
+        .manager
+        .get_review_asset(project_id, "asset_desktop")
+        .unwrap();
+    assert!(item.local_proxy_available);
+    assert_eq!(
+        item.original_availability,
+        Some(NodeAvailabilityState::TemporarilyUnavailable)
+    );
+    let legacy = root.path().join("camera-normalized-v1.mp4");
+    fs::write(&legacy, b"normalized mp4").unwrap();
+    c.execute(
+        "UPDATE assets SET proxy_path=?1 WHERE id='asset_desktop'",
+        [legacy.to_str().unwrap()],
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .manager
+            .get_review_asset(project_id, "asset_desktop")
+            .unwrap()
+            .local_proxy_available
+    );
+    c.execute(
+        "UPDATE assets SET metadata_rotation_degrees=90 WHERE id='asset_desktop'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        !fixture
+            .manager
+            .get_review_asset(project_id, "asset_desktop")
+            .unwrap()
+            .local_proxy_available
+    );
+    c.execute(
+        "UPDATE assets SET metadata_rotation_degrees=0 WHERE id='asset_desktop'",
+        [],
+    )
+    .unwrap();
+    fixture.manager.attached_project_roots = vec![root.path().to_path_buf()];
+    for recorded in [
+        root.path().join("missing.v3.mp4"),
+        root.path().join("old.v2.mp4"),
+        root.path().join("empty.v3.mp4"),
+    ] {
+        if recorded.file_name().unwrap() != "missing.v3.mp4" {
+            fs::write(
+                &recorded,
+                if recorded.to_string_lossy().contains("empty") {
+                    &b""[..]
+                } else {
+                    &b"old"[..]
+                },
+            )
+            .unwrap();
+        }
+        c.execute(
+            "UPDATE assets SET proxy_path=?1 WHERE id='asset_desktop'",
+            [recorded.to_str().unwrap()],
+        )
+        .unwrap();
+        assert!(
+            !fixture
+                .manager
+                .get_review_asset(project_id, "asset_desktop")
+                .unwrap()
+                .local_proxy_available
+        );
+    }
+    let outside = fixture._root.path().join("outside.v3.mp4");
+    fs::write(&outside, b"outside").unwrap();
+    c.execute(
+        "UPDATE assets SET proxy_path=?1 WHERE id='asset_desktop'",
+        [outside.to_str().unwrap()],
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .manager
+            .asset_proxy_path(project_id, "asset_desktop")
+            .unwrap()
+            .is_none()
+    );
+    #[cfg(unix)]
+    {
+        let link = root.path().join("escape.v3.mp4");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        c.execute(
+            "UPDATE assets SET proxy_path=?1 WHERE id='asset_desktop'",
+            [link.to_str().unwrap()],
+        )
+        .unwrap();
+        assert!(
+            fixture
+                .manager
+                .asset_proxy_path(project_id, "asset_desktop")
+                .unwrap()
+                .is_none()
+        );
+    }
+    // Even overlapping allowlists cannot expose server state, or the original itself.
+    fixture
+        .manager
+        .attached_project_roots
+        .push(fixture._root.path().to_path_buf());
+    let secret = fixture.manager.data_dir.join("private.v3.mp4");
+    fs::write(&secret, b"private").unwrap();
+    for (source, recorded) in [
+        (original.as_path(), secret.as_path()),
+        (proxy.as_path(), proxy.as_path()),
+    ] {
+        c.execute(
+            "UPDATE assets SET path=?1, proxy_path=?2 WHERE id='asset_desktop'",
+            params![source.to_str().unwrap(), recorded.to_str().unwrap()],
+        )
+        .unwrap();
+        assert!(
+            fixture
+                .manager
+                .asset_proxy_path(project_id, "asset_desktop")
+                .unwrap()
+                .is_none()
+        );
+    }
 }

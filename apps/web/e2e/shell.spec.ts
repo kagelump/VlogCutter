@@ -130,6 +130,23 @@ test("Chrome imports a verified TV review target through the real server and sho
   await expect(page.getByRole("link", { name: "YouTube" })).toHaveCount(0);
   await expect(page.getByRole("region", { name: /Shots/ }).getByRole("link")).toHaveCount(3);
 
+  const targetUrl = page.url();
+  await page.getByRole("button", { name: "Rename cut" }).click();
+  const rename = page.getByRole("dialog", { name: "Rename cut" });
+  await rename.getByLabel("Cut name").fill("RC7");
+  await rename.getByRole("button", { name: "Save name" }).click();
+  await expect(page.getByRole("heading", { name: /^RC7/ })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("heading", { name: /^RC7/ })).toBeVisible();
+  expect(page.url()).toBe(targetUrl);
+  await page.getByRole("link", { name: "TV reviews" }).first().click();
+  await expect(page.getByRole("main").getByRole("listitem").filter({ hasText: "RC7" })).toContainText("Revision syntheti");
+  await page.goto(targetUrl);
+  await page.getByRole("button", { name: "Rename cut" }).click();
+  await rename.getByLabel("Cut name").fill("");
+  await rename.getByRole("button", { name: "Save name" }).click();
+  await expect(page.getByRole("heading", { name: /^Cut syntheti/ })).toBeVisible();
+
   // Re-importing the identical handoff reuses the original target rather than adding one.
   await page.getByRole("link", { name: "TV reviews" }).first().click();
   await expect(targets).toHaveCount(2);
@@ -169,6 +186,8 @@ test("Chrome records a fake-microphone voice review with a manual cue and reopen
   test.setTimeout(60_000);
   await openSeededTarget(page, bootstrapCode(5));
   await startRecording(page);
+  await expect(page.getByText("Live draft", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Live transcription needs a speech model/)).toBeVisible();
   await page.waitForTimeout(1_500);
   await page.keyboard.press("m");
   await page.waitForTimeout(3_000);
@@ -189,7 +208,10 @@ test("Chrome records a fake-microphone voice review with a manual cue and reopen
   await page.getByRole("button", { name: "OpenRouter (cloud)" }).click();
   await page.getByRole("button", { name: "Check" }).click();
   await expect(page.getByText(/may be sent to the provider/)).toBeVisible();
-  await expect(page.getByText(/No OpenRouter key/)).toBeVisible();
+  // A developer may have a key file even when the fixture clears the env key.
+  // Capture must never enable cloud execution without explicit consent.
+  await expect(page.getByRole("checkbox", { name: /Send this recording to OpenRouter/ })).not.toBeChecked();
+  await expect(page.getByRole("button", { name: "Transcribe", exact: true })).toHaveCount(0);
 
   const href = await page.getByRole("link", { name: "Download WAV" }).getAttribute("href");
   // Fetch from the page so the browser's own session cookie is used.
@@ -338,4 +360,67 @@ test("Chrome imports a historical rendered-artifact review only with an acknowle
   await expect(page.getByRole("link", { name: "Record review" })).toBeVisible();
   await page.getByRole("link", { name: "TV reviews" }).first().click();
   await expect(page.getByRole("main").getByRole("listitem").filter({ hasText: "Cut historic" })).toContainText("Historical");
+});
+
+
+test("live transcript layout follows updates, keeps scroll position, and refines in place", async ({ page }, testInfo) => {
+  test.setTimeout(60_000);
+  const baseURL = process.env.RCDVLOG_WEB_E2E_BASE_URL!;
+  const reviewPath = readFileSync(reviewRunPath(baseURL), "utf8").trim();
+  await signIn(page, bootstrapCode(10));
+  // Supplemental browser-only state changes; real capture/API behavior is covered above.
+  const sessionPath = reviewPath.replace(/\/(?:review|runs|transcripts)\/[^/]+$/, "");
+  let revision = 1;
+  let complete = false;
+  const utterance = (index: number) => ({ utteranceId: `live-${index}`, segmentIndex: 0, windowIndex: 0,
+    startFrame: index * 48000, endFrame: (index + 1) * 48000, startSeconds: index, endSeconds: index + 1,
+    text: `Live review line ${index}`, displayText: `Live review line ${index}`, displayProjection: null,
+    language: "en", script: "latin", speaker: "unknown", speakerEvidence: "diarizationUnavailable",
+    meanTokenProbability: 0.8, suppressed: false, flags: [] });
+  await page.route("**/api/v1/projects/*/review-sessions/*/live-transcript", async (route) => {
+    await route.fulfill({ json: { enabled: true, state: complete ? "complete" : "refining", model: "ggml-base.bin", modelAvailable: true,
+      processedSeconds: 45 + revision, receivedSeconds: 60, revision, finalRunId: null, errorCode: null,
+      lines: Array.from({ length: 45 + revision }, (_, i) => ({ utterance: utterance(i), movieTime: null, assetId: null, shotNumber: null })) } });
+  });
+  await page.route("**/api/v1/projects/*/review-sessions/*/transcriptions", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    if (!complete) body.items = body.items.map((item: object) => ({ ...item, state: "running", utterances: [] }));
+    await route.fulfill({ json: body });
+  });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(sessionPath);
+  const list = page.getByRole("list", { name: "Live transcript" });
+  await expect(list).toBeVisible();
+  await expect.poll(() => list.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(4);
+  await list.evaluate((el) => { el.scrollTop = 0; el.dispatchEvent(new Event("scroll")); });
+  await expect(page.getByRole("button", { name: "Follow live", exact: true })).toBeVisible();
+  revision = 2;
+  await expect(page.getByText("Live review line 46")).toBeAttached();
+  await expect.poll(() => list.evaluate((el) => el.scrollTop)).toBe(0);
+  await page.getByRole("button", { name: "Follow live", exact: true }).click();
+  await expect.poll(() => list.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(4);
+  await page.screenshot({ path: testInfo.outputPath("live-transcript-desktop.png"), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("live-transcript-phone.png"), fullPage: true });
+  complete = true;
+  await expect(list).toHaveCount(0);
+  await expect(page.getByText("不要，長度不變，換個轉場。")).toBeVisible();
+});
+
+test("Chrome plays and seeks the attached CLI proxy through real byte ranges", async ({ page }) => {
+  await signIn(page, bootstrapCode(9));
+  await page.getByRole("link", { name: "Clips" }).first().click();
+  const video = page.locator("video");
+  await expect(video).toHaveAttribute("src", /\/assets\/asset_web_e2e\/proxy$/);
+  await expect(page.getByText("No preview", { exact: true })).toHaveCount(0);
+  await video.evaluate(async (element: HTMLVideoElement) => { element.muted = true; await element.play(); });
+  await expect.poll(() => video.evaluate((element: HTMLVideoElement) => element.currentTime)).toBeGreaterThan(0.1);
+  await video.evaluate((element: HTMLVideoElement) => { element.pause(); element.currentTime = 2.5; });
+  await expect.poll(() => video.evaluate((element: HTMLVideoElement) => element.seeking)).toBe(false);
+  expect(await video.evaluate((element: HTMLVideoElement) => ({time: element.currentTime, error: element.error?.code ?? null, width: element.videoWidth}))).toMatchObject({time: 2.5, error: null, width: 160});
+  const ranged = await page.evaluate(async (url) => { const r = await fetch(url, {headers: {Range: "bytes=4-15"}}); return {status:r.status, bytes:(await r.arrayBuffer()).byteLength, contentRange:r.headers.get("content-range")}; }, (await video.getAttribute("src"))!);
+  expect(ranged).toMatchObject({status:206, bytes:12});
+  expect(ranged.contentRange).toMatch(/^bytes 4-15\//);
 });

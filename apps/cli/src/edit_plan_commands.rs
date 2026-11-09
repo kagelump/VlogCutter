@@ -36,11 +36,17 @@ pub enum EditPlanCommand {
     HistoricalReviewTargetExport {
         #[arg(long)]
         artifact: String,
+        /// Human-readable cut name, for example RC7; display metadata only.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Export a path-free versioned TV review target after fresh local verification.
     ReviewTargetExport {
         #[arg(long)]
         artifact: String,
+        /// Human-readable cut name, for example RC7; display metadata only.
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long)]
         youtube_video_id: Option<String>,
     },
@@ -611,17 +617,22 @@ fn expected(value: &str) -> Option<&str> {
 
 pub fn execute(catalog: &Catalog, command: &EditPlanCommand) -> Result<Value> {
     match command {
-        EditPlanCommand::HistoricalReviewTargetExport { artifact } => Ok(serde_json::to_value(
-            catalog.review_historical_rendered_artifact(artifact, &|| false)?,
-        )?),
+        EditPlanCommand::HistoricalReviewTargetExport { artifact, name } => {
+            Ok(serde_json::to_value(
+                catalog
+                    .review_historical_rendered_artifact(artifact, &|| false)?
+                    .with_display_name(name.clone())?,
+            )?)
+        }
         EditPlanCommand::ReviewTargetExport {
             artifact,
+            name,
             youtube_video_id,
-        } => Ok(serde_json::to_value(catalog.export_review_target(
-            artifact,
-            youtube_video_id.clone(),
-            &|| false,
-        )?)?),
+        } => Ok(serde_json::to_value(
+            catalog
+                .export_review_target(artifact, youtube_video_id.clone(), &|| false)?
+                .with_display_name(name.clone())?,
+        )?),
         EditPlanCommand::Bundle { input } => {
             let request: rcdvlog_core::EditPlanBundleRequest = read_workflow_input(input)?;
             Ok(serde_json::to_value(

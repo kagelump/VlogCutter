@@ -29,9 +29,8 @@ export function ClipsPage() {
   const queue = useClipQueue(projectId, search);
   const { assets } = queue;
   const selectedParam = params.get("clip");
-  const selectedId = selectedParam && assets.some((asset) => asset.projectAssetId === selectedParam)
-    ? selectedParam
-    : assets[0]?.projectAssetId ?? null;
+  // A shared link may point beyond the loaded queue page. Fetch that clip directly.
+  const selectedId = selectedParam || assets[0]?.projectAssetId || null;
   const review = useReviewAsset(projectId, selectedId, queue.live);
   const index = assets.findIndex((asset) => asset.projectAssetId === selectedId);
   const wide = useMediaQuery("(min-width: 1100px)");
@@ -60,7 +59,7 @@ export function ClipsPage() {
     }, { replace: true });
   }, [setParams]);
 
-  const canNext = index < assets.length - 1 || queue.hasNextPage;
+  const canNext = index >= 0 && (index < assets.length - 1 || queue.hasNextPage);
   // URL updates land asynchronously; rapid J/K presses build on the pending position, not the rendered one.
   const pending = useRef<number | null>(null);
   useEffect(() => { pending.current = null; }, [index]);
@@ -118,7 +117,7 @@ export function ClipsPage() {
   if (queue.isPending) return <Page><Loading /></Page>;
   if (queue.error && !assets.length) return <Page><ErrorMessage error={queue.error} onRetry={() => void queue.refetch()} /></Page>;
 
-  const counter = assets.length
+  const counter = selectedId && index < 0 ? "Selected clip" : assets.length
     ? `${index + 1} / ${assets.length}${queue.hasNextPage ? "+" : ""}`
     : "0";
 
@@ -127,7 +126,7 @@ export function ClipsPage() {
       <div className={styles.workspace}>
         {wide ? <aside className={styles.queueColumn} aria-label="Clips">{queueList}</aside> : null}
 
-        {!assets.length ? (
+        {!assets.length && !selectedId ? (
           <div className={styles.emptyColumn}>
             <EmptyState
               title={search ? "No matching clips" : "No clips in this project"}
@@ -139,7 +138,7 @@ export function ClipsPage() {
         ) : (
           <>
             <section className={styles.stageColumn} aria-label="Player">
-              <ClipPlayer ref={player} asset={review.data ?? null} loading={review.isPending} />
+              <ClipPlayer ref={player} projectId={projectId} asset={review.data ?? null} loading={review.isPending} />
               <div className={styles.transport}>
                 <Button icon="chevronLeft" iconOnly label="Previous clip (K)" disabled={index <= 0} onClick={() => void move(-1)} />
                 <span className={styles.counter} aria-live="polite">{counter}</span>

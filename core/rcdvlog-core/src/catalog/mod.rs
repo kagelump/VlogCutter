@@ -167,6 +167,23 @@ impl Catalog {
         Self::open(database_path)
     }
 
+    /// Opens a same-machine catalog for shared writes, without migrations,
+    /// recovery or redispatch. Both processes must use the exact current schema.
+    pub fn open_shared_existing(database_path: impl AsRef<Path>) -> Result<Self> {
+        let database_path = database_path.as_ref();
+        Self::validate_existing(database_path)?;
+        let connection =
+            Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let inspection = migrations::inspect_project_catalog_migrations(&connection)?;
+        if inspection.status != migrations::MigrationHistoryStatus::Current {
+            bail!("shared catalog requires the exact current schema");
+        }
+        Ok(Self {
+            database_path: database_path.to_path_buf(),
+            read_only: false,
+        })
+    }
+
     /// Opens an existing catalog without running migrations or permitting writes.
     pub fn open_read_only_existing(database_path: impl AsRef<Path>) -> Result<Self> {
         let database_path = database_path.as_ref();
