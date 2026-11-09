@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ReviewSessionState, ReviewTranscriptionRequest, ReviewTranscriptionRun, ReviewUtterance } from "@rcdvlog/project-client";
+import type { ReviewSessionState, ReviewTranscriptionRequest, ReviewTranscriptionRun, ReviewUtterance, MovieTimeEstimate } from "@rcdvlog/project-client";
 import { keys, useClient } from "../../app/client";
 import { describeCode, describeError } from "../../lib/errors";
 import { formatDateTime, formatStamp, plural } from "../../lib/format";
@@ -100,6 +100,21 @@ export function TranscriptSection({ projectId, sessionId, sessionState, onOpenRe
 }
 
 function RunBody({ run }: { run: ReviewTranscriptionRun }) {
+  const client = useClient();
+  const workspace = useQuery({
+    queryKey: keys.workspace(run.projectId, run.runId),
+    queryFn: () => client.getReviewWorkspace(run.projectId, run.runId),
+    enabled: run.utterances.length > 0,
+    refetchInterval: run.state === "running" ? 2_000 : false,
+  });
+  const target = useQuery({
+    queryKey: keys.target(run.projectId, run.reviewTargetId),
+    queryFn: () => client.getReviewTarget(run.projectId, run.reviewTargetId),
+    enabled: run.utterances.length > 0,
+  });
+  const context = workspace.data?.runId === run.runId && workspace.data.sessionId === run.sessionId
+    && workspace.data.revisionId === run.revisionId ? workspace.data : undefined;
+  const timedLines = new Map(context?.utterances.map((line) => [line.machine.utteranceId, line.movieTime]));
   const [showRaw, setShowRaw] = useState(false);
   const projected = run.utterances.some((utterance) => utterance.displayProjection && utterance.displayText !== utterance.text);
   const failedSegments = run.segments.filter((segment) => segment.state === "failed");
@@ -125,7 +140,17 @@ function RunBody({ run }: { run: ReviewTranscriptionRun }) {
             {projected ? <Checkbox checked={showRaw} onChange={setShowRaw}>Show original script</Checkbox> : null}
           </div>
           <ol className={styles.utterances}>
-            {run.utterances.map((utterance) => <UtteranceLine key={utterance.utteranceId} utterance={utterance} showRaw={showRaw} />)}
+            {run.utterances.map((utterance) => {
+              const movieTime = timedLines.get(utterance.utteranceId);
+              const seconds = movieTime?.movieSeconds;
+              const cut = seconds !== undefined && Number.isFinite(seconds) && seconds >= 0
+                ? context?.cuts.find((shot) => shot.movieInSeconds <= seconds && seconds < shot.movieOutSeconds) : undefined;
+              return <UtteranceLine key={utterance.utteranceId} utterance={utterance} showRaw={showRaw}
+                movieTime={movieTime && Number.isFinite(movieTime.movieSeconds) && movieTime.movieSeconds >= 0 ? movieTime : undefined}
+                thumbnail={cut ? client.projectAssetThumbnailUrl(run.projectId, cut.assetId) : undefined}
+                shotNumber={cut ? cut.position + 1 : undefined}
+                videoId={target.data?.youtube.videoId ?? undefined} timingLoading={workspace.isPending} />;
+            })}
           </ol>
         </>
       ) : null}
@@ -133,18 +158,45 @@ function RunBody({ run }: { run: ReviewTranscriptionRun }) {
   );
 }
 
-function UtteranceLine({ utterance, showRaw }: { utterance: ReviewUtterance; showRaw: boolean }) {
+function UtteranceLine({ utterance, showRaw, movieTime, thumbnail, shotNumber, videoId, timingLoading }: {
+  utterance: ReviewUtterance; showRaw: boolean; movieTime?: MovieTimeEstimate;
+  thumbnail?: string; shotNumber?: number; videoId?: string; timingLoading: boolean;
+}) {
   return (
     <li className={styles.utterance} data-suppressed={utterance.suppressed || undefined}>
-      <span className={styles.stamp}>{formatStamp(utterance.startSeconds)}</span>
+      <span className={styles.stamp}><small>Audio</small><br />{formatStamp(utterance.startSeconds)}</span>
       <span className={styles.speaker}>{utterance.speaker === "unknown" ? "?" : utterance.speaker}</span>
       <span className={styles.utteranceText} lang={utterance.language === "zh" ? "zh-Hant" : utterance.language || undefined}>
         {utterance.suppressed ? <em className={styles.muted}>Low quality: </em> : null}
         {showRaw ? utterance.text : utterance.displayText}
         {utterance.flags.length ? <small className={styles.flags}>{utterance.flags.map((flag) => FLAG_COPY[flag] ?? flag.replace("qualityGate:", "")).join(" · ")}</small> : null}
+        <VideoReference movieTime={movieTime} thumbnail={thumbnail} shotNumber={shotNumber} videoId={videoId} loading={timingLoading} />
       </span>
     </li>
   );
+}
+
+
+function VideoReference({ movieTime, thumbnail, shotNumber, videoId, loading }: {
+  movieTime?: MovieTimeEstimate; thumbnail?: string; shotNumber?: number; videoId?: string; loading: boolean;
+}) {
+  if (!movieTime) return <small className={styles.muted}>{loading ? "Matching video time…" : "Video time unavailable"}</small>;
+  const label = `Video ${movieTime.source === "humanCorrection" ? "" : "≈ "}${formatStamp(movieTime.movieSeconds)}`;
+  return <span className={styles.videoReference}>
+    <span className={styles.videoTime} title={movieTime.source === "humanCorrection" ? "Video time set by a reviewer" : `Estimated video time at the start of this line (±${movieTime.uncertaintySeconds.toFixed(2)}s)`}>
+      {videoId ? <a href={`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&t=${Math.floor(movieTime.movieSeconds)}s`} target="_blank" rel="noopener noreferrer">{label}</a> : label}
+    </span>
+    {thumbnail ? <TranscriptThumbnail key={thumbnail} src={thumbnail} shotNumber={shotNumber} /> : null}
+  </span>;
+}
+
+function TranscriptThumbnail({ src, shotNumber }: { src: string; shotNumber?: number }) {
+  const [failed, setFailed] = useState(false);
+  return <span className={styles.videoThumbnail}>
+    {failed ? <small className={styles.muted}>Thumbnail unavailable</small>
+      : <><img src={src} alt={`Shot ${shotNumber} thumbnail`} loading="lazy" decoding="async" onError={() => setFailed(true)} />
+        <small className={styles.muted}>Shot {shotNumber} thumbnail</small></>}
+  </span>;
 }
 
 /** Choose where to transcribe, check what it will cost or why it can't run, then start. */

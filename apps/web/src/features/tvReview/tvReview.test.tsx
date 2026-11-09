@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReviewTargetPreflight } from "@rcdvlog/project-client";
 import { memoryVoice, renderApp } from "../../test/render";
@@ -295,4 +295,39 @@ test("the review workspace corrects speakers and groups the transcript", async (
   expect(shot).toHaveValue("");
   await userEvent.selectOptions(shot, "editop_b");
   expect(client.updateReviewDiscussion).toHaveBeenCalledWith("p1", "d1", { targetOperationId: "editop_b" });
+});
+
+test("transcript lines show mapped video time and their shot thumbnail", async () => {
+  const mapped = workspace();
+  mapped.utterances[0].movieTime = { movieSeconds: 1.5, uncertaintySeconds: 0.25, source: "sharedSync:estimated", evidenceIds: ["player_a", "player_b"] };
+  renderApp("/projects/p1/reviews/rtarget_one/sessions/rsession_1", {
+    ...targetsClient,
+    getReviewSession: vi.fn().mockResolvedValue({ ...session, state: "completed" }),
+    reviewSessionAudioUrl: vi.fn().mockReturnValue("/audio.wav"),
+    listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [run()] }),
+    getReviewWorkspace: vi.fn().mockResolvedValue(mapped),
+    getReviewTarget: vi.fn().mockResolvedValue({ ...target, youtube: { ...target.youtube, videoId: "dQw4w9WgXcQ" } }),
+  });
+  const link = await screen.findByRole("link", { name: "Video ≈ 0:01.5" });
+  expect(link).toHaveAttribute("href", "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1s");
+  expect(screen.getByText("Audio")).toBeVisible();
+  const image = screen.getByRole("img", { name: "Shot 1 thumbnail" });
+  expect(image).toHaveAttribute("src", "/api/v1/projects/p1/assets/asset_repeated/thumbnail");
+  fireEvent.error(image);
+  expect(await screen.findByText("Thumbnail unavailable")).toBeVisible();
+  expect(link).toBeVisible();
+});
+
+test("an unmapped transcript line does not borrow a nearby video time or thumbnail", async () => {
+  renderApp("/projects/p1/reviews/rtarget_one/sessions/rsession_1", {
+    ...targetsClient,
+    getReviewSession: vi.fn().mockResolvedValue({ ...session, state: "completed" }),
+    reviewSessionAudioUrl: vi.fn().mockReturnValue("/audio.wav"),
+    listReviewTranscriptions: vi.fn().mockResolvedValue({ items: [run()] }),
+    getReviewWorkspace: vi.fn().mockResolvedValue(workspace()),
+  });
+  expect(await screen.findByText("Video time unavailable")).toBeVisible();
+  expect(screen.getByText("I think I like the frame")).toBeVisible();
+  expect(screen.queryByRole("img")).toBeNull();
+  expect(screen.queryByRole("link", { name: /^Video/ })).toBeNull();
 });

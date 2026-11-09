@@ -247,3 +247,10 @@
 .recordingMain:hover { background: var(--surface-2); text-decoration: none; }
 .recordingMain span { color: var(--text-muted); font-size: var(--text-sm); }
 .recordingActions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+
+/* Video context comes from the shared synchronizer; thumbnails represent shots. */
+.videoReference { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--space-3); margin-top: var(--space-2); }
+.videoTime { font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+.videoThumbnail { display: grid; gap: 3px; width: 128px; max-width: 100%; }
+.videoThumbnail img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: var(--surface); border-radius: 4px; }
+.videoThumbnail small { font-size: var(--text-xs); }
