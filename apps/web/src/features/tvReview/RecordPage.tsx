@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useBlocker, useNavigate, useParams } from "react-router";
+import { useBlocker, useNavigate, useParams, useSearchParams } from "react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ProjectClientError, type RecordingEndReason } from "@rcdvlog/project-client";
 import { keys, useClient } from "../../app/client";
@@ -13,6 +13,8 @@ import { useProjectId } from "../projects/ProjectLayout";
 import { microphoneConstraints, type CaptureStatus } from "./recording/recorder";
 import { PendingRecoveries, targetTitle, useVoiceDeps, type VoiceDeps } from "./shared";
 import styles from "./TvReview.module.css";
+import { LiveTranscriptPanel, useLiveTranscript } from "./LiveTranscript";
+import { YouTubePlayer } from "./YouTubePlayer";
 
 type Phase = "setup" | "starting" | "recording" | "stopping" | "queued";
 type Recording = Awaited<ReturnType<VoiceDeps["startRecording"]>>;
@@ -20,11 +22,15 @@ type Recording = Awaited<ReturnType<VoiceDeps["startRecording"]>>;
 export function RecordPage() {
   const projectId = useProjectId();
   const { targetId = "" } = useParams();
+  const [searchParams] = useSearchParams();
+  const playMode = searchParams.get("mode") === "play";
   const client = useClient();
   const deps = useVoiceDeps();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const target = useQuery({ queryKey: keys.target(projectId, targetId), queryFn: () => client.getReviewTarget(projectId, targetId) });
+  const [liveEnabled, setLiveEnabled] = useState(true);
+  const [liveError, setLiveError] = useState(false);
   const [consent, setConsent] = useState(false);
   const [secondSpeaker, setSecondSpeaker] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
@@ -36,6 +42,7 @@ export function RecordPage() {
   const [error, setError] = useState<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const recording = useRef<Recording | null>(null);
+  const liveTranscript = useLiveTranscript(projectId, activeSessionId ?? "");
   useDocumentTitle(phase === "recording" ? `● ${formatClock(status?.elapsedSeconds ?? 0)}` : "Record review");
 
   const live = phase === "recording" || phase === "stopping";
@@ -95,6 +102,12 @@ export function RecordPage() {
       recording.current = started;
       setActiveSessionId(started.session.sessionId);
       setPhase("recording");
+      if (liveEnabled) {
+        // Capture is already running. Transcription failure must never stop it.
+        void client.enableLiveReviewTranscript(projectId, started.session.sessionId).then((data) => {
+          queryClient.setQueryData(keys.liveTranscript(projectId, started.session.sessionId), data);
+        }).catch(() => setLiveError(true));
+      }
     } catch (reason) {
       setPhase("setup");
       setError(reason instanceof ProjectClientError ? describeError(reason) : "Recording couldn’t start in this browser.");
@@ -121,13 +134,18 @@ export function RecordPage() {
 
   return (
     <Page>
-      <div className={styles.narrow}>
+      <div className={styles.recordLayout}>
+      <div className={styles.recordMain}>
         <PageHeader
           back={live ? undefined : { to: paths.target(projectId, targetId), label: targetTitle(detail) }}
-          title="Record review"
-          subtitle={detail.youtube.videoId ? <>Play <a href={`https://www.youtube.com/watch?v=${encodeURIComponent(detail.youtube.videoId)}`} target="_blank" rel="noreferrer noopener">youtu.be/{detail.youtube.videoId}</a> on the TV.</> : "Play this cut on the TV."}
+          title={playMode ? "Play + record review" : "Record review"}
+          subtitle={playMode ? "Play the video here while you record your review." : detail.youtube.videoId ? <>Play <a href={`https://www.youtube.com/watch?v=${encodeURIComponent(detail.youtube.videoId)}`} target="_blank" rel="noreferrer noopener">youtu.be/{detail.youtube.videoId}</a> on the TV.</> : "Play this cut on the TV."}
         />
 
+        {playMode && detail.youtube.videoId ? <>
+          <YouTubePlayer videoId={detail.youtube.videoId} recording={phase === "recording"} onObservation={(position, state, rate, time) => recording.current?.observePlayback(position, state, rate, time)} />
+          <p className={styles.muted}>Start recording, then press play in the video. Transcript lines match the video position when you spoke. Video times are estimates; a thumbnail represents the matching shot.</p>
+        </> : playMode ? <Notice tone="warning">This review has no YouTube video. Return to the cut and use Record review.</Notice> : null}
         <PendingRecoveries projectId={projectId} exclude={activeSessionId} />
         {blocked ? <Notice tone="critical" title="Recording is blocked.">{detail.readiness.blockers.map(describeCode).join(" ")}</Notice> : null}
         {error ? <Notice tone="critical">{error}</Notice> : null}
@@ -140,10 +158,10 @@ export function RecordPage() {
             </div>
             <Meter peak={status?.peak ?? 0} />
             <div className={styles.recButtons}>
-              <Button size="lg" onClick={cue} disabled={phase !== "recording"} aria-keyshortcuts="M">Mark start</Button>
+              {!playMode ? <Button size="lg" onClick={cue} disabled={phase !== "recording"} aria-keyshortcuts="M">Mark start</Button> : null}
               <Button size="lg" variant="danger" busy={phase === "stopping"} onClick={() => void stop()}>{phase === "stopping" ? "Finishing upload…" : "Stop"}</Button>
             </div>
-            <p className={styles.muted}>Tap <strong>Mark start</strong> (or press <Kbd>M</Kbd>) when the first frame appears on the TV. It helps line up your comments with the cut, but is optional.</p>
+            {!playMode ? <p className={styles.muted}>Tap <strong>Mark start</strong> (or press <Kbd>M</Kbd>) when the first frame appears on the TV. It helps line up your comments with the cut, but is optional.</p> : null}
             {status ? (
               <ul className={styles.recStats}>
                 <li><span>Uploaded</span>{upload!.uploadedChunks} chunks{upload!.pendingChunks ? `, ${upload!.pendingChunks} waiting` : ""}{upload!.retrying ? " · retrying" : ""}</li>
@@ -184,8 +202,9 @@ export function RecordPage() {
               </li>
               <li>
                 <h2>Record</h2>
-                <p className={styles.muted}>Start the video on the TV yourself; this page doesn’t control it. Talk normally while it plays.</p>
-                <Button size="lg" variant="primary" icon="mic" busy={phase === "starting"} disabled={!stream || !consent || blocked} onClick={() => void start()}>Record</Button>
+                <Checkbox checked={liveEnabled} onChange={setLiveEnabled}>Show live transcription and refine it automatically after recording.</Checkbox>
+                <p className={styles.muted}>{playMode ? "Start recording, then use the player controls above. Talk normally while it plays." : "Start the video on the TV yourself; this page doesn’t control it. Talk normally while it plays."}</p>
+                <Button size="lg" variant="primary" icon="mic" busy={phase === "starting"} disabled={!stream || !consent || blocked || (playMode && !detail.youtube.videoId)} onClick={() => void start()}>Record</Button>
               </li>
             </ol>
           </section>
@@ -194,6 +213,14 @@ export function RecordPage() {
         <p className={styles.hintSmall}>
           Audio stays on this server, isn’t included in backups, and is kept until you delete it. Echo cancellation, noise suppression and auto-gain are off so the room sound is preserved.
         </p>
+      </div>
+      {activeSessionId && liveEnabled ? <aside className={styles.recordTranscript} aria-label="Recording transcript">
+        {liveError ? <Notice tone="warning">Live transcription couldn’t start. Recording continues. <Button onClick={() => {
+          void client.enableLiveReviewTranscript(projectId, activeSessionId).then((data) => {
+            setLiveError(false); queryClient.setQueryData(keys.liveTranscript(projectId, activeSessionId), data);
+          }).catch(() => setLiveError(true));
+        }}>Retry live transcription</Button></Notice> : liveTranscript.data?.enabled ? <LiveTranscriptPanel data={liveTranscript.data} projectId={projectId} videoId={detail.youtube.videoId ?? undefined} recording /> : <Notice>Starting live transcription…</Notice>}
+      </aside> : null}
       </div>
 
       <ConfirmDialog

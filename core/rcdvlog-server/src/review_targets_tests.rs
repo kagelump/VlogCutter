@@ -92,6 +92,7 @@ pub(crate) fn historical_with(
 ) -> HistoricalRenderedArtifactReview {
     let handoff = handoff_with(edit);
     let review = HistoricalRenderedArtifactReview {
+        display_name: None,
         schema_version: 1,
         purpose: HistoricalReviewPurpose::HistoricalRenderedArtifactReview,
         target_digest: handoff.target_digest,
@@ -917,4 +918,137 @@ fn one_snapshot_cannot_be_stored_under_both_contracts() {
             1
         );
     }
+}
+
+#[test]
+fn display_names_survive_import_rename_and_youtube_rebind_without_new_evidence() {
+    let root = TempDir::new().unwrap();
+    let catalog = catalog(&root);
+    let service = catalog.review_targets();
+    let named = handoff_with(|_| {})
+        .with_display_name(Some(" RC7 ".into()))
+        .unwrap();
+    let imported = service
+        .import(
+            PROJECT,
+            &request(serde_json::to_value(&named).unwrap()),
+            &actor(),
+            now(),
+        )
+        .unwrap();
+    let original = imported.review_target;
+    let id = &original.summary.review_target_id;
+    assert_eq!(original.summary.display_name.as_deref(), Some("RC7"));
+    let renamed = service
+        .set_display_name(PROJECT, id, Some("RC7 — review copy"), now())
+        .unwrap();
+    let mut comparable = renamed.clone();
+    comparable.summary.display_name = original.summary.display_name.clone();
+    assert_eq!(
+        comparable, original,
+        "only presentation metadata may change"
+    );
+    assert_eq!(
+        service.list(PROJECT, 50, None, now()).unwrap().items[0].display_name,
+        renamed.summary.display_name
+    );
+    let duplicate = service
+        .import(
+            PROJECT,
+            &request(serde_json::to_value(&named).unwrap()),
+            &actor(),
+            now(),
+        )
+        .unwrap();
+    assert_eq!(duplicate.outcome, ImportOutcome::Reused);
+    assert_eq!(
+        duplicate.review_target, renamed,
+        "reimport must not undo a user rename"
+    );
+    let rebound = service
+        .rebind_youtube(PROJECT, id, Some("dQw4w9WgXcQ"), &actor(), now())
+        .unwrap();
+    assert_eq!(
+        rebound.review_target.summary.display_name,
+        renamed.summary.display_name
+    );
+    assert_eq!(
+        service.handoff(PROJECT, id).unwrap().display_name,
+        renamed.summary.display_name
+    );
+    let cleared = service.set_display_name(PROJECT, id, None, now()).unwrap();
+    assert!(cleared.summary.display_name.is_none());
+    assert_eq!(
+        cleared.summary.target_digest,
+        original.summary.target_digest
+    );
+    for invalid in ["", " ", "RC7\n", &"x".repeat(121)] {
+        assert!(matches!(
+            service.set_display_name(PROJECT, id, Some(invalid), now()),
+            Err(ReviewTargetServiceError::InvalidInput(_))
+        ));
+    }
+    assert!(matches!(
+        service.set_display_name("project_other", id, Some("oops"), now()),
+        Err(ReviewTargetServiceError::NotFound)
+    ));
+}
+
+#[test]
+fn historical_display_names_stay_historical_and_invalid_names_are_rejected() {
+    let root = TempDir::new().unwrap();
+    let catalog = catalog(&root);
+    let service = catalog.review_targets();
+    let named = historical_with(|_| {})
+        .with_display_name(Some("RC5".into()))
+        .unwrap();
+    let imported = service
+        .import_historical(
+            PROJECT,
+            &historical_request(serde_json::to_value(&named).unwrap()),
+            &actor(),
+            now(),
+        )
+        .unwrap();
+    let id = &imported.review_target.summary.review_target_id;
+    assert_eq!(
+        imported.review_target.summary.display_name.as_deref(),
+        Some("RC5")
+    );
+    assert_eq!(
+        imported.review_target.summary.target_digest,
+        named.target_digest
+    );
+    let renamed = service
+        .set_display_name(PROJECT, id, Some("RC5 — historical"), now())
+        .unwrap();
+    assert_eq!(
+        renamed.summary.contract,
+        ReviewTargetContract::HistoricalRenderedArtifactReviewV1
+    );
+    assert!(service.handoff(PROJECT, id).is_err());
+    let mut invalid = serde_json::to_value(&named).unwrap();
+    invalid["displayName"] = json!("\n");
+    assert!(
+        !service
+            .preflight_historical(PROJECT, &historical_request(invalid), now())
+            .unwrap()
+            .importable
+    );
+}
+
+#[test]
+fn display_name_migration_upgrades_existing_review_rows_without_rewriting_them() {
+    use crate::CONTROL_CATALOG_MIGRATIONS;
+    use rcdvlog_core::run_sqlite_migrations;
+    let mut connection = Connection::open_in_memory().unwrap();
+    run_sqlite_migrations(&mut connection, &CONTROL_CATALOG_MIGRATIONS[..18]).unwrap();
+    connection.execute("INSERT INTO project_registry(project_id,replica_relative_path,state,registered_at,created_at,updated_at) VALUES(?1,'replica','registered','t','t','t')", [PROJECT]).unwrap();
+    let h = handoff_with(|_| {});
+    let snapshot = serde_json::to_string(&h.target).unwrap();
+    connection.execute("INSERT INTO review_targets(review_target_id,project_id,schema_version,target_digest,binding_digest,revision_id,viewed_artifact_id,movie_blake3,movie_byte_length,duration_seconds,cut_count,snapshot_json,imported_at,importer_actor_type,importer_actor_id) VALUES('rtarget_legacy',?1,1,?2,?2,?3,?4,?5,1,6.0,3,?6,'t','browser_session','test')", params![PROJECT,h.target_digest,h.target.revision_id,h.target.viewed_artifact_id,h.target.movie.blake3,snapshot]).unwrap();
+    run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS).unwrap();
+    let row = connection.query_row("SELECT display_name,snapshot_json,target_digest FROM review_targets WHERE review_target_id='rtarget_legacy'", [], |row| Ok((row.get::<_,Option<String>>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))).unwrap();
+    assert_eq!(row, (None, snapshot, h.target_digest));
+    run_sqlite_migrations(&mut connection, CONTROL_CATALOG_MIGRATIONS).unwrap();
 }

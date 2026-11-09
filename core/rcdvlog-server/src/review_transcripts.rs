@@ -47,6 +47,10 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod live;
+pub(crate) use live::migrate_live;
+pub use live::{LIVE_REVIEW_MODEL, LiveReviewLine, LiveReviewTranscript};
+
 pub const REVIEW_TRANSCRIPT_SCHEMA: &str = "review-transcript.v1";
 pub const REVIEW_TRANSCRIBE_JOB_TYPE: &str = "review_session.transcribe.v1";
 pub const REVIEW_TRANSCRIBE_RECIPE: &str = "review-stt.vad-silero-v5.win30.seg600.v1";
@@ -288,6 +292,12 @@ pub struct ReviewTranscriptionRun {
 
 /// Model availability and transports, behind one seam so tests use fakes.
 pub trait ReviewSpeechRuntime: Send + Sync {
+    fn live_models_present(&self) -> bool {
+        false
+    }
+    fn live_engine(&self) -> anyhow::Result<Box<dyn SttEngine>> {
+        anyhow::bail!("live model unavailable")
+    }
     fn local_models_present(&self) -> bool;
     fn vad_model_present(&self) -> bool;
     /// VAD + whisper decode on this host.
@@ -321,6 +331,15 @@ impl ModelDirSpeechRuntime {
 }
 
 impl ReviewSpeechRuntime for ModelDirSpeechRuntime {
+    fn live_models_present(&self) -> bool {
+        self.model_dir.join(LIVE_REVIEW_MODEL.file_name).is_file() && self.vad_path().is_file()
+    }
+    fn live_engine(&self) -> anyhow::Result<Box<dyn SttEngine>> {
+        Ok(Box::new(rcdvlog_core::review_speech::WhisperEngine::new(
+            &self.model_dir.join(LIVE_REVIEW_MODEL.file_name),
+            &self.vad_path(),
+        )?))
+    }
     fn local_models_present(&self) -> bool {
         self.whisper_path().is_file() && self.vad_path().is_file()
     }

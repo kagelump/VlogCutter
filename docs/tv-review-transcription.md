@@ -1,7 +1,8 @@
 # TV voice review transcription (#224)
 
 This page covers transcribing a finalized [voice review recording](tv-voice-review-recording.md)
-into **timed utterances on the recording clock**. The results are stored in
+into **timed utterances on the recording clock**. For provisional text during capture
+and automatic refinement, see [Live voice review transcription](tv-review-live-transcription.md). The results are stored in
 their own tables in the companion server's control catalog. They are never
 written into source-asset transcripts, project annotations, edit plans or
 canonical feedback. Movie time comes later, from the shared synchronizer (#223);

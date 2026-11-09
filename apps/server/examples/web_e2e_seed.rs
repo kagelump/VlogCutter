@@ -85,6 +85,7 @@ fn main() -> Result<()> {
         target.revision_id = "editrev_historical".into();
         target.viewed_artifact_id = "preview_historical".into();
         let review = rcdvlog_server_core::HistoricalRenderedArtifactReview {
+            display_name: None,
             schema_version: 1,
             purpose: rcdvlog_server_core::HistoricalReviewPurpose::HistoricalRenderedArtifactReview,
             target_digest: ReviewTargetHandoff::snapshot_digest(&target)?,

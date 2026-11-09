@@ -205,3 +205,39 @@ fn real_generated_movie_export_is_verified_repeatable_path_free_and_refuses_chan
     std::fs::remove_file(&preview.output_path).unwrap();
     assert!(catalog.export_review_target(&id, None, &|| false).is_err());
 }
+
+#[test]
+fn display_names_round_trip_without_changing_snapshot_identity() {
+    let legacy = synthetic();
+    assert!(legacy.display_name.is_none());
+    assert!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("displayName")
+            .is_none()
+    );
+    let named = legacy
+        .clone()
+        .with_display_name(Some(" RC7 ".into()))
+        .unwrap();
+    named.validate().unwrap();
+    assert_eq!(named.display_name.as_deref(), Some("RC7"));
+    assert_eq!(named.target_digest, legacy.target_digest);
+    assert_eq!(named.target, legacy.target);
+    assert_eq!(named.verification, legacy.verification);
+    assert_eq!(
+        ReviewTargetHandoff::from_json(&serde_json::to_vec(&named).unwrap()).unwrap(),
+        named
+    );
+    for invalid in ["".to_string(), " ".into(), "RC7\n".into(), "x".repeat(121)] {
+        assert!(
+            legacy
+                .clone()
+                .with_display_name(Some(invalid.clone()))
+                .is_err()
+        );
+        let mut untrusted = serde_json::to_value(&legacy).unwrap();
+        untrusted["displayName"] = json!(invalid);
+        assert!(ReviewTargetHandoff::from_json(&serde_json::to_vec(&untrusted).unwrap()).is_err());
+    }
+}

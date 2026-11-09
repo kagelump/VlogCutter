@@ -623,12 +623,13 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     );
     headers.insert(
         header::HeaderName::from_static("referrer-policy"),
-        HeaderValue::from_static("same-origin"),
+        // YouTube embeds require the cross-origin Referer to identify this app.
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
     headers.insert(
         header::HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(
-            "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'",
+            "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'; script-src 'self' https://www.youtube.com https://s.ytimg.com; frame-src https://www.youtube.com",
         ),
     );
     headers.insert(
@@ -894,7 +895,7 @@ pub fn router(state: HttpState) -> Router {
         )
         .route(
             "/api/v1/projects/{project_id}/review-targets/{review_target_id}",
-            get(review_target_http::get),
+            get(review_target_http::get).patch(review_target_http::set_display_name),
         )
         .route(
             "/api/v1/projects/{project_id}/review-targets/{review_target_id}/youtube",
@@ -5241,6 +5242,22 @@ mod tests {
             .unwrap();
         assert_eq!(index.status(), StatusCode::OK);
         assert_eq!(index.headers()[header::CACHE_CONTROL], "no-cache");
+        // The IFrame API loads external scripts and creates a YouTube frame.
+        // Keep these permissions explicit while retaining the same-origin API
+        // boundary and the ban on embedding our app inside another site.
+        assert_eq!(
+            index.headers()["content-security-policy"],
+            "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; connect-src 'self'; script-src 'self' https://www.youtube.com https://s.ytimg.com; frame-src https://www.youtube.com"
+        );
+        assert_eq!(
+            index.headers()["referrer-policy"],
+            "strict-origin-when-cross-origin"
+        );
+        assert_eq!(index.headers()["x-frame-options"], "DENY");
+        assert_eq!(
+            index.headers()["permissions-policy"],
+            "camera=(), microphone=(self), geolocation=()"
+        );
         assert_eq!(
             to_bytes(index.into_body(), 1024).await.unwrap(),
             "<main>web shell</main>"
@@ -6449,6 +6466,63 @@ mod tests {
             .unwrap();
         assert_eq!(json(again).await["outcome"], "reused");
 
+        let patch_name = |body: Value, csrf_header: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("{base}/{id}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie);
+            if let Some(csrf) = csrf_header {
+                builder = builder.header("x-csrf-token", csrf);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let denied = fixture
+            .app()
+            .oneshot(patch_name(serde_json::json!({"displayName":"RC7"}), None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"displayName":42}),
+            serde_json::json!({"displayName":""}),
+            serde_json::json!({"displayName":"RC7\n"}),
+        ] {
+            let response = fixture
+                .app()
+                .oneshot(patch_name(invalid, Some(&csrf)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let renamed = fixture
+            .app()
+            .oneshot(patch_name(
+                serde_json::json!({"displayName":" RC7 "}),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(renamed.status(), StatusCode::OK);
+        let renamed = json(renamed).await;
+        assert_eq!(renamed["displayName"], "RC7");
+        assert_eq!(renamed["reviewTargetId"], target["reviewTargetId"]);
+        assert_eq!(renamed["targetDigest"], target["targetDigest"]);
+        assert_eq!(renamed["observations"], target["observations"]);
+        let cleared = fixture
+            .app()
+            .oneshot(patch_name(
+                serde_json::json!({"displayName":null}),
+                Some(&csrf),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        assert_eq!(json(cleared).await["displayName"], Value::Null);
+
         let mut conflicting = request.clone();
         conflicting["handoff"]["target"]["movie"]["blake3"] = Value::String("d".repeat(64));
         let mut typed: rcdvlog_server_core::ReviewTargetSnapshot =
@@ -7076,6 +7150,49 @@ mod tests {
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap()
         };
+        let live_uri =
+            format!("/api/v1/projects/{project_id}/review-sessions/{recording}/live-transcript");
+        let unauth = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(&live_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+        let no_csrf = fixture
+            .app()
+            .oneshot(post(live_uri.clone(), serde_json::json!({}), None))
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+        let enabled = fixture
+            .app()
+            .oneshot(post(live_uri.clone(), serde_json::json!({}), Some(&csrf)))
+            .await
+            .unwrap();
+        assert_eq!(enabled.status(), StatusCode::OK);
+        assert_eq!(json(enabled).await["enabled"], true);
+        let read = fixture
+            .app()
+            .oneshot(
+                Request::builder()
+                    .uri(&live_uri)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        let value = json(read).await;
+        assert_eq!(value["model"], "ggml-tiny.bin");
+        assert_eq!(value["state"], "live");
+        assert!(value["lines"].as_array().unwrap().is_empty());
+
         let unacknowledged = serde_json::json!({"backend": "openrouter", "model": "openai/whisper-1", "authorizedMaxCostUsd": 0.5, "cloudUploadAcknowledged": false});
         let no_csrf = fixture
             .app()

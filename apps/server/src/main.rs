@@ -60,6 +60,10 @@ enum AdminCommand {
         about = "Serve projects directly from same-machine CLI catalogs"
     )]
     Projects(ProjectsCommand),
+    #[command(
+        about = "Explicitly install multilingual Whisper Tiny and Silero for local live review"
+    )]
+    InstallLiveSpeechModels,
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,6 +237,12 @@ fn main() -> ExitCode {
 fn run_local_command(command: LocalCommand) -> Result<serde_json::Value> {
     let config = ServerConfig::from_environment().context("load server configuration")?;
     match command {
+        LocalCommand::Admin(AdminCommand::InstallLiveSpeechModels) => {
+            rcdvlog_server_core::ModelDirSpeechRuntime::from_environment().install_live_models()?;
+            Ok(
+                serde_json::json!({"ok":true,"model":rcdvlog_server_core::LIVE_REVIEW_MODEL.file_name}),
+            )
+        }
         LocalCommand::Admin(AdminCommand::Backup(BackupCommand::Inspect { backup })) => {
             let inspection = rcdvlog_server_core::BackupManager::inspect_restore_point_in_root(
                 &config.backup_dir,
@@ -550,6 +560,13 @@ async fn run() -> Result<()> {
         tracing::info!(component = "scheduler", "job_scheduler_stopped");
     });
 
+    let live_transcripts = foundation.catalog().review_transcripts();
+    let live_jobs = foundation.catalog().jobs();
+    let live_shutdown = shutdown.child_token();
+    let live_handle = tokio::task::spawn_blocking(move || {
+        live_transcripts.run_live_worker(live_jobs, live_shutdown)
+    });
+
     let result = serve_until_shutdown(
         listener,
         router(HttpState::new(foundation.clone())),
@@ -557,6 +574,8 @@ async fn run() -> Result<()> {
         foundation.config().shutdown_timeout,
     )
     .await;
+
+    let _ = tokio::time::timeout(Duration::from_secs(30), live_handle).await;
 
     // Drain the scan worker (scheduler + schedule loop)
     let _ = tokio::time::timeout(Duration::from_secs(30), scan_handle).await;

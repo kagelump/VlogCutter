@@ -56,6 +56,8 @@ pub const STABLE_ERROR_CODES: &[&str] = &[
     "review_conflicting_acceptance",
     "review_human_required",
     "review_item_retracted",
+    "review_live_model_unavailable",
+    "review_live_resource_busy",
     "review_reconciliation_conflict",
     "review_session_audio_unavailable",
     "review_session_busy",
@@ -121,6 +123,8 @@ mod tests {
             "mount_unavailable",
             "conflict",
             "retryable_job_failure",
+            "review_live_model_unavailable",
+            "review_live_resource_busy",
             "internal_error",
         ] {
             assert!(is_stable_error_code(required), "missing {required}");

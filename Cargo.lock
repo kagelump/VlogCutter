@@ -3653,6 +3653,7 @@ dependencies = [
  "ferrous-opencc",
  "fs2",
  "hex",
+ "hound",
  "libc",
  "rand 0.8.7",
  "rcdvlog-core",

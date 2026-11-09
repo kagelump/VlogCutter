@@ -20,6 +20,9 @@ pub enum HistoricalReviewUnresolved {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HistoricalRenderedArtifactReview {
+    /// Display metadata only; excluded from the immutable snapshot digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub schema_version: u32,
     pub purpose: HistoricalReviewPurpose,
     pub target_digest: String,
@@ -36,6 +39,12 @@ pub struct HistoricalRenderedArtifactReview {
 }
 
 impl HistoricalRenderedArtifactReview {
+    pub fn with_display_name(mut self, name: Option<String>) -> Result<Self> {
+        review_target::validate_display_name(name.as_deref())?;
+        self.display_name = name.map(|name| name.trim().to_string());
+        Ok(self)
+    }
+
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         ensure!(
             bytes.len() <= review_target::REVIEW_TARGET_MAX_BYTES,
@@ -47,6 +56,7 @@ impl HistoricalRenderedArtifactReview {
     }
 
     pub fn validate(&self) -> Result<()> {
+        review_target::validate_display_name(self.display_name.as_deref())?;
         ensure!(
             self.schema_version == 1,
             crate::ReviewTargetError::UnsupportedVersion
@@ -137,6 +147,7 @@ impl Catalog {
             cancel,
         )?;
         let review = HistoricalRenderedArtifactReview {
+            display_name: None,
             schema_version: 1,
             purpose: HistoricalReviewPurpose::HistoricalRenderedArtifactReview,
             target_digest: ReviewTargetHandoff::snapshot_digest(&target)?,

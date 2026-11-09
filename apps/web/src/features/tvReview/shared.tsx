@@ -13,7 +13,7 @@ export interface VoiceDeps {
   outbox: ChunkOutbox;
   getUserMedia(constraints: MediaStreamConstraints): Promise<MediaStream>;
   listMicrophones(): Promise<MediaDeviceInfo[]>;
-  startRecording(options: Parameters<typeof VoiceRecording.start>[0]): Promise<Pick<VoiceRecording, "session" | "cue" | "stop" | "pageHidden">>;
+  startRecording(options: Parameters<typeof VoiceRecording.start>[0]): Promise<Pick<VoiceRecording, "session" | "cue" | "stop" | "pageHidden" | "observePlayback">>;
 }
 
 let browserDeps: VoiceDeps | null = null;
@@ -39,9 +39,9 @@ export function useVoiceDeps(): VoiceDeps {
 
 export const isHistorical = (target: { contract?: string }) => target.contract === "historicalRenderedArtifactReviewV1";
 
-/** Cuts are identified by their edit revision; show its short form. */
-export function targetTitle(target: Pick<ReviewTargetSummary, "revisionId">) {
-  return `Cut ${shortId(target.revisionId)}`;
+/** Prefer editorial names; legacy imports retain a stable revision fallback. */
+export function targetTitle(target: Pick<ReviewTargetSummary, "revisionId" | "displayName">) {
+  return target.displayName?.trim() || `Cut ${shortId(target.revisionId)}`;
 }
 
 export function ReadinessBadge({ target }: { target: ReviewTargetSummary }) {

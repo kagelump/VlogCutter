@@ -185,8 +185,69 @@ pub(super) async fn cancel(
     Json(run).into_response()
 }
 
+pub(super) async fn live_get(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    AxumPath((project_id, session_id)): AxumPath<(String, String)>,
+) -> Response {
+    let transcripts = transcripts(&state);
+    match blocking(&request_id, move || {
+        transcripts.live_transcript(
+            &project_id,
+            &session_id,
+            &ModelDirSpeechRuntime::from_environment(),
+        )
+    })
+    .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(response) => response,
+    }
+}
+
+pub(super) async fn live_enable(
+    State(state): State<HttpState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    AxumPath((project_id, session_id)): AxumPath<(String, String)>,
+) -> Response {
+    let transcripts = transcripts(&state);
+    let requester = actor(&principal);
+    let audit_session = session_id.clone();
+    match blocking(&request_id, move || {
+        transcripts.enable_live(
+            &project_id,
+            &session_id,
+            &requester,
+            &ModelDirSpeechRuntime::from_environment(),
+        )
+    })
+    .await
+    {
+        Ok(value) => {
+            if let Err(response) = audit_admin(
+                &state,
+                &principal,
+                &request_id,
+                "review_transcription.live_enabled",
+                "review_session",
+                Some(&audit_session),
+                serde_json::json!({"backend":"local","model":value.model}),
+            ) {
+                return *response;
+            }
+            Json(value).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
 pub(super) fn routes(state: &HttpState) -> Router<HttpState> {
     Router::new()
+        .route(
+            "/api/v1/projects/{project_id}/review-sessions/{session_id}/live-transcript",
+            get(live_get).post(live_enable),
+        )
         .route(
             "/api/v1/projects/{project_id}/review-sessions/{session_id}/transcriptions",
             get(list).post(start),
@@ -222,6 +283,10 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
     let ok = |schema: &str| json!({"description":schema,"content":{"application/json":{"schema":{"$ref":format!("#/components/schemas/{schema}")}}}});
     let error = json!({"$ref":"#/components/responses/Error"});
     let paths = json!({
+        "/api/v1/projects/{projectId}/review-sessions/{sessionId}/live-transcript": {
+            "get": {"operationId":"getLiveReviewTranscript","description":"Read the bounded provisional transcript tail and current movie matches. Never starts decoding.","parameters":[project.clone(),session.clone()],"responses":{"200":ok("LiveReviewTranscript"),"404":error.clone()}},
+            "post": {"operationId":"enableLiveReviewTranscript","description":"Opt in to local multilingual Whisper Tiny live drafts and an automatic local full transcription after finalization. Never uploads to a cloud provider or downloads models.","parameters":[project.clone(),session.clone()],"responses":{"200":ok("LiveReviewTranscript"),"404":error.clone(),"409":error.clone()}}
+        },
         "/api/v1/projects/{projectId}/review-sessions/{sessionId}/transcriptions": {
             "get": {"operationId":"listReviewTranscriptions","parameters":[project.clone(),session.clone()],"responses":{"200":ok("ReviewTranscriptionList"),"404":error.clone()}},
             "post": {"operationId":"startReviewTranscription","description":"Create or reuse (by audio/provider/settings fingerprint) a durable transcription run. Cloud runs require explicit upload acknowledgement and a hard USD ceiling; no fallback.",
@@ -241,6 +306,7 @@ pub(super) fn openapi_extend(document: &mut serde_json::Value) {
     });
     let open = json!({"type":"object","additionalProperties":true});
     let schemas = json!({
+        "LiveReviewTranscript": open.clone(),
         "ReviewTranscriptionRequest": {"type":"object","additionalProperties":false,"required":["backend"],"properties":{
             "backend":{"type":"string","enum":["local","openrouter"]},
             "model":{"type":["string","null"]},

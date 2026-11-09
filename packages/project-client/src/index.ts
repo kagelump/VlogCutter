@@ -290,6 +290,7 @@ export interface ReviewTargetReadiness {
 }
 
 export interface ReviewTargetSummary {
+  displayName?: string | null;
   reviewTargetId: string;
   contract: ReviewTargetContract;
   projectId: string;
@@ -474,6 +475,20 @@ export interface ReviewSessionDetail extends ReviewSessionSummary {
 export interface ReviewSessionPage { items: ReviewSessionSummary[]; nextBefore: number | null }
 
 // Review-session transcription (#224). Mirrors rcdvlog-server-core::review_transcripts.
+export interface LiveReviewTranscript {
+  enabled: boolean;
+  state: "disabled" | "live" | "refining" | "complete" | "failed" | "stopped";
+  model: string;
+  modelAvailable: boolean;
+  sync: ReviewSyncDescription;
+  processedSeconds: number;
+  receivedSeconds: number;
+  revision: number;
+  finalRunId: string | null;
+  errorCode: string | null;
+  lines: { utterance: ReviewUtterance; movieTime: MovieTimeEstimate | null; assetId: string | null; shotNumber: number | null }[];
+}
+
 export type ReviewTranscriptionBackend = "local" | "openrouter";
 export type ReviewTranscriptionState = "queued" | "running" | "completed" | "noSpeech" | "partial" | "failed" | "cancelled";
 
@@ -709,6 +724,7 @@ export interface BrowserProjectClient extends ProjectClient {
   preflightHistoricalReviewTarget(projectId: string, request: HistoricalReviewTargetImportRequest): Promise<ReviewTargetPreflight>;
   importHistoricalReviewTarget(projectId: string, request: HistoricalReviewTargetImportRequest): Promise<ReviewTargetImportResult>;
   getReviewTarget(projectId: string, reviewTargetId: string): Promise<ReviewTargetDetail>;
+  renameReviewTarget(projectId: string, reviewTargetId: string, displayName: string | null): Promise<ReviewTargetDetail>;
   declareReviewTargetYoutube(projectId: string, reviewTargetId: string, youtubeVideoId: string | null): Promise<ReviewTargetImportResult>;
   getReviewTargetCandidates(projectId: string, reviewTargetId: string, startSeconds: number, endSeconds: number): Promise<ReviewTargetCandidates>;
   listReviewSessions(projectId: string, reviewTargetId?: string, limit?: number, before?: number): Promise<ReviewSessionPage>;
@@ -719,6 +735,8 @@ export interface BrowserProjectClient extends ProjectClient {
   finalizeReviewSession(projectId: string, sessionId: string, request: { finalFrameCount: number; endReason: RecordingEndReason }): Promise<ReviewSessionDetail>;
   deleteReviewSession(projectId: string, sessionId: string): Promise<ReviewSessionDetail>;
   reviewSessionAudioUrl(projectId: string, sessionId: string): string;
+  getLiveReviewTranscript(projectId: string, sessionId: string): Promise<LiveReviewTranscript>;
+  enableLiveReviewTranscript(projectId: string, sessionId: string): Promise<LiveReviewTranscript>;
   preflightReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionPreflight>;
   startReviewTranscription(projectId: string, sessionId: string, request: ReviewTranscriptionRequest): Promise<ReviewTranscriptionRun>;
   listReviewTranscriptions(projectId: string, sessionId: string): Promise<{ items: ReviewTranscriptionRun[] }>;

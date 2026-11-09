@@ -7,10 +7,14 @@ recording is bound to one imported, immutable [review target](tv-review-handoff.
 feedback (#225). Those owners read this evidence later; see
 [TV review transcription](tv-review-transcription.md).
 
-The page never plays, controls or observes YouTube. The TV plays on its own.
+In **Record review** the TV plays on its own. In **Play + record review**, the page embeds the target’s declared YouTube video and records playback observations alongside the microphone.
 The only statement the page makes about the video is the reviewer's optional
 **manual cue** ("the first frame is showing now"), which is recorded as a
 declaration and not as measured sync.
+
+## Play + record review
+
+For a target with a YouTube ID, choose **Play + record review**, allow the microphone, acknowledge consent, and press Record. Press play in the embedded player after recording starts. Player position, state and playback rate are sampled every five seconds and on player state/rate changes; each observation retains its browser monotonic time, a contemporaneous microphone-clock pairing and clock epoch. Observations are durable session events and can be lost if local event storage fails (the recorder reports unsaved events). Pauses, buffering and seeks can make the mapping discontinuous. The observations are approximate and do not measure TV output latency or verify that the YouTube video matches the target. The existing synchronization pipeline does not yet consume these observations for automatic comment placement. An independent TV player is not observed.
 
 ## User flow
 

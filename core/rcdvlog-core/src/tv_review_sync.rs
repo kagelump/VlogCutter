@@ -51,6 +51,8 @@ pub struct CapturePosition {
 #[serde(rename_all = "camelCase")]
 pub enum SyncAnchorSource {
     ManualCue,
+    /// Browser player position paired with the native microphone clock.
+    PlayerObservation,
     AcousticTimecode,
     PassiveSoundtrack,
 }

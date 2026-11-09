@@ -83,3 +83,16 @@ test("unacknowledged stop records unknown tail evidence instead of a clean stop"
   expect(client.recordReviewSessionEvent).toHaveBeenCalledWith("p","s",expect.objectContaining({kind:"pageInterrupted",detail:expect.objectContaining({captureTailStatus:"unknown"})}));
   expect(client.finalizeReviewSession).toHaveBeenCalledWith("p","s",expect.objectContaining({endReason:"interrupted"}));
 });
+
+test("player observations are persisted with playback and capture clocks before finalization", async()=>{
+  const {client,recording}=await start();
+  recording.observePlayback(23.5, 1, 1, 1234);
+  const stopped=recording.stop("stopped",1000,1000);
+  await vi.advanceTimersByTimeAsync(10);
+  message({type:"stopped",firstFrame:1000,finalFrame:1512});
+  await stopped;
+  expect(client.recordReviewSessionEvent).toHaveBeenCalledWith("p","s",expect.objectContaining({
+    kind:"clockSample", performanceMs:expect.any(Number),
+    detail:expect.objectContaining({method:"playerObservation",clockEpoch:0,playback:expect.objectContaining({positionSeconds:23.5,state:1,rate:1,observedPerformanceMs:1234})}),
+  }));
+});

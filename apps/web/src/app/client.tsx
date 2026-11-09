@@ -31,6 +31,7 @@ export const keys = {
   target: (projectId: string, targetId: string) => ["project", projectId, "target", targetId] as const,
   sessions: (projectId: string, targetId: string) => ["project", projectId, "sessions", targetId] as const,
   session: (projectId: string, sessionId: string) => ["project", projectId, "session", sessionId] as const,
+  liveTranscript: (projectId: string, sessionId: string) => ["project", projectId, "liveTranscript", sessionId] as const,
   transcriptions: (projectId: string, sessionId: string) => ["project", projectId, "transcriptions", sessionId] as const,
   workspace: (projectId: string, runId: string) => ["project", projectId, "workspace", runId] as const,
   admin: ["admin"] as const,
