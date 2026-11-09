@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ConfigDiagnostics;
 
-pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 19;
+pub const CONTROL_CATALOG_SCHEMA_VERSION: u32 = 20;
 pub const CONTROL_DATABASE_FILENAME: &str = "control.sqlite3";
 pub const INSTANCE_LOCK_FILENAME: &str = "server.lock";
 
