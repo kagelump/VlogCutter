@@ -26,6 +26,7 @@ use tauri::{Emitter, Manager, State};
 mod chronology_commands;
 #[cfg(debug_assertions)]
 mod eval_bridge;
+mod hint_client_slot;
 mod keychain;
 mod media_server;
 mod project_work;
@@ -2383,6 +2384,8 @@ async fn pair_with_server(
     write_settings(&state.settings_path, &updated)
         .map_err(|e| format!("failed to save settings: {e}"))?;
     *settings = updated;
+    // Re-evaluate sync now so the hint client follows the new server.
+    state.sync_manager.pairing_changed();
 
     Ok(ServerPairingResult {
         node_id: server_node_id.to_string(),
@@ -2410,16 +2413,18 @@ fn server_connection_status(state: State<'_, AppState>) -> Result<ServerConnecti
 
 #[tauri::command]
 fn unpair_server(state: State<'_, AppState>) -> Result<(), String> {
-    let settings = state
-        .settings
-        .read()
-        .map_err(|_| "desktop settings are unavailable".to_string())?;
-
-    if let (Some(endpoint), Some(node_id)) = (
-        &settings.paired_server_endpoint,
-        &settings.paired_server_node_id,
-    ) {
-        keychain::delete_server_credential(endpoint, node_id).ok();
+    {
+        // Scoped so the read guard is released before the write lock below.
+        let settings = state
+            .settings
+            .read()
+            .map_err(|_| "desktop settings are unavailable".to_string())?;
+        if let (Some(endpoint), Some(node_id)) = (
+            &settings.paired_server_endpoint,
+            &settings.paired_server_node_id,
+        ) {
+            keychain::delete_server_credential(endpoint, node_id).ok();
+        }
     }
 
     let mut settings = state
@@ -2437,6 +2442,8 @@ fn unpair_server(state: State<'_, AppState>) -> Result<(), String> {
     write_settings(&state.settings_path, &updated)
         .map_err(|e| format!("failed to save settings: {e}"))?;
     *settings = updated;
+    // Stop the hint client now rather than at the next periodic tick.
+    state.sync_manager.pairing_changed();
     Ok(())
 }
 
